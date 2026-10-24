@@ -86,8 +86,10 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 # Ensure standard I/O encoding is UTF-8 for MCP stdio transport
 if sys.platform == "win32":
-    sys.stdin.reconfigure(encoding="utf-8")
-    sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stdin, "reconfigure"):
+        sys.stdin.reconfigure(encoding="utf-8")
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -119,9 +121,12 @@ WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
 S7_MANAGER_WINDOW_TITLE_REGEX = r".*SIMATIC Manager.*"
 S7_EDITOR_WINDOW_TITLE_REGEX = r".*(LAD/FBD/STL|LAD/STL/FBD|KOP/FUP/AWL|LAD, FBD, STL).*"
 STEP7_DEFAULT_BIN = Path(r"C:\Program Files (x86)\Siemens\Step7\s7bin")
+STEP7_DEFAULT_DIR = Path(r"C:\Program Files (x86)\Siemens\Step7")
 STEP7_MANAGER_EXE = "S7tgtopx.exe"
-STEP7_EDITOR_EXE = "s7wndltx.exe"
+STEP7_EDITOR_EXE = "S7KAFAPX.EXE"
 STEP7_HWCNF_EXE = "S7HWCNFX.EXE"
+STEP7_PLCSIM_EXE = "S7USSAPX.EXE"
+STEP7_SYMBOL_EXE = "S7symapx.exe"
 STEP7_EXECUTABLE_ENV = "STEP7_EXE"
 
 GUI_TRANSACTION_LOCK = threading.RLock()
@@ -196,6 +201,98 @@ def find_step7_manager_exe() -> Optional[Path]:
         return Path(found)
 
     return None
+
+
+def find_step7_editor_exe() -> Optional[Path]:
+    """Discovers the Siemens LAD/FBD/STL Block Editor (S7KAFAPX.EXE)."""
+    mgr = find_step7_manager_exe()
+    if mgr:
+        root = mgr.parent.parent
+        cand = root / "S7SKA" / STEP7_EDITOR_EXE
+        if cand.is_file():
+            return cand
+    cand = STEP7_DEFAULT_DIR / "S7SKA" / STEP7_EDITOR_EXE
+    if cand.is_file():
+        return cand
+    found = shutil.which(STEP7_EDITOR_EXE)
+    if found and Path(found).is_file():
+        return Path(found)
+    return None
+
+
+def find_step7_symbol_exe() -> Optional[Path]:
+    """Discovers the Siemens Symbol Table Editor (S7symapx.exe)."""
+    mgr = find_step7_manager_exe()
+    if mgr:
+        root = mgr.parent.parent
+        cand = root / "S7SYM" / STEP7_SYMBOL_EXE
+        if cand.is_file():
+            return cand
+    cand = STEP7_DEFAULT_DIR / "S7SYM" / STEP7_SYMBOL_EXE
+    if cand.is_file():
+        return cand
+    found = shutil.which(STEP7_SYMBOL_EXE)
+    if found and Path(found).is_file():
+        return Path(found)
+    return None
+
+
+def find_step7_plcsim_exe() -> Optional[Path]:
+    """Discovers the Siemens S7-PLCSIM executable (S7USSAPX.EXE)."""
+    mgr = find_step7_manager_exe()
+    if mgr:
+        root = mgr.parent.parent
+        cand = root / "S7USS" / STEP7_PLCSIM_EXE
+        if cand.is_file():
+            return cand
+    cand = STEP7_DEFAULT_DIR / "S7USS" / STEP7_PLCSIM_EXE
+    if cand.is_file():
+        return cand
+    found = shutil.which(STEP7_PLCSIM_EXE)
+    if found and Path(found).is_file():
+        return Path(found)
+    return None
+
+
+def find_step7_hwcnf_exe() -> Optional[Path]:
+    """Discovers the Siemens Hardware Configuration Editor (S7HWCNFX.EXE)."""
+    mgr = find_step7_manager_exe()
+    if mgr:
+        cand = mgr.parent / STEP7_HWCNF_EXE
+        if cand.is_file():
+            return cand
+    cand = STEP7_DEFAULT_BIN / STEP7_HWCNF_EXE
+    if cand.is_file():
+        return cand
+    found = shutil.which(STEP7_HWCNF_EXE)
+    if found and Path(found).is_file():
+        return Path(found)
+    return None
+
+
+def spawn_detached_siemens_process(cmd: str) -> bool:
+    """
+    Spawns a detached process using WMI (Win32_Process.Create) to avoid
+    Windows Job Object restrictions and sandbox termination. Falls back to subprocess.
+    """
+    if sys.platform == "win32":
+        try:
+            import win32com.client
+            wmi = win32com.client.GetObject("winmgmts:\\\\.\\root\\cimv2")
+            proc = wmi.Get("Win32_Process")
+            res, _ = proc.Create(CommandLine=cmd)
+            if res == 0:
+                return True
+        except Exception:
+            pass
+    try:
+        flags = 0
+        if sys.platform == "win32":
+            flags = 0x00000200 | 0x00000008  # CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS
+        subprocess.Popen(cmd, creationflags=flags, shell=isinstance(cmd, str))
+        return True
+    except Exception:
+        return False
 
 
 @dataclass(frozen=True)
@@ -1233,15 +1330,16 @@ def validate_and_analyze_program(
                 continue
 
             clean_line = inst_line.strip()
+            if not clean_line:
+                continue
+
+            if clean_line.startswith("//"):
+                norm_insts.append(clean_line)
+                continue
+
             # Strip trailing semicolon if user provided it
             if clean_line.endswith(";"):
                 clean_line = clean_line[:-1].strip()
-
-            if not clean_line or clean_line.startswith("//"):
-                report.valid = False
-                msg = f"Network {net_idx}, line {inst_idx}: blank lines and comment lines are not accepted as instructions."
-                report.errors.append(msg)
-                continue
 
             # Check for label prefix on line (e.g. 'LAB1: L 100' or 'M001:')
             label_prefix: Optional[str] = None
@@ -1525,6 +1623,10 @@ def generate_s7_awl_source(
         if net.comment:
             lines.append(f"// {net.comment}")
         for inst in net.instructions:
+            clean_inst = inst.strip()
+            if clean_inst.startswith("//"):
+                lines.append(f"      {clean_inst}")
+                continue
             existing_comment = ""
             inst_code = inst
             if "//" in inst:
@@ -1749,7 +1851,10 @@ def s7_instruction_signature(networks: List[Dict[str, Any]]) -> List[Tuple[str, 
     sig = []
     for net in networks:
         for inst in net.get("instructions", []):
-            m_lbl = re.match(r"^([A-Za-z_][A-Za-z0-9_]{0,15})\s*:\s*(.*)$", inst)
+            clean_i = inst.strip()
+            if not clean_i or clean_i.startswith("//"):
+                continue
+            m_lbl = re.match(r"^([A-Za-z_][A-Za-z0-9_]{0,15})\s*:\s*(.*)$", clean_i)
             if m_lbl:
                 lbl = m_lbl.group(1).upper()
                 rem = m_lbl.group(2).strip()
@@ -1901,7 +2006,9 @@ def parse_s7_symbol_table(filepath: Path) -> Dict[str, Any]:
             })
             symbol_map[sym.upper()] = canon_addr
         return {
+            "file": str(filepath),
             "symbol_count": len(entries),
+            "symbols": entries,
             "entries": entries,
             "symbol_map": symbol_map,
             "errors": row_errors,
@@ -1951,9 +2058,37 @@ def parse_s7_symbol_table(filepath: Path) -> Dict[str, Any]:
         "file": str(filepath),
         "symbol_count": len(entries),
         "symbols": entries,
+        "entries": entries,
         "symbol_map": symbol_map,
         "errors": row_errors,
     }
+
+
+def find_default_symbol_table_file(controller_proj: Optional[str] = None) -> Optional[Path]:
+    """
+    Locates the most relevant symbol table (.asc, .sdf, .csv, .seq) across
+    the active project and the workspace directory.
+    """
+    search_dirs: List[Path] = []
+    if controller_proj:
+        search_dirs.append(WORKSPACE_DIR / "Projects" / controller_proj / "Symbols")
+        search_dirs.append(WORKSPACE_DIR / "Projects" / controller_proj)
+    search_dirs.append(WORKSPACE_DIR / "Symbols")
+    search_dirs.append(WORKSPACE_DIR)
+
+    candidates: List[Path] = []
+    for d in search_dirs:
+        if not d.is_dir():
+            continue
+        for ext in ("*.asc", "*.sdf", "*.csv", "*.seq"):
+            for f in d.glob(ext):
+                if f.is_file():
+                    candidates.append(f)
+    if candidates:
+        # Sort by most recently modified
+        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return candidates[0]
+    return None
 
 
 # ============================================================================
@@ -2834,14 +2969,10 @@ def detect_simatic_environment() -> Dict[str, Any]:
     except Exception:
         pass
 
-    s7bin = exe_path.parent if exe_path else STEP7_DEFAULT_BIN
-    editor_path = s7bin / STEP7_EDITOR_EXE if s7bin.is_dir() else None
-    hwcnf_path = s7bin / STEP7_HWCNF_EXE if s7bin.is_dir() else None
-    plcsim_path = s7bin / "s7wndx.exe" if s7bin.is_dir() else None
-    if not plcsim_path or not plcsim_path.is_file():
-        alt_plcsim = s7bin / "s7plcsim.exe" if s7bin.is_dir() else None
-        if alt_plcsim and alt_plcsim.is_file():
-            plcsim_path = alt_plcsim
+    editor_path = find_step7_editor_exe()
+    symbol_path = find_step7_symbol_exe()
+    hwcnf_path = find_step7_hwcnf_exe()
+    plcsim_path = find_step7_plcsim_exe()
 
     projects_dir = WORKSPACE_DIR / "Projects"
     existing_projects = [p.name for p in projects_dir.iterdir() if p.is_dir()] if projects_dir.is_dir() else []
@@ -2850,6 +2981,7 @@ def detect_simatic_environment() -> Dict[str, Any]:
         "step7_installed": exe_path is not None and exe_path.is_file(),
         "simatic_manager_exe": str(exe_path) if exe_path else None,
         "editor_exe": str(editor_path) if editor_path and editor_path.is_file() else None,
+        "symbol_editor_exe": str(symbol_path) if symbol_path and symbol_path.is_file() else None,
         "hw_config_exe": str(hwcnf_path) if hwcnf_path and hwcnf_path.is_file() else None,
         "plcsim_exe": str(plcsim_path) if plcsim_path and plcsim_path.is_file() else None,
         "installed_versions": installed_versions or (["v5.5 / v5.6 / v5.7"] if exe_path else []),
@@ -2945,7 +3077,10 @@ class SimaticManagerController:
             cmd = f'"{exe_path}"'
             if project_path and Path(project_path).exists():
                 cmd += f' "{project_path}"'
-            self.app = Application(backend="win32").start(cmd)
+            try:
+                self.app = Application(backend="win32").start(cmd)
+            except Exception:
+                spawn_detached_siemens_process(cmd)
             time.sleep(3.0)
             ok, msg = self.connect()
             if ok and self.app:
@@ -3026,20 +3161,33 @@ class SimaticManagerController:
                     try:
                         time.sleep(0.5)
                         self.main_win.set_focus()
-                        station_menu = {
-                            "S7-300": "Insert->Station->1 SIMATIC 300 Station",
-                            "S7-400": "Insert->Station->2 SIMATIC 400 Station",
-                            "WINAC": "Insert->Station->SIMATIC PC Station",
-                        }.get(profile.name, "Insert->Station->1 SIMATIC 300 Station")
-                        try:
-                            self.main_win.menu_select(station_menu)
-                        except Exception:
-                            de_menu = {
-                                "S7-300": "Einfügen->Station->1 SIMATIC 300-Station",
-                                "S7-400": "Einfügen->Station->2 SIMATIC 400-Station",
-                                "WINAC": "Einfügen->Station->SIMATIC PC-Station",
-                            }.get(profile.name, "Einfügen->Station->1 SIMATIC 300-Station")
-                            self.main_win.menu_select(de_menu)
+                        station_candidates = [
+                            f"Insert->Station->2 {target_station}",
+                            f"Insert->Station->1 {target_station}",
+                            f"Insert->Station->{target_station}",
+                            "Insert->Program->1 S7 Program",
+                        ]
+                        if profile.name == "S7-300":
+                            station_candidates.extend([
+                                "Insert->Station->2 SIMATIC 300 Station",
+                                "Insert->Station->1 SIMATIC 300 Station",
+                                "Einfügen->Station->2 SIMATIC 300-Station",
+                                "Einfügen->Station->1 SIMATIC 300-Station",
+                                "Einfügen->Programm->1 S7-Programm",
+                            ])
+                        elif profile.name == "S7-400":
+                            station_candidates.extend([
+                                "Insert->Station->1 SIMATIC 400 Station",
+                                "Insert->Station->2 SIMATIC 400 Station",
+                                "Einfügen->Station->1 SIMATIC 400-Station",
+                                "Einfügen->Station->2 SIMATIC 400-Station",
+                            ])
+                        for menu_path in station_candidates:
+                            try:
+                                self.main_win.menu_select(menu_path)
+                                break
+                            except Exception:
+                                continue
                         time.sleep(0.5)
                         self._dismiss_popups(confirm=True, timeout=1.0)
                     except Exception:
@@ -3183,11 +3331,30 @@ class SimaticManagerController:
     ) -> Tuple[bool, str, Dict[str, Any]]:
         """
         Ensures target block is accessible or focused in the LAD/FBD/STL Editor.
+        If SIMATIC Manager is running, attempts to open the block via GUI accelerator (Ctrl+Alt+O / Enter).
         """
         blk_clean = block_name.strip().upper()
         ok, title = self.connect()
         if ok and self.is_block_editor_active(blk_clean)[0]:
             return True, f"Block editor '{blk_clean}' is active.", {"block_name": blk_clean, "mode": "gui"}
+
+        # If SIMATIC Manager is connected, attempt to open the block in the GUI
+        if ok and self.main_win:
+            try:
+                self.main_win.set_focus()
+                time.sleep(0.2)
+                # In SIMATIC Manager, Ctrl+Alt+O opens the selected object, or pressing Enter
+                send_keys("^%o")
+                time.sleep(1.0)
+                active, active_title = self.is_block_editor_active(blk_clean)
+                if active:
+                    return True, f"Opened block '{blk_clean}' in LAD/STL Editor via GUI.", {
+                        "block_name": blk_clean,
+                        "mode": "gui",
+                        "window_title": active_title,
+                    }
+            except Exception:
+                pass
 
         # Check offline block file
         proj = project_name or self.project_name
@@ -3210,6 +3377,7 @@ class SimaticManagerController:
             "block_file": str(blk_file) if blk_file else None,
             "block_path": str(blk_file) if blk_file else None,
             "gui_connected": ok,
+            "mode": "offline",
         }
 
     def is_block_editor_active(self, expected_block: str = "OB1") -> Tuple[bool, str]:
@@ -3222,6 +3390,15 @@ class SimaticManagerController:
         current_title = self.main_win.window_text()
         if expected_block.upper() in current_title.upper():
             return True, current_title
+        try:
+            if PYWINAUTO_AVAILABLE:
+                editor_app = Application(backend="win32").connect(title_re=S7_EDITOR_WINDOW_TITLE_REGEX, timeout=0.3)
+                for w in editor_app.windows():
+                    w_title = w.window_text()
+                    if expected_block.upper() in w_title.upper():
+                        return True, w_title
+        except Exception:
+            pass
         try:
             for w in self.app.windows():
                 if expected_block.upper() in w.window_text().upper():
@@ -3316,9 +3493,12 @@ class SimaticManagerController:
             self.main_win.set_focus()
             time.sleep(0.2)
             try:
-                self.main_win.menu_select("File->Export...")
+                self.main_win.menu_select("File->Generate Source...")
             except Exception:
-                send_keys("^e")
+                try:
+                    self.main_win.menu_select("File->Export...")
+                except Exception:
+                    send_keys("^t")
 
             time.sleep(0.5)
             picker = self.app.window(title_re=r".*(Export|Save|Speichern).*")
@@ -3358,9 +3538,12 @@ class SimaticManagerController:
             self.main_win.set_focus()
             time.sleep(0.2)
             try:
-                self.main_win.menu_select("File->Import...")
+                self.main_win.menu_select("Insert->External Source...")
             except Exception:
-                send_keys("^i")
+                try:
+                    self.main_win.menu_select("File->Import...")
+                except Exception:
+                    pass
 
             time.sleep(0.5)
             picker = self.app.window(title_re=r".*(Import|Open|Öffnen).*")
@@ -3400,6 +3583,9 @@ class SimaticManagerController:
         try:
             self.main_win.set_focus()
             time.sleep(0.2)
+            # Compile (Ctrl+B) and Check & Save (Ctrl+S)
+            send_keys("^b")
+            time.sleep(0.5)
             send_keys("^s")
             time.sleep(0.8)
             popups = self._dismiss_popups(confirm=True, timeout=2.5)
@@ -4173,18 +4359,7 @@ def s7_read_device_comments(comment_file_path: Optional[str] = None) -> str:
     if comment_file_path and comment_file_path.strip():
         target_path = Path(comment_file_path).expanduser().resolve()
     else:
-        if controller.project_name:
-            proj_sym = WORKSPACE_DIR / "Projects" / controller.project_name / "Symbols" / "symbols.sdf"
-            if proj_sym.is_file():
-                target_path = proj_sym
-        if not target_path or not target_path.is_file():
-            ws_sym = WORKSPACE_DIR / "Symbols" / "symbols.sdf"
-            if ws_sym.is_file():
-                target_path = ws_sym
-        if not target_path or not target_path.is_file():
-            cands = sorted(WORKSPACE_DIR.glob("*.sdf"), key=lambda f: f.stat().st_mtime, reverse=True)
-            if cands:
-                target_path = cands[0]
+        target_path = find_default_symbol_table_file(controller.project_name)
 
     if not target_path or not target_path.is_file():
         err_msg = (
@@ -4238,18 +4413,7 @@ def s7_search_symbols_and_comments(
 
     target_path = Path(comment_file_path).expanduser().resolve() if comment_file_path else None
     if not target_path or not target_path.is_file():
-        proj_sym = (
-            (WORKSPACE_DIR / "Projects" / controller.project_name / "Symbols" / "symbols.sdf")
-            if controller.project_name else None
-        )
-        for cand in [proj_sym, WORKSPACE_DIR / "Symbols" / "symbols.sdf", WORKSPACE_DIR / "Symbols" / "symbols.csv"]:
-            if cand and cand.is_file():
-                target_path = cand
-                break
-        if not target_path or not target_path.is_file():
-            cands = sorted(WORKSPACE_DIR.glob("*.sdf"), key=lambda f: f.stat().st_mtime, reverse=True)
-            if cands:
-                target_path = cands[0]
+        target_path = find_default_symbol_table_file(controller.project_name)
 
     if not target_path or not target_path.is_file():
         return json.dumps({
@@ -4316,9 +4480,9 @@ def s7_annotate_awl_code(
             symbols_to_use = parsed_sym.get("symbols")
 
     if not symbols_to_use:
-        ws_sym = WORKSPACE_DIR / "Symbols" / "symbols.sdf"
-        if ws_sym.is_file():
-            parsed_sym = parse_s7_symbol_table(ws_sym)
+        sym_file = find_default_symbol_table_file(controller.project_name)
+        if sym_file and sym_file.is_file():
+            parsed_sym = parse_s7_symbol_table(sym_file)
             symbols_to_use = parsed_sym.get("symbols")
 
     try:

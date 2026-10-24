@@ -1375,5 +1375,124 @@ class QualityOfLifeAndToolsTests(unittest.TestCase):
         self.assertTrue(any("enregistrer" in m for m in msgs))
 
 
+class TestSimaticS7EnhancementsAndEdgeCases(unittest.TestCase):
+    def test_instruction_comments_supported(self):
+        networks = [
+            {
+                "title": "Network with comments",
+                "instructions": [
+                    "// Check start button",
+                    "A I 0.0",
+                    "// Set latch marker",
+                    "= M 0.0",
+                ],
+            }
+        ]
+        report = MODULE.validate_and_analyze_program(networks)
+        self.assertTrue(report.valid, f"Validation failed: {report.errors}")
+        awl = MODULE.generate_s7_awl_source(report.normalized_networks)
+        self.assertIn("// Check start button", awl)
+        self.assertIn("// Set latch marker", awl)
+
+        # Signature ignores pure comments
+        sig = MODULE.s7_instruction_signature([{"instructions": report.normalized_networks[0].instructions}])
+        self.assertEqual(len(sig), 2)
+        self.assertEqual(sig[0][0], "A")
+        self.assertEqual(sig[1][0], "=")
+
+    def test_parse_s7_symbol_table_standard_keys(self):
+        with tempfile.TemporaryDirectory() as td:
+            # 1. Native Siemens 126 ASC format
+            asc_path = Path(td) / "symbols.asc"
+            asc_content = (
+                f"126,{'START_PB':<24}{'I 0.0':<12}{'BOOL':<10}Start Pushbutton\r\n"
+                f"126,{'MOTOR_RUN':<24}{'Q 0.0':<12}{'BOOL':<10}Motor Run Output\r\n"
+            )
+            asc_path.write_bytes(asc_content.encode("latin1"))
+
+            res = MODULE.parse_s7_symbol_table(asc_path)
+            self.assertIn("symbols", res)
+            self.assertIn("entries", res)
+            self.assertIn("file", res)
+            self.assertEqual(res["symbol_count"], 2)
+            self.assertEqual(res["symbols"][0]["symbol"], "START_PB")
+            self.assertEqual(res["symbols"][0]["address"], "I 0.0")
+
+            # 2. SDF format
+            sdf_path = Path(td) / "symbols.sdf"
+            sdf_content = (
+                "Symbol\tAddress\tData type\tComment\r\n"
+                "STOP_PB\tI 0.1\tBOOL\tStop Pushbutton\r\n"
+            )
+            sdf_path.write_text(sdf_content, encoding="utf-8")
+            res_sdf = MODULE.parse_s7_symbol_table(sdf_path)
+            self.assertIn("symbols", res_sdf)
+            self.assertIn("entries", res_sdf)
+            self.assertIn("file", res_sdf)
+            self.assertEqual(res_sdf["symbol_count"], 1)
+
+    def test_find_default_symbol_table_file_asc(self):
+        with tempfile.TemporaryDirectory() as td:
+            orig_ws = MODULE.WORKSPACE_DIR
+            try:
+                MODULE.WORKSPACE_DIR = Path(td)
+                sym_dir = MODULE.WORKSPACE_DIR / "Symbols"
+                sym_dir.mkdir(parents=True)
+                asc_file = sym_dir / "symbols.asc"
+                asc_content = (
+                    f"126,{'RESET_PB':<24}{'I 0.2':<12}{'BOOL':<10}Reset Pushbutton\r\n"
+                )
+                asc_file.write_bytes(asc_content.encode("latin1"))
+
+                found = MODULE.find_default_symbol_table_file()
+                self.assertIsNotNone(found)
+                self.assertEqual(found.name, "symbols.asc")
+
+                # Test s7_read_device_comments picks it up automatically
+                read_res = json.loads(MODULE.s7_read_device_comments())
+                self.assertTrue(read_res["success"])
+                self.assertEqual(read_res["symbol_count"], 1)
+                self.assertEqual(read_res["device_comments"]["I 0.2"], "Reset Pushbutton")
+
+                # Test s7_search_symbols_and_comments picks it up
+                search_res = json.loads(MODULE.s7_search_symbols_and_comments(query="RESET*"))
+                self.assertTrue(search_res["success"])
+                self.assertEqual(len(search_res["results"]), 1)
+                self.assertEqual(search_res["results"][0]["symbol"], "RESET_PB")
+            finally:
+                MODULE.WORKSPACE_DIR = orig_ws
+
+    def test_executable_discovery(self):
+        mgr = MODULE.find_step7_manager_exe()
+        if mgr and mgr.is_file():
+            editor = MODULE.find_step7_editor_exe()
+            self.assertIsNotNone(editor)
+            self.assertTrue(editor.is_file())
+            self.assertEqual(editor.name.upper(), "S7KAFAPX.EXE")
+
+            symbol_ed = MODULE.find_step7_symbol_exe()
+            self.assertIsNotNone(symbol_ed)
+            self.assertTrue(symbol_ed.is_file())
+            self.assertEqual(symbol_ed.name.lower(), "s7symapx.exe")
+
+            plcsim = MODULE.find_step7_plcsim_exe()
+            self.assertIsNotNone(plcsim)
+            self.assertTrue(plcsim.is_file())
+            self.assertEqual(plcsim.name.upper(), "S7USSAPX.EXE")
+
+            hwcnf = MODULE.find_step7_hwcnf_exe()
+            self.assertIsNotNone(hwcnf)
+            self.assertTrue(hwcnf.is_file())
+            self.assertEqual(hwcnf.name.upper(), "S7HWCNFX.EXE")
+
+    def test_open_block_offline_fallback(self):
+        ctrl = MODULE.SimaticManagerController()
+        # Mock connect returning False (offline)
+        ctrl.connect = lambda timeout=0.5: (False, "Offline")
+        ok, msg, meta = ctrl.open_block("OB999_NONEXISTENT")
+        self.assertFalse(ok)
+        self.assertIn("not found", msg)
+
+
 if __name__ == "__main__":
     unittest.main()
