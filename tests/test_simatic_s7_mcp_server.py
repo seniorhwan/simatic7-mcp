@@ -491,6 +491,224 @@ class AdditionalEdgeCaseTests(unittest.TestCase):
         self.assertIn("supported_plc_families", res)
         self.assertIn("S7-300", res["supported_plc_families"])
 
+    def test_local_data_addressing(self):
+        local_net = [
+            {
+                "title": "Local temp bit and word access",
+                "instructions": ["A L 0.0", "= L 0.7", "L LW 2", "T LD 4"],
+            }
+        ]
+        report = MODULE.validate_and_analyze_program(local_net)
+        self.assertTrue(report.valid, report.errors)
+        self.assertIn("L 0.0", report.devices_used)
+        self.assertIn("L 0.7", report.devices_used)
+
+    def test_block_operands_and_opened_db(self):
+        call_net = [
+            {
+                "title": "Block calls and DB access",
+                "instructions": [
+                    "OPN DB 1",
+                    "A DBX 0.0",
+                    "= DBX 0.1",
+                    "L DBW 2",
+                    "T DBD 4",
+                    "CALL FC 1",
+                    "CALL FB 1, DB 2",
+                    "CC FC 10",
+                    "UC FC 20",
+                ],
+            }
+        ]
+        report = MODULE.validate_and_analyze_program(call_net)
+        self.assertTrue(report.valid, report.errors)
+
+    def test_jump_labels_roundtrip(self):
+        jump_net = [
+            {
+                "title": "Branching with labels",
+                "instructions": [
+                    "A I 0.0",
+                    "JC LAB1",
+                    "L 0",
+                    "T MW 10",
+                    "JU END1",
+                    "LAB1: L 100",
+                    "T MW 10",
+                    "END1: NOP 0",
+                ],
+            }
+        ]
+        report = MODULE.validate_and_analyze_program(jump_net)
+        self.assertTrue(report.valid, report.errors)
+        with tempfile.TemporaryDirectory() as td:
+            awl = MODULE.generate_s7_awl_source(report.normalized_networks)
+            path = Path(td) / "jump.awl"
+            path.write_text(awl, encoding="utf-8")
+            parsed = MODULE.parse_s7_awl_source(path)
+            self.assertNotIn("error", parsed)
+            self.assertEqual(len(parsed["networks"][0]["instructions"]), 8)
+            exp_sig = MODULE.s7_instruction_signature([{"instructions": net.instructions} for net in report.normalized_networks])
+            act_sig = MODULE.s7_instruction_signature(parsed["networks"])
+            self.assertEqual(act_sig, exp_sig)
+
+    def test_status_bits_validation(self):
+        status_net = [
+            {
+                "title": "Status bits check",
+                "instructions": [
+                    "A ==0",
+                    "A >0",
+                    "A OS",
+                    "A OV",
+                    "A BR",
+                    "= M 0.0",
+                ],
+            }
+        ]
+        report = MODULE.validate_and_analyze_program(status_net)
+        self.assertTrue(report.valid, report.errors)
+
+    def test_extended_literals_with_underscores(self):
+        lit_net = [
+            {
+                "title": "Extended literals",
+                "instructions": [
+                    "L S5T#1M_30S",
+                    "L S5TIME#10S",
+                    "L T#1D_2H",
+                    "L D#2026-10-24",
+                    "L TOD#12:30:00",
+                    "L B#16#FF",
+                    "L 2#1010_0101",
+                    "T MD 20",
+                ],
+            }
+        ]
+        report = MODULE.validate_and_analyze_program(lit_net)
+        self.assertTrue(report.valid, report.errors)
+
+    def test_address_register_and_stack(self):
+        ar_net = [
+            {
+                "title": "Address register instructions",
+                "instructions": [
+                    "LAR1 P#0.0",
+                    "TAR1 MD 10",
+                    "CAR",
+                    "PUSH",
+                    "POP",
+                    "STP",
+                ],
+            }
+        ]
+        report = MODULE.validate_and_analyze_program(ar_net)
+        self.assertTrue(report.valid, report.errors)
+
+    def test_german_jumps_and_timers(self):
+        de_net = [
+            {
+                "title": "German jumps and timers",
+                "instructions": [
+                    "U E 0.0",
+                    "L S5T#2S",
+                    "SI T 1",
+                    "U T 1",
+                    "SPA LAB_DE",
+                    "LAB_DE: ZV C 1",
+                    "BEA",
+                ],
+            }
+        ]
+        report = MODULE.validate_and_analyze_program(de_net)
+        self.assertTrue(report.valid, report.errors)
+
+    def test_mnemonic_language_normalization(self):
+        foreign_net = [
+            {"title": "Foreign mnemonics", "instructions": ["LD I 0.0", "OUT Q 0.0"]}
+        ]
+        rep_de = MODULE.validate_and_analyze_program(foreign_net, auto_fix_mnemonics=True, mnemonic_language="German")
+        self.assertTrue(rep_de.valid, rep_de.errors)
+        self.assertEqual(rep_de.normalized_networks[0].instructions, ["U I 0.0", "= Q 0.0"])
+
+        rep_intl = MODULE.validate_and_analyze_program(foreign_net, auto_fix_mnemonics=True, mnemonic_language="International")
+        self.assertTrue(rep_intl.valid, rep_intl.errors)
+        self.assertEqual(rep_intl.normalized_networks[0].instructions, ["A I 0.0", "= Q 0.0"])
+
+    def test_awl_parser_strips_inline_comments(self):
+        with tempfile.TemporaryDirectory() as td:
+            awl_text = (
+                "ORGANIZATION_BLOCK OB 1\n"
+                "TITLE = \"Test\"\n"
+                "BEGIN\n"
+                "NETWORK\n"
+                "TITLE = Net1\n"
+                "      A     I 0.0; // Start PB\n"
+                "      =     Q 0.0; // Contactor\n"
+                "END_ORGANIZATION_BLOCK\n"
+            )
+            p = Path(td) / "inline.awl"
+            p.write_text(awl_text, encoding="utf-8")
+            parsed = MODULE.parse_s7_awl_source(p)
+            self.assertNotIn("error", parsed)
+            insts = parsed["networks"][0]["instructions"]
+            self.assertEqual(insts, ["A I 0.0", "= Q 0.0"])
+
+    def test_star_delta_with_symbols_and_german(self):
+        german_hazard = [
+            {"title": "Motor STERN Schütz", "instructions": ["U M 0.0", "= A 0.1"]},
+            {"title": "Motor DREIECK Schütz", "instructions": ["U M 0.1", "= A 0.2"]},
+        ]
+        rep_hazard = MODULE.validate_and_analyze_program(german_hazard)
+        self.assertTrue(rep_hazard.valid)
+        self.assertTrue(any("Star-Delta switching hazard detected" in w for w in rep_hazard.warnings))
+
+        symbols = {"STAR_CONTACTOR": "Q 0.1", "DELTA_CONTACTOR": "Q 0.2"}
+        interlocked = [
+            {"title": "Motor STAR contactor", "instructions": ["A M 0.0", "AN \"DELTA_CONTACTOR\"", "= \"STAR_CONTACTOR\""]},
+            {"title": "Motor DELTA contactor", "instructions": ["A M 0.1", "AN \"STAR_CONTACTOR\"", "= \"DELTA_CONTACTOR\""]},
+        ]
+        rep_ok = MODULE.validate_and_analyze_program(interlocked, symbols_input=symbols)
+        self.assertFalse(any("Star-Delta switching hazard detected" in w for w in rep_ok.warnings))
+
+    def test_symbol_table_bidirectional_and_read(self):
+        addr_key = {"I 0.0": "START", "Q 0.0": "MOTOR"}
+        rep = MODULE.validate_and_analyze_program(SAMPLE_NETWORKS, symbols_input=addr_key)
+        self.assertTrue(rep.valid, rep.errors)
+
+        with tempfile.TemporaryDirectory() as td:
+            csv_path = Path(td) / "sym.csv"
+            csv_content = MODULE.generate_s7_symbol_csv([
+                MODULE.S7SymbolEntry("START", "I 0.0", "BOOL", "Start PB"),
+                MODULE.S7SymbolEntry("STOP", "I 0.1", "BOOL", "Stop PB"),
+            ])
+            csv_path.write_text(csv_content, encoding="utf-8")
+            read_res = json.loads(MODULE.s7_read_symbol_table(str(csv_path)))
+            self.assertTrue(read_res["success"])
+            self.assertEqual(read_res["symbol_count"], 2)
+            self.assertEqual(read_res["symbol_map"]["START"], "I 0.0")
+
+    def test_s7_list_supported_plc_types_tool(self):
+        res = json.loads(MODULE.s7_list_supported_plc_types())
+        self.assertIn("families", res)
+        families = [f["family"] for f in res["families"]]
+        self.assertIn("S7-300", families)
+        self.assertIn("S7-400", families)
+        self.assertIn("WinAC", families)
+
+    def test_s7_create_project_offline(self):
+        old_ws = MODULE.WORKSPACE_DIR
+        with tempfile.TemporaryDirectory() as td:
+            MODULE.WORKSPACE_DIR = Path(td)
+            try:
+                res = json.loads(MODULE.s7_create_project(project_name="Line2_Station", plc_type="S7-400"))
+                self.assertTrue(res["success"])
+                self.assertEqual(res["project_name"], "Line2_Station")
+                meta_path = Path(td) / "Projects" / "Line2_Station" / "project.json"
+                self.assertTrue(meta_path.is_file())
+            finally:
+                MODULE.WORKSPACE_DIR = old_ws
+
 
 if __name__ == "__main__":
     unittest.main()

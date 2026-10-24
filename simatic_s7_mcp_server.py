@@ -13,34 +13,41 @@ developed for PLC MCP bridges:
      * Inputs: I <byte>.<bit> / E <byte>.<bit>, IB, IW, ID
      * Outputs: Q <byte>.<bit> / A <byte>.<bit>, QB, QW, QD
      * Bit Memory: M <byte>.<bit>, MB, MW, MD
-     * Timers: T <n>, Counters: C <n> / Z <n>
-     * Data Blocks: DB<n>.DBX/DBB/DBW/DBD
-     * Peripheral I/O: PIB, PIW, PID / PQB, PQW, PQD
      * Local Data: L <byte>.<bit>, LB, LW, LD
-     * Constants: S5T#..., T#..., 16#..., 2#..., integer, floating point, pointers
+     * Timers: T <n>, Counters: C <n> / Z <n>
+     * Block References: FC <n>, FB <n>, OB <n>, DB <n>, DI <n>, SFC <n>, SFB <n>
+     * Data Blocks: DB<n>.DBX/DBB/DBW/DBD as well as opened DBX/DBB/DBW/DBD
+     * Status Bits: ==0, <>0, >0, <0, >=0, <=0, OV, OS, BR, UO
+     * Peripheral I/O: PIB, PIW, PID / PQB, PQW, PQD
+     * Address Register Indirect: [AR1, P#...], [AR2, P#...]
+     * Constants: S5T#..., S5TIME#..., T#..., TIME#..., D#..., TOD#..., DT#...,
+       16#..., 2#..., integer, floating point, pointer, character, byte literals
    - Enforces 0..7 bit bounds within bytes and family-specific address boundaries.
-   - Handles both International (English: A, AN, O, ON, =, S, R, I, Q) and
-     German (SIMATIC German: U, UN, O, ON, =, S, R, E, A) mnemonics.
-   - Detects common cross-PLC / LLM hallucinations (LD, OUT, ANDN, TON, X0, Y0)
+   - Handles both International (English: A, AN, O, ON, =, S, R, I, Q, JU, JC, SP, CU) and
+     German (SIMATIC German: U, UN, O, ON, =, S, R, E, A, SPA, SPB, SI, ZV) mnemonics.
+   - Detects common cross-PLC / foreign mnemonics (LD, OUT, ANDN, TON, X0, Y0)
      with precise actionable hints and optional auto-correction.
 
 2. Static Safety & Interlock Analyzer:
    - Star-Delta contactor switching hazard:
      Warns if Star and Delta contactor coils are activated without mutual
-     software interlocks (AN opposing coil) or without dead-time timer delay.
+     software interlocks (AN opposing coil / opposing symbol) or without dead-time timer delay.
+     Supports both English ("STAR"/"DELTA") and German ("STERN"/"DREIECK") naming.
    - Duplicate coil assignment detector:
-     Flags destructive duplicate '=' assignments to identical outputs/markers.
+     Flags destructive duplicate '=' assignments to identical outputs/markers,
+     cross-resolving named symbols to physical bit addresses.
    - Unassigned / uninitialized timers & counters.
    - Unused symbol definitions.
 
 3. Siemens AWL (STL) Source Code & Symbol Table Round-Trip Bridge:
    - Generates fully compliant Siemens STEP 7 AWL text source files
-     (OB 1, FC, FB) with proper network markers and comments.
-   - Generates and validates standard Siemens Symbol Tables (.SDF and .CSV).
+     (OB 1, FC, FB) with proper network markers, labels, and comments.
+   - Generates and parses standard Siemens Symbol Tables (.SDF and .CSV).
    - Exports, parses, and normalizes compiled blocks to guarantee readback equality.
 
 4. Serialized SIMATIC Manager GUI Automation (pywinauto):
    - Automates SIMATIC Manager (s7tgtopx.exe) and the LAD/FBD/STL Editor (s7kotx.exe).
+   - Creates projects natively or establishes offline workspace structure.
    - Validates active project and block prior to any edit.
    - Backs up current block to ~/Documents/Codex-Simatic7/ before modification.
    - Imports candidate AWL, executes compile/check, and verifies readback.
@@ -238,16 +245,23 @@ SUPPORTED_S7_OPCODES: Dict[str, Tuple[int, int]] = {
     "SAVE": (0, 0),
     "FP": (1, 1),   # Edge positive
     "FN": (1, 1),   # Edge negative
-    # Timers (S7 Timers)
+    # Timers (English S7 Timers)
     "SP": (1, 1),   # Pulse timer
-    "SE": (1, 1),   # Extended pulse
+    "SE": (1, 1),   # Extended pulse (English) / On-delay (German)
     "SD": (1, 1),   # On-delay timer
     "SS": (1, 1),   # Retentive on-delay
     "SF": (1, 1),   # Off-delay timer
     "FR": (1, 1),   # Free timer / counter
-    # Counters (S7 Counters)
+    # Timers (German S7 Timers)
+    "SI": (1, 1),   # Impuls
+    "SV": (1, 1),   # Verlängerter Impuls
+    "SA": (1, 1),   # Ausschaltverzögerung
+    # Counters (English S7 Counters)
     "CU": (1, 1),   # Count up
     "CD": (1, 1),   # Count down
+    # Counters (German S7 Counters)
+    "ZV": (1, 1),   # Zählen Vorwärts
+    "ZR": (1, 1),   # Zählen Rückwärts
     # Load and Transfer
     "L": (1, 1),    # Load into ACCU1
     "LC": (1, 1),   # Load current time/counter in BCD
@@ -256,6 +270,16 @@ SUPPORTED_S7_OPCODES: Dict[str, Tuple[int, int]] = {
     "CAW": (0, 0),  # Byte swap word in ACCU1
     "CAD": (0, 0),  # Byte swap dword in ACCU1
     "NOP": (0, 1),  # NOP or NOP 0 / NOP 1
+    # Address Register & Stack Instructions
+    "LAR1": (0, 1), # Load Address Register 1
+    "LAR2": (0, 1), # Load Address Register 2
+    "TAR1": (0, 1), # Transfer Address Register 1
+    "TAR2": (0, 1), # Transfer Address Register 2
+    "CAR": (0, 0),  # Exchange Address Registers AR1 and AR2
+    "PUSH": (0, 0), # Push ACCU stack
+    "POP": (0, 0),  # Pop ACCU stack
+    "ENT": (0, 0),  # Enter ACCU stack
+    "LEAVE": (0, 0),# Leave ACCU stack
     # Comparison Instructions (operate on ACCU1 and ACCU2)
     "==I": (0, 0), "<>I": (0, 0), ">I": (0, 0), "<I": (0, 0), ">=I": (0, 0), "<=I": (0, 0),
     "==D": (0, 0), "<>D": (0, 0), ">D": (0, 0), "<D": (0, 0), ">=D": (0, 0), "<=D": (0, 0),
@@ -281,15 +305,70 @@ SUPPORTED_S7_OPCODES: Dict[str, Tuple[int, int]] = {
     "DTR": (0, 0), "DTB": (0, 0), "TRUNC": (0, 0), "ROUND": (0, 0),
     "CEIL": (0, 0), "FLOOR": (0, 0), "INVI": (0, 0), "INVD": (0, 0),
     "NEGI": (0, 0), "NEGD": (0, 0), "NEGR": (0, 0),
-    # Program Flow, Calls and Jumps
+    # Program Flow, Calls and Jumps (English)
     "JU": (1, 1), "JC": (1, 1), "JCN": (1, 1), "JCB": (1, 1), "JNB": (1, 1),
-    "JBI": (1, 1), "JNBI": (1, 1), "LOOP": (1, 1),
+    "JBI": (1, 1), "JNBI": (1, 1), "JL": (1, 1), "LOOP": (1, 1),
     "BE": (0, 0), "BEC": (0, 0), "BEU": (0, 0),
     "CALL": (1, 10),
     "CC": (1, 1),
     "UC": (1, 1),
     "OPN": (1, 1),  # Open DB or DI
     "MCR(": (0, 0), ")MCR": (0, 0), "MCRA": (0, 0), "MCRD": (0, 0),
+    "STP": (0, 0),  # Stop CPU
+    # Program Flow, Calls and Jumps (German aliases)
+    "SPA": (1, 1),  # Sprung Absolut = JU
+    "SPB": (1, 1),  # Sprung Bedingt = JC
+    "SPBN": (1, 1), # Sprung Bedingt Nicht = JCN
+    "SPBB": (1, 1), # Sprung mit BR = JCB
+    "SPBI": (1, 1), # Sprung wenn BR=1 = JBI
+    "SPBIN": (1, 1),# Sprung wenn BR=0 = JNBI
+    "SPL": (1, 1),  # Sprungleiste = JL
+    "BEA": (0, 0),  # Bausteinende Absolut = BE
+    "BEB": (0, 0),  # Bausteinende Bedingt = BEC
+}
+
+# Translation mapping between German and International mnemonics
+GERMAN_TO_INTL_OPCODES: Dict[str, str] = {
+    "U": "A",
+    "UN": "AN",
+    "U(": "A(",
+    "UN(": "AN(",
+    "SPA": "JU",
+    "SPB": "JC",
+    "SPBN": "JCN",
+    "SPBB": "JCB",
+    "SPBI": "JBI",
+    "SPBIN": "JNBI",
+    "SPL": "JL",
+    "BEA": "BE",
+    "BEB": "BEC",
+    "SI": "SP",
+    "SV": "SE",
+    "SA": "SF",
+    "ZV": "CU",
+    "ZR": "CD",
+}
+
+INTL_TO_GERMAN_OPCODES: Dict[str, str] = {
+    "A": "U",
+    "AN": "UN",
+    "A(": "U(",
+    "AN(": "UN(",
+    "JU": "SPA",
+    "JC": "SPB",
+    "JCN": "SPBN",
+    "JCB": "SPBB",
+    "JBI": "SPBI",
+    "JNBI": "SPBIN",
+    "JL": "SPL",
+    "BE": "BEA",
+    "BEC": "BEB",
+    "SP": "SI",
+    "SE": "SV",
+    "SD": "SE",
+    "SF": "SA",
+    "CU": "ZV",
+    "CD": "ZR",
 }
 
 # Mapping common LLM hallucinations or foreign PLC mnemonics to Siemens S7 STL
@@ -322,35 +401,77 @@ S7_OPCODE_HINTS: Dict[str, str] = {
 }
 
 # Regex patterns for S7 Operands
+# 1. Bit Devices (I, Q, M, E, A, L)
 S7_BIT_DEVICE_REGEX = re.compile(
-    r"^([IQMEA])\s*(\d+)\.([0-7])$", re.IGNORECASE
+    r"^([IQMEAL])\s*(\d+)\.([0-7])$", re.IGNORECASE
 )
+# 2. Byte Devices (IB, QB, MB, EB, AB, LB, PIB, PQB, PEB, PAB)
 S7_BYTE_DEVICE_REGEX = re.compile(
     r"^(IB|QB|MB|EB|AB|LB|PIB|PQB|PEB|PAB)\s*(\d+)$", re.IGNORECASE
 )
+# 3. Word Devices (IW, QW, MW, EW, AW, LW, PIW, PQW, PEW, PAW)
 S7_WORD_DEVICE_REGEX = re.compile(
     r"^(IW|QW|MW|EW|AW|LW|PIW|PQW|PEW|PAW)\s*(\d+)$", re.IGNORECASE
 )
+# 4. Double Word Devices (ID, QD, MD, ED, AD, LD, PID, PQD, PED, PAD)
 S7_DWORD_DEVICE_REGEX = re.compile(
     r"^(ID|QD|MD|ED|AD|LD|PID|PQD|PED|PAD)\s*(\d+)$", re.IGNORECASE
 )
+# 5. Timers
 S7_TIMER_REGEX = re.compile(r"^T\s*(\d+)$", re.IGNORECASE)
+# 6. Counters
 S7_COUNTER_REGEX = re.compile(r"^([CZ])\s*(\d+)$", re.IGNORECASE)
+# 7. Block References (FC, FB, OB, DB, DI, SFC, SFB)
+S7_BLOCK_OPERAND_REGEX = re.compile(
+    r"^(FC|FB|OB|SFC|SFB|DB|DI)\s*(\d+)$", re.IGNORECASE
+)
+# 8. DB Elements (DB1.DBX 0.0 or standalone DBX 0.0 / DBW 2 / DBD 4)
 S7_DB_ELEMENT_REGEX = re.compile(
-    r"^(DB\d+|DI\d+)\.(DBX|DBB|DBW|DBD|DIX|DIB|DIW|DID)\s*(\d+)(\.([0-7]))?$",
+    r"^((DB\d+|DI\d+)\.)?(DBX|DBB|DBW|DBD|DIX|DIB|DIW|DID)\s*(\d+)(\.([0-7]))?$",
     re.IGNORECASE,
 )
+# 9. Status Word Bit Queries (==0, <>0, >0, <0, >=0, <=0, OV, OS, BR, UO)
+S7_STATUS_BIT_REGEX = re.compile(
+    r"^(==0|<>0|>0|<0|>=0|<=0|OV|OS|BR|UO)$", re.IGNORECASE
+)
+# 10. Named Symbols and Local Block Variables
 S7_NAMED_SYMBOL_REGEX = re.compile(r"^\"([A-Za-z0-9_]{1,24})\"$")
 S7_LOCAL_VAR_REGEX = re.compile(r"^#([A-Za-z0-9_]{1,24})$")
 
 # S7 Constants
-S7_S5TIME_REGEX = re.compile(r"^S5T#(\d+([A-Za-z]+))+$", re.IGNORECASE)
-S7_TIME_REGEX = re.compile(r"^(T|TIME)#(\d+([A-Za-z]+))+$", re.IGNORECASE)
+S7_S5TIME_REGEX = re.compile(r"^(S5T|S5TIME)#(\d+[A-Za-z]+)(_\d+[A-Za-z]+)*$", re.IGNORECASE)
+S7_TIME_REGEX = re.compile(r"^(T|TIME)#(\d+[A-Za-z]+)(_\d+[A-Za-z]+)*$", re.IGNORECASE)
+S7_DATE_REGEX = re.compile(r"^(D|DATE)#\d{4}-\d{1,2}-\d{1,2}$", re.IGNORECASE)
+S7_TOD_REGEX = re.compile(r"^(TOD|TIME_OF_DAY)#\d{1,2}:\d{1,2}(:\d{1,2}(\.\d+)?)?$", re.IGNORECASE)
+S7_DT_REGEX = re.compile(r"^(DT|DATE_AND_TIME)#\d{4}-\d{1,2}-\d{1,2}-\d{1,2}:\d{1,2}:\d{1,2}(\.\d+)?$", re.IGNORECASE)
 S7_HEX_REGEX = re.compile(r"^(W#16#|DW#16#|B#16#|16#)[0-9A-Fa-f]+$", re.IGNORECASE)
 S7_BIN_REGEX = re.compile(r"^2#[01_]+$", re.IGNORECASE)
 S7_INT_REGEX = re.compile(r"^(L#)?-?\d+$", re.IGNORECASE)
 S7_REAL_REGEX = re.compile(r"^-?\d+\.\d+([eE][+-]?\d+)?$")
 S7_POINTER_REGEX = re.compile(r"^P#.*$", re.IGNORECASE)
+S7_CHAR_REGEX = re.compile(r"^(C#)?'[^']{1,4}'$", re.IGNORECASE)
+S7_BYTE_CONST_REGEX = re.compile(r"^B#(\d+|16#[0-9A-Fa-f]+|2#[01_]+|\(-?\d+,\s*-?\d+\))$", re.IGNORECASE)
+S7_INDIRECT_ADDR_REGEX = re.compile(
+    r"^((DBX|DBB|DBW|DBD|DIX|DIB|DIW|DID|I|Q|M|L|E|A)\s*)?\[\s*(AR1|AR2)(\s*,\s*P#[^\]]+)?\s*\]$",
+    re.IGNORECASE,
+)
+
+S7_ALL_ADDRESS_PATTERNS = [
+    S7_BIT_DEVICE_REGEX,
+    S7_BYTE_DEVICE_REGEX,
+    S7_WORD_DEVICE_REGEX,
+    S7_DWORD_DEVICE_REGEX,
+    S7_TIMER_REGEX,
+    S7_COUNTER_REGEX,
+    S7_BLOCK_OPERAND_REGEX,
+    S7_DB_ELEMENT_REGEX,
+]
+
+
+def _is_potential_s7_address(s: str) -> bool:
+    """Returns True if string matches any standard S7 memory or device address pattern."""
+    clean = s.strip()
+    return any(p.fullmatch(clean) is not None for p in S7_ALL_ADDRESS_PATTERNS)
 
 
 # ============================================================================
@@ -392,14 +513,28 @@ class S7ValidationReport:
 def canonical_s7_address(operand: str) -> str:
     """
     Normalizes S7 addresses into canonical uppercase representation with
-    proper spacing (e.g. 'I0.0' -> 'I 0.0', 'm10.1' -> 'M 10.1', 't1' -> 'T 1').
+    proper spacing (e.g. 'I0.0' -> 'I 0.0', 'm10.1' -> 'M 10.1', 't1' -> 'T 1',
+    'fc1' -> 'FC 1', 'dbx0.0' -> 'DBX 0.0').
     """
     clean = operand.strip()
-    # Bit address: I 0.0, Q 0.1, M 10.2, E 0.0, A 0.0
+    if not clean:
+        return ""
+
+    # Handle comma-separated operands (e.g. 'FC 1, DB 1')
+    if "," in clean:
+        return ", ".join(canonical_s7_address(part.strip()) for part in clean.split(",") if part.strip())
+
+    # Bit address: I 0.0, Q 0.1, M 10.2, E 0.0, A 0.0, L 0.0
     m_bit = S7_BIT_DEVICE_REGEX.fullmatch(clean)
     if m_bit:
         prefix, byte_num, bit_num = m_bit.groups()
         return f"{prefix.upper()} {int(byte_num)}.{bit_num}"
+
+    # Block reference: FC 1, FB 1, OB 1, DB 1, DI 1, SFC 1, SFB 1
+    m_blk = S7_BLOCK_OPERAND_REGEX.fullmatch(clean)
+    if m_blk:
+        return f"{m_blk.group(1).upper()} {int(m_blk.group(2))}"
+
     # Byte / Word / DWord
     m_byte = S7_BYTE_DEVICE_REGEX.fullmatch(clean)
     if m_byte:
@@ -410,6 +545,7 @@ def canonical_s7_address(operand: str) -> str:
     m_dword = S7_DWORD_DEVICE_REGEX.fullmatch(clean)
     if m_dword:
         return f"{m_dword.group(1).upper()} {int(m_dword.group(2))}"
+
     # Timer / Counter
     m_t = S7_TIMER_REGEX.fullmatch(clean)
     if m_t:
@@ -417,14 +553,23 @@ def canonical_s7_address(operand: str) -> str:
     m_c = S7_COUNTER_REGEX.fullmatch(clean)
     if m_c:
         return f"{m_c.group(1).upper()} {int(m_c.group(2))}"
-    # DB Elements
+
+    # DB Elements (DB1.DBX 0.0 or standalone DBX 0.0 / DBW 2)
     m_db = S7_DB_ELEMENT_REGEX.fullmatch(clean)
     if m_db:
-        db_blk = m_db.group(1).upper()
-        db_type = m_db.group(2).upper()
-        offset = int(m_db.group(3))
-        bit_part = f".{m_db.group(5)}" if m_db.group(5) is not None else ""
-        return f"{db_blk}.{db_type} {offset}{bit_part}"
+        db_pfx = m_db.group(1)
+        db_type = m_db.group(3).upper()
+        offset = int(m_db.group(4))
+        bit_part = f".{m_db.group(6)}" if m_db.group(6) is not None else ""
+        if db_pfx:
+            return f"{db_pfx.upper()}{db_type} {offset}{bit_part}"
+        return f"{db_type} {offset}{bit_part}"
+
+    # Status Bits
+    m_status = S7_STATUS_BIT_REGEX.fullmatch(clean)
+    if m_status:
+        return m_status.group(1).upper()
+
     return clean.upper()
 
 
@@ -447,7 +592,7 @@ def _validate_s7_operand(operand: str, profile: S7PLCProfile) -> Tuple[bool, Opt
             f"use '{s7_equiv} 0.0' or 'E/A' for Siemens."
         ), None
 
-    # 1. Bit Devices (I, Q, M, E, A)
+    # 1. Bit Devices (I, Q, M, E, A, L)
     m_bit = S7_BIT_DEVICE_REGEX.fullmatch(clean)
     if m_bit:
         pfx, byte_str, bit_str = m_bit.groups()
@@ -459,10 +604,23 @@ def _validate_s7_operand(operand: str, profile: S7PLCProfile) -> Tuple[bool, Opt
             return False, f"Output byte address '{clean}' exceeds maximum {profile.max_output_byte} for {profile.name}.", None
         if pfx_up == "M" and byte_val > profile.max_marker_byte:
             return False, f"Marker byte address '{clean}' exceeds maximum {profile.max_marker_byte} for {profile.name}.", None
+        if pfx_up == "L" and byte_val > 65535:
+            return False, f"Local byte address '{clean}' exceeds maximum 65535.", None
         canon = f"{pfx_up} {byte_val}.{bit_str}"
         return True, None, canon
 
-    # 2. Byte Devices
+    # 2. Block References (FC, FB, OB, DB, DI, SFC, SFB)
+    m_blk = S7_BLOCK_OPERAND_REGEX.fullmatch(clean)
+    if m_blk:
+        blk_kind = m_blk.group(1).upper()
+        blk_num = int(m_blk.group(2))
+        if blk_kind in ("DB", "DI") and blk_num > profile.max_db_num:
+            return False, f"Data Block number '{blk_kind} {blk_num}' exceeds maximum {profile.max_db_num} for {profile.name}.", None
+        if blk_num > 65535:
+            return False, f"Block number '{blk_kind} {blk_num}' exceeds maximum 65535.", None
+        return True, None, f"{blk_kind} {blk_num}"
+
+    # 3. Byte Devices
     m_b = S7_BYTE_DEVICE_REGEX.fullmatch(clean)
     if m_b:
         pfx, byte_str = m_b.groups()
@@ -476,7 +634,7 @@ def _validate_s7_operand(operand: str, profile: S7PLCProfile) -> Tuple[bool, Opt
             return False, f"Marker byte '{clean}' exceeds maximum {profile.max_marker_byte} for {profile.name}.", None
         return True, None, f"{pfx_up} {byte_val}"
 
-    # 3. Word Devices
+    # 4. Word Devices
     m_w = S7_WORD_DEVICE_REGEX.fullmatch(clean)
     if m_w:
         pfx, byte_str = m_w.groups()
@@ -490,7 +648,7 @@ def _validate_s7_operand(operand: str, profile: S7PLCProfile) -> Tuple[bool, Opt
             return False, f"Marker word '{clean}' exceeds address range for {profile.name}.", None
         return True, None, f"{pfx_up} {byte_val}"
 
-    # 4. Double Word Devices
+    # 5. Double Word Devices
     m_d = S7_DWORD_DEVICE_REGEX.fullmatch(clean)
     if m_d:
         pfx, byte_str = m_d.groups()
@@ -504,7 +662,7 @@ def _validate_s7_operand(operand: str, profile: S7PLCProfile) -> Tuple[bool, Opt
             return False, f"Marker dword '{clean}' exceeds address range for {profile.name}.", None
         return True, None, f"{pfx_up} {byte_val}"
 
-    # 5. Timers
+    # 6. Timers
     m_t = S7_TIMER_REGEX.fullmatch(clean)
     if m_t:
         t_num = int(m_t.group(1))
@@ -512,7 +670,7 @@ def _validate_s7_operand(operand: str, profile: S7PLCProfile) -> Tuple[bool, Opt
             return False, f"Timer '{clean}' exceeds maximum T {profile.max_timer_num} for {profile.name}.", None
         return True, None, f"T {t_num}"
 
-    # 6. Counters
+    # 7. Counters
     m_c = S7_COUNTER_REGEX.fullmatch(clean)
     if m_c:
         pfx, c_str = m_c.groups()
@@ -521,35 +679,53 @@ def _validate_s7_operand(operand: str, profile: S7PLCProfile) -> Tuple[bool, Opt
             return False, f"Counter '{clean}' exceeds maximum {profile.max_counter_num} for {profile.name}.", None
         return True, None, f"{pfx.upper()} {c_num}"
 
-    # 7. DB Elements
+    # 8. DB Elements (DB1.DBX 0.0 or DBX 0.0)
     m_db = S7_DB_ELEMENT_REGEX.fullmatch(clean)
     if m_db:
-        db_num = int(m_db.group(1)[2:])
-        if db_num > profile.max_db_num:
-            return False, f"Data Block number '{m_db.group(1)}' exceeds maximum DB {profile.max_db_num}.", None
-        offset = int(m_db.group(3))
+        db_pfx = m_db.group(1)
+        if db_pfx:
+            num_part = re.search(r"\d+", db_pfx)
+            if num_part:
+                db_num = int(num_part.group(0))
+                if db_num > profile.max_db_num:
+                    return False, f"Data Block number '{db_pfx}' exceeds maximum DB {profile.max_db_num}.", None
+        offset = int(m_db.group(4))
         if offset > profile.max_db_byte:
             return False, f"DB byte offset '{offset}' exceeds maximum {profile.max_db_byte}.", None
         canon = canonical_s7_address(clean)
         return True, None, canon
 
-    # 8. Named Symbols or Local Variables: "MOTOR_RUN" or #TEMP_VAL
+    # 9. Status Word Bit Queries (==0, <>0, >0, <0, >=0, <=0, OV, OS, BR, UO)
+    m_status = S7_STATUS_BIT_REGEX.fullmatch(clean)
+    if m_status:
+        return True, None, m_status.group(1).upper()
+
+    # 10. Address Register Indirect Addressing: [AR1, P#...], [AR2, P#...]
+    if S7_INDIRECT_ADDR_REGEX.fullmatch(clean):
+        return True, None, clean.upper()
+
+    # 11. Named Symbols or Local Variables: "MOTOR_RUN" or #TEMP_VAL
     if S7_NAMED_SYMBOL_REGEX.fullmatch(clean) or S7_LOCAL_VAR_REGEX.fullmatch(clean):
         return True, None, clean
 
-    # 9. Constants: S5T#, TIME#, 16#, 2#, integer, real, pointer
+    # 12. Constants: S5T#, TIME#, D#, TOD#, DT#, 16#, 2#, integer, real, pointer, char, byte
     if (
         S7_S5TIME_REGEX.fullmatch(clean)
         or S7_TIME_REGEX.fullmatch(clean)
+        or S7_DATE_REGEX.fullmatch(clean)
+        or S7_TOD_REGEX.fullmatch(clean)
+        or S7_DT_REGEX.fullmatch(clean)
         or S7_HEX_REGEX.fullmatch(clean)
         or S7_BIN_REGEX.fullmatch(clean)
         or S7_INT_REGEX.fullmatch(clean)
         or S7_REAL_REGEX.fullmatch(clean)
         or S7_POINTER_REGEX.fullmatch(clean)
+        or S7_CHAR_REGEX.fullmatch(clean)
+        or S7_BYTE_CONST_REGEX.fullmatch(clean)
     ):
         return True, None, clean.upper()
 
-    # 10. Labels for jumps (alphanumeric up to 16 chars)
+    # 13. Labels for jumps (alphanumeric up to 16 chars)
     if re.fullmatch(r"^[A-Za-z_][A-Za-z0-9_]{0,15}$", clean):
         return True, None, clean
 
@@ -563,43 +739,77 @@ def estimate_s7_instruction_bytes(opcode: str, operands: List[str]) -> int:
         return 2
     if op in ("A(", "AN(", "O(", "ON(", "X(", "XN(", "U(", "UN(", ")", "NOT", "SET", "CLR", "SAVE"):
         return 2
-    if op in ("SP", "SE", "SD", "SS", "SF", "FR", "CU", "CD"):
+    if op in ("SP", "SE", "SD", "SS", "SF", "FR", "CU", "CD", "SI", "SV", "SA", "ZV", "ZR"):
         return 2
-    if op in ("L", "T"):
+    if op in ("L", "LC", "T"):
         if operands and (operands[0].startswith("DB") or operands[0].startswith("DI")):
             return 4
-        if operands and any(operands[0].startswith(p) for p in ("16#", "2#", "DW#16#", "L#", "P#")):
+        if operands and any(operands[0].startswith(p) for p in ("16#", "2#", "DW#16#", "L#", "P#", "S5T#", "T#", "D#", "TOD#", "DT#")):
             return 6
+        return 2
+    if op in ("LAR1", "LAR2", "TAR1", "TAR2", "CAR"):
+        return 4
+    if op in ("PUSH", "POP", "ENT", "LEAVE", "STP"):
         return 2
     if op in ("==I", "<>I", ">I", "<I", ">=I", "<=I", "==D", "<>D", ">D", "<D", ">=D", "<=D", "==R", "<>R", ">R", "<R", ">=R", "<=R"):
         return 2
     if op in ("+I", "-I", "*I", "/I", "+D", "-D", "*D", "/D", "MOD", "+R", "-R", "*R", "/R"):
         return 2
-    if op in ("JU", "JC", "JCN", "JCB", "JNB", "JBI", "JNBI", "LOOP"):
+    if op in ("JU", "JC", "JCN", "JCB", "JNB", "JBI", "JNBI", "LOOP", "SPA", "SPB", "SPBN", "SPBB", "SPBI", "SPBIN", "JL", "SPL"):
         return 4
-    if op == "CALL":
+    if op in ("BE", "BEC", "BEU", "BEA", "BEB"):
+        return 2
+    if op in ("CALL", "CC", "UC"):
         return 6
+    if op == "OPN":
+        return 4
     return 2
 
 
 def _validate_symbol_map(symbols_input: Any) -> Tuple[List[str], List[S7SymbolEntry]]:
-    """Validates S7 symbol table definitions."""
+    """
+    Validates S7 symbol table definitions.
+    Supports Symbol -> Address, Address -> Symbol/Comment, or list of dicts.
+    """
     errors: List[str] = []
     symbol_entries: List[S7SymbolEntry] = []
     if symbols_input is None:
         return errors, symbol_entries
 
-    # Can be passed as dict {"START": "I 0.0"} or list of dicts [{"symbol": "START", "address": "I 0.0", ...}]
     items: List[Dict[str, str]] = []
     if isinstance(symbols_input, dict):
         for k, v in symbols_input.items():
-            if isinstance(v, str):
-                items.append({"symbol": str(k), "address": v, "comment": ""})
-            elif isinstance(v, dict):
-                entry = {"symbol": str(k), **v}
-                items.append(entry)
+            k_str = str(k).strip()
+            # Auto-detect if key is an S7 address
+            if _is_potential_s7_address(k_str):
+                if isinstance(v, str):
+                    v_str = v.strip()
+                    if re.fullmatch(r"^[A-Za-z_][A-Za-z0-9_]{0,23}$", v_str):
+                        items.append({"symbol": v_str, "address": k_str, "data_type": "BOOL", "comment": ""})
+                    else:
+                        gen_sym = re.sub(r"[^A-Za-z0-9_]", "_", v_str).strip("_")[:24]
+                        if not gen_sym or not gen_sym[0].isalpha():
+                            gen_sym = f"SYM_{gen_sym}"[:24]
+                        items.append({"symbol": gen_sym, "address": k_str, "data_type": "BOOL", "comment": v_str})
+                elif isinstance(v, dict):
+                    sym = v.get("symbol") or re.sub(r"[^A-Za-z0-9_]", "_", k_str).replace(".", "_")
+                    items.append({
+                        "symbol": str(sym),
+                        "address": k_str,
+                        "data_type": v.get("data_type", "BOOL"),
+                        "comment": v.get("comment", ""),
+                    })
+                else:
+                    errors.append(f"Invalid symbol entry value for address key '{k}'.")
             else:
-                errors.append(f"Invalid symbol entry value for key '{k}'.")
+                # Key is symbol name
+                if isinstance(v, str):
+                    items.append({"symbol": k_str, "address": v.strip(), "data_type": "BOOL", "comment": ""})
+                elif isinstance(v, dict):
+                    entry = {"symbol": k_str, **v}
+                    items.append(entry)
+                else:
+                    errors.append(f"Invalid symbol entry value for key '{k}'.")
     elif isinstance(symbols_input, list):
         for idx, item in enumerate(symbols_input, start=1):
             if not isinstance(item, dict):
@@ -640,7 +850,6 @@ def _validate_symbol_map(symbols_input: Any) -> Tuple[List[str], List[S7SymbolEn
             continue
         canon_addr = canonical_s7_address(addr)
         if canon_addr in seen_addresses:
-            # Note: Overlapping symbol addresses can occur with subfields, but exact duplicates are errors
             errors.append(f"Duplicate symbol address '{addr}' for symbol '{sym_name}'.")
         seen_addresses.add(canon_addr)
 
@@ -683,20 +892,29 @@ def validate_and_analyze_program(
         report.valid = False
         report.errors.extend(sym_errors)
 
+    # Build symbol lookup map: symbol -> canonical address and address -> symbol
+    symbol_to_addr: Dict[str, str] = {}
+    addr_to_symbol: Dict[str, str] = {}
+    for entry in symbol_entries:
+        symbol_to_addr[f'"{entry.symbol.upper()}"'] = entry.address.upper()
+        symbol_to_addr[entry.symbol.upper()] = entry.address.upper()
+        addr_to_symbol[entry.address.upper()] = entry.symbol.upper()
+
     if not isinstance(networks_input, list) or not networks_input:
         report.valid = False
         report.errors.append("Provide at least one network as a list of network objects.")
         return report
 
-    assigned_coils: Dict[str, List[int]] = {}  # coil -> list of network indices
+    assigned_coils: Dict[str, List[int]] = {}  # canonical coil address -> list of network indices
     star_network: Optional[int] = None
     delta_network: Optional[int] = None
-    star_coil: Optional[str] = None
-    delta_coil: Optional[str] = None
-    network_interlocks: Dict[int, List[str]] = {}
+    star_coils: Set[str] = set()
+    delta_coils: Set[str] = set()
+    network_interlocks: Dict[int, Set[str]] = {}
 
     timers_started: Set[str] = set()
-    timers_loaded: Set[str] = set()
+
+    is_german_target = mnemonic_language.strip().lower() == "german"
 
     for net_idx, raw_net in enumerate(networks_input, start=1):
         if not isinstance(raw_net, dict):
@@ -704,7 +922,6 @@ def validate_and_analyze_program(
             report.errors.append(f"Network {net_idx} must be an object.")
             continue
 
-        # Support both 'title'/'statement' and 'comment'
         title = raw_net.get("title", raw_net.get("statement", ""))
         comment = raw_net.get("comment", "")
         if not isinstance(title, str):
@@ -728,7 +945,6 @@ def validate_and_analyze_program(
             continue
 
         norm_insts: List[str] = []
-        network_has_output = False
         last_loaded_time_val: bool = False
 
         for inst_idx, inst_line in enumerate(raw_insts, start=1):
@@ -747,6 +963,17 @@ def validate_and_analyze_program(
                 report.errors.append(f"Network {net_idx}, line {inst_idx}: blank lines and comment lines are not accepted as instructions.")
                 continue
 
+            # Check for label prefix on line (e.g. 'LAB1: L 100' or 'M001:')
+            label_prefix: Optional[str] = None
+            m_lbl = re.match(r"^([A-Za-z_][A-Za-z0-9_]{0,15}):\s*(.*)$", clean_line)
+            if m_lbl:
+                label_prefix = m_lbl.group(1).upper()
+                clean_line = m_lbl.group(2).strip()
+                if not clean_line:
+                    # Line contains only label; normalize to label with NOP 0
+                    norm_insts.append(f"{label_prefix}: NOP 0")
+                    continue
+
             # Split opcode and operands
             tokens = clean_line.split(maxsplit=1)
             raw_opcode = tokens[0].upper()
@@ -757,12 +984,21 @@ def validate_and_analyze_program(
                 hint = S7_OPCODE_HINTS[raw_opcode]
                 if auto_fix_mnemonics and raw_opcode in ("LD", "LDI", "LDN", "OUT", "AND", "ANI", "ANDN", "OR", "ORI", "ORN"):
                     fixed_opcode = hint
-                    report.warnings.append(f"Network {net_idx}, line {inst_idx}: converted mnemonic '{raw_opcode}' to Siemens '{fixed_opcode}'.")
+                    if is_german_target:
+                        fixed_opcode = INTL_TO_GERMAN_OPCODES.get(hint, hint)
+                    report.warnings.append(f"Network {net_idx}, line {inst_idx}: converted foreign mnemonic '{raw_opcode}' to Siemens '{fixed_opcode}'.")
                     raw_opcode = fixed_opcode
                 else:
                     report.valid = False
                     report.errors.append(f"Network {net_idx}, line {inst_idx}: unsupported mnemonic '{raw_opcode}'; use Siemens '{hint}'.")
                     continue
+
+            # Mnemonic language normalization if auto_fix_mnemonics is True
+            if auto_fix_mnemonics:
+                if is_german_target and raw_opcode in INTL_TO_GERMAN_OPCODES:
+                    raw_opcode = INTL_TO_GERMAN_OPCODES[raw_opcode]
+                elif not is_german_target and raw_opcode in GERMAN_TO_INTL_OPCODES:
+                    raw_opcode = GERMAN_TO_INTL_OPCODES[raw_opcode]
 
             # Check opcode validity
             if raw_opcode not in SUPPORTED_S7_OPCODES:
@@ -775,8 +1011,6 @@ def validate_and_analyze_program(
             # Parse operands
             operands: List[str] = []
             if raw_operand_str:
-                # In S7 AWL, operands can be comma-separated or space separated
-                # e.g. CALL FB 1, DB 1
                 if "," in raw_operand_str:
                     operands = [op.strip() for op in raw_operand_str.split(",") if op.strip()]
                 else:
@@ -800,11 +1034,13 @@ def validate_and_analyze_program(
                     validated_operands.append(canon or op)
                     if canon:
                         report.devices_used.add(canon)
+                    elif op.startswith('"'):
+                        report.devices_used.add(op)
 
             # Check Timer value loading sequence
-            if raw_opcode == "L" and validated_operands and validated_operands[0].startswith("S5T#"):
+            if raw_opcode == "L" and validated_operands and any(validated_operands[0].startswith(p) for p in ("S5T#", "S5TIME#")):
                 last_loaded_time_val = True
-            elif raw_opcode in ("SP", "SE", "SD", "SS", "SF"):
+            elif raw_opcode in ("SP", "SE", "SD", "SS", "SF", "SI", "SV", "SA"):
                 if validated_operands:
                     timer_name = validated_operands[0]
                     timers_started.add(timer_name)
@@ -817,32 +1053,53 @@ def validate_and_analyze_program(
                 last_loaded_time_val = False
 
             # Track output coils for duplicate assignment detection
-            if raw_opcode in ("=", "S", "R"):
-                network_has_output = True
-                if validated_operands and raw_opcode == "=":
-                    coil_addr = validated_operands[0]
-                    assigned_coils.setdefault(coil_addr, []).append(net_idx)
+            if raw_opcode == "=":
+                if validated_operands:
+                    raw_coil = validated_operands[0].upper()
+                    # Resolve to canonical physical address if symbolic
+                    canon_coil = symbol_to_addr.get(raw_coil, raw_coil)
+                    assigned_coils.setdefault(canon_coil, []).append(net_idx)
 
-            # Star-Delta Interlock Detection
-            # Look for keywords 'STAR' and 'DELTA' in title, comment, or symbol/device operands
+            # Star-Delta Interlock Detection (support English and German: STAR/DELTA, STERN/DREIECK)
             net_text = f"{title} {comment} {clean_line}".upper()
-            if "STAR" in net_text and raw_opcode in ("=", "S"):
+            if any(term in net_text for term in ("STAR", "STERN")) and raw_opcode in ("=", "S"):
                 star_network = net_idx
                 if validated_operands:
-                    star_coil = validated_operands[0]
-            if "DELTA" in net_text and raw_opcode in ("=", "S"):
+                    coil_name = validated_operands[0].upper()
+                    star_coils.add(coil_name)
+                    if coil_name in symbol_to_addr:
+                        star_coils.add(symbol_to_addr[coil_name])
+                    if coil_name in addr_to_symbol:
+                        star_coils.add(f'"{addr_to_symbol[coil_name]}"')
+            if any(term in net_text for term in ("DELTA", "DREIECK")) and raw_opcode in ("=", "S"):
                 delta_network = net_idx
                 if validated_operands:
-                    delta_coil = validated_operands[0]
+                    coil_name = validated_operands[0].upper()
+                    delta_coils.add(coil_name)
+                    if coil_name in symbol_to_addr:
+                        delta_coils.add(symbol_to_addr[coil_name])
+                    if coil_name in addr_to_symbol:
+                        delta_coils.add(f'"{addr_to_symbol[coil_name]}"')
 
             if raw_opcode in ("AN", "UN") and validated_operands:
-                network_interlocks.setdefault(net_idx, []).append(validated_operands[0])
+                interlock_op = validated_operands[0].upper()
+                targets = {interlock_op}
+                if interlock_op in symbol_to_addr:
+                    targets.add(symbol_to_addr[interlock_op])
+                if interlock_op in addr_to_symbol:
+                    targets.add(f'"{addr_to_symbol[interlock_op]}"')
+                network_interlocks.setdefault(net_idx, set()).update(targets)
 
             # Format normalized instruction string
             if validated_operands:
-                norm_insts.append(f"{raw_opcode} {', '.join(validated_operands)}")
+                inst_str = f"{raw_opcode} {', '.join(validated_operands)}"
             else:
-                norm_insts.append(raw_opcode)
+                inst_str = raw_opcode
+
+            if label_prefix:
+                norm_insts.append(f"{label_prefix}: {inst_str}")
+            else:
+                norm_insts.append(inst_str)
 
             report.estimated_mc7_bytes += estimate_s7_instruction_bytes(raw_opcode, validated_operands)
 
@@ -863,8 +1120,8 @@ def validate_and_analyze_program(
 
     # 2. Star-Delta Switching Hazard Check:
     if star_network is not None and delta_network is not None:
-        star_has_delta_interlock = bool(delta_coil and delta_coil in network_interlocks.get(star_network, []))
-        delta_has_star_interlock = bool(star_coil and star_coil in network_interlocks.get(delta_network, []))
+        star_has_delta_interlock = bool(delta_coils.intersection(network_interlocks.get(star_network, set())))
+        delta_has_star_interlock = bool(star_coils.intersection(network_interlocks.get(delta_network, set())))
         if not (star_has_delta_interlock and delta_has_star_interlock):
             report.warnings.append(
                 f"Star-Delta switching hazard detected between Network {star_network} and Network {delta_network}: "
@@ -875,8 +1132,17 @@ def validate_and_analyze_program(
     # 3. Check for unreferenced symbols:
     if symbol_entries:
         for sym in symbol_entries:
-            canon = sym.address
-            if canon not in report.devices_used and f"\"{sym.symbol}\"" not in report.devices_used:
+            canon = sym.address.upper()
+            sym_quoted = f'"{sym.symbol.upper()}"'
+            # Also check German equivalent of address (I <-> E, Q <-> A)
+            german_canon = re.sub(r"^I\b", "E", canon) if canon.startswith("I") else re.sub(r"^Q\b", "A", canon)
+            intl_canon = re.sub(r"^E\b", "I", canon) if canon.startswith("E") else re.sub(r"^A\b", "Q", canon)
+            if (
+                canon not in report.devices_used
+                and sym_quoted not in report.devices_used
+                and german_canon not in report.devices_used
+                and intl_canon not in report.devices_used
+            ):
                 report.warnings.append(
                     f"Symbol '{sym.symbol}' ({sym.address}) is declared but not referenced in the program logic."
                 )
@@ -950,14 +1216,29 @@ def generate_s7_awl_source(
         if net.comment:
             lines.append(f"// {net.comment}")
         for inst in net.instructions:
-            # Format with Siemens 6-space indentation and semicolon
-            tokens = inst.split(maxsplit=1)
-            opcode = tokens[0]
-            operands = tokens[1] if len(tokens) > 1 else ""
-            if operands:
-                lines.append(f"      {opcode:<6} {operands};")
+            m_lbl = re.match(r"^([A-Za-z_][A-Za-z0-9_]{0,15})\s*:\s*(.*)$", inst)
+            if m_lbl:
+                lbl = m_lbl.group(1)
+                rem = m_lbl.group(2).strip()
+                lbl_tag = f"{lbl}:"
+                if rem:
+                    tokens = rem.split(maxsplit=1)
+                    opcode = tokens[0]
+                    operands = tokens[1] if len(tokens) > 1 else ""
+                    if operands:
+                        lines.append(f"{lbl_tag:<8} {opcode:<6} {operands};")
+                    else:
+                        lines.append(f"{lbl_tag:<8} {opcode};")
+                else:
+                    lines.append(f"{lbl_tag:<8} ;")
             else:
-                lines.append(f"      {opcode};")
+                tokens = inst.split(maxsplit=1)
+                opcode = tokens[0]
+                operands = tokens[1] if len(tokens) > 1 else ""
+                if operands:
+                    lines.append(f"      {opcode:<6} {operands};")
+                else:
+                    lines.append(f"      {opcode};")
         lines.append("")
 
     if block_type_up == "OB":
@@ -981,7 +1262,6 @@ def parse_s7_awl_source(filepath: Path) -> Dict[str, Any]:
         raw_bytes = filepath.read_bytes()
         if not raw_bytes:
             return {"error": f"AWL source file is empty: {filepath}"}
-        # Detect encoding: UTF-8, ANSI (Windows-1252), UTF-16
         if raw_bytes.startswith(b"\xff\xfe"):
             text = raw_bytes[2:].decode("utf-16-le", errors="strict")
         elif raw_bytes.startswith(b"\xfe\xff"):
@@ -1050,7 +1330,6 @@ def parse_s7_awl_source(filepath: Path) -> Dict[str, Any]:
             continue
 
         if current_net is None:
-            # Instructions before first NETWORK tag belong to an implicit network
             current_net = {"title": "", "comment": "", "instructions": []}
 
         if line.upper().startswith("TITLE"):
@@ -1063,20 +1342,39 @@ def parse_s7_awl_source(filepath: Path) -> Dict[str, Any]:
             current_net["comment"] = line[2:].strip()
             continue
 
-        # Instruction line
-        clean_inst = line
-        if clean_inst.endswith(";"):
-            clean_inst = clean_inst[:-1].strip()
-        tokens = clean_inst.split(maxsplit=1)
-        if tokens:
-            op = tokens[0].upper()
-            args = tokens[1].strip() if len(tokens) > 1 else ""
-            if args:
-                # normalize operand address
-                canon_op = canonical_s7_address(args)
-                current_net["instructions"].append(f"{op} {canon_op}")
+        # Clean line: strip inline comments and trailing semicolons
+        code_part = line.split("//", 1)[0].strip()
+        if not code_part:
+            continue
+        if code_part.endswith(";"):
+            code_part = code_part[:-1].strip()
+
+        # Check for label prefix on code line
+        m_lbl = re.match(r"^([A-Za-z_][A-Za-z0-9_]{0,15})\s*:\s*(.*)$", code_part)
+        if m_lbl:
+            lbl = m_lbl.group(1).upper()
+            rem = m_lbl.group(2).strip()
+            if rem:
+                tokens = rem.split(maxsplit=1)
+                op = tokens[0].upper()
+                args = tokens[1].strip() if len(tokens) > 1 else ""
+                if args:
+                    canon_op = canonical_s7_address(args)
+                    current_net["instructions"].append(f"{lbl}: {op} {canon_op}")
+                else:
+                    current_net["instructions"].append(f"{lbl}: {op}")
             else:
-                current_net["instructions"].append(op)
+                current_net["instructions"].append(f"{lbl}: NOP 0")
+        else:
+            tokens = code_part.split(maxsplit=1)
+            if tokens:
+                op = tokens[0].upper()
+                args = tokens[1].strip() if len(tokens) > 1 else ""
+                if args:
+                    canon_op = canonical_s7_address(args)
+                    current_net["instructions"].append(f"{op} {canon_op}")
+                else:
+                    current_net["instructions"].append(op)
 
     if current_net is not None:
         networks.append(current_net)
@@ -1095,10 +1393,22 @@ def s7_instruction_signature(networks: List[Dict[str, Any]]) -> List[Tuple[str, 
     sig = []
     for net in networks:
         for inst in net.get("instructions", []):
-            parts = inst.split(maxsplit=1)
-            op = parts[0].upper()
-            args = parts[1].strip().upper() if len(parts) > 1 else ""
-            sig.append((op, canonical_s7_address(args)))
+            m_lbl = re.match(r"^([A-Za-z_][A-Za-z0-9_]{0,15})\s*:\s*(.*)$", inst)
+            if m_lbl:
+                lbl = m_lbl.group(1).upper()
+                rem = m_lbl.group(2).strip()
+                if rem:
+                    parts = rem.split(maxsplit=1)
+                    op = parts[0].upper()
+                    args = parts[1].strip().upper() if len(parts) > 1 else ""
+                    sig.append((f"{lbl}: {op}", canonical_s7_address(args)))
+                else:
+                    sig.append((f"{lbl}:", ""))
+            else:
+                parts = inst.split(maxsplit=1)
+                op = parts[0].upper()
+                args = parts[1].strip().upper() if len(parts) > 1 else ""
+                sig.append((op, canonical_s7_address(args)))
     return sig
 
 
@@ -1132,7 +1442,7 @@ def new_s7_artifact_path(prefix: str, suffix: str = ".awl") -> Path:
 
 
 # ============================================================================
-# 6. SYMBOL TABLE GENERATOR (.SDF / .CSV)
+# 6. SYMBOL TABLE GENERATOR & PARSER (.SDF / .CSV)
 # ============================================================================
 
 def generate_s7_symbol_sdf(symbol_entries: List[S7SymbolEntry]) -> str:
@@ -1159,6 +1469,85 @@ def generate_s7_symbol_csv(symbol_entries: List[S7SymbolEntry]) -> str:
     return output.getvalue()
 
 
+def parse_s7_symbol_table(filepath: Path) -> Dict[str, Any]:
+    """
+    Parses a Siemens STEP 7 Symbol Table (.SDF, .SEQ, or .CSV).
+    Extracts symbols, addresses, data types, and comments.
+    """
+    try:
+        raw_bytes = filepath.read_bytes()
+        if not raw_bytes:
+            return {"error": f"Symbol table file is empty: {filepath}"}
+        if raw_bytes.startswith(b"\xff\xfe"):
+            text = raw_bytes[2:].decode("utf-16-le", errors="strict")
+        elif raw_bytes.startswith(b"\xfe\xff"):
+            text = raw_bytes[2:].decode("utf-16-be", errors="strict")
+        elif raw_bytes.startswith(b"\xef\xbb\xbf"):
+            text = raw_bytes.decode("utf-8-sig", errors="strict")
+        else:
+            try:
+                text = raw_bytes.decode("utf-8", errors="strict")
+            except UnicodeDecodeError:
+                text = raw_bytes.decode("cp1252", errors="replace")
+    except FileNotFoundError:
+        return {"error": f"Symbol table file not found: {filepath}"}
+    except Exception as exc:
+        return {"error": f"Failed to read symbol table file: {exc}"}
+
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        return {"error": f"Symbol table contains no data: {filepath}"}
+
+    first_line = lines[0]
+    delimiter = "\t" if "\t" in first_line else ","
+    reader = csv.reader(lines, delimiter=delimiter)
+    raw_header = next(reader, [])
+    header = [h.strip().lower() for h in raw_header]
+
+    sym_idx = next((i for i, h in enumerate(header) if "sym" in h), 0)
+    addr_idx = next((i for i, h in enumerate(header) if "addr" in h or "oper" in h), 1)
+    dtype_idx = next((i for i, h in enumerate(header) if "data" in h or "typ" in h), 2)
+    comm_idx = next((i for i, h in enumerate(header) if "comm" in h or "rem" in h), 3)
+
+    entries: List[Dict[str, str]] = []
+    symbol_map: Dict[str, str] = {}
+    row_errors: List[str] = []
+
+    for row_idx, row in enumerate(reader, start=2):
+        if not row or not any(field.strip() for field in row):
+            continue
+        sym = row[sym_idx].strip() if len(row) > sym_idx else ""
+        addr = row[addr_idx].strip() if len(row) > addr_idx else ""
+        dtype = row[dtype_idx].strip() if len(row) > dtype_idx else "BOOL"
+        comm = row[comm_idx].strip() if len(row) > comm_idx else ""
+
+        if not sym and not addr:
+            continue
+        if not sym:
+            row_errors.append(f"Row {row_idx}: missing symbol name.")
+            continue
+        if not addr:
+            row_errors.append(f"Row {row_idx}: missing address for symbol '{sym}'.")
+            continue
+
+        canon_addr = canonical_s7_address(addr)
+        entries.append({
+            "symbol": sym,
+            "address": canon_addr,
+            "data_type": dtype.upper(),
+            "comment": comm,
+        })
+        symbol_map[sym] = canon_addr
+
+    return {
+        "file": str(filepath),
+        "symbol_count": len(entries),
+        "symbols": entries,
+        "symbol_map": symbol_map,
+        "errors": row_errors,
+    }
+
+
 # ============================================================================
 # 7. SERIALIZED SIMATIC MANAGER GUI CONTROLLER (pywinauto)
 # ============================================================================
@@ -1176,14 +1565,14 @@ class SimaticManagerController:
         self.import_started: bool = False
         self._last_confirmation: List[str] = []
 
-    def connect(self) -> Tuple[bool, str]:
+    def connect(self, timeout: float = 0.5) -> Tuple[bool, str]:
         """Connects to a running instance of SIMATIC Manager or the LAD/FBD/STL Editor."""
         if not PYWINAUTO_AVAILABLE:
             return False, "pywinauto is not installed."
         try:
             # 1. Look for LAD/FBD/STL Editor first if open
             try:
-                app = Application(backend="win32").connect(title_re=S7_EDITOR_WINDOW_TITLE_REGEX, timeout=1.5)
+                app = Application(backend="win32").connect(title_re=S7_EDITOR_WINDOW_TITLE_REGEX, timeout=timeout)
                 self.app = app
                 self.main_win = app.top_window()
                 return True, self.main_win.window_text()
@@ -1191,7 +1580,7 @@ class SimaticManagerController:
                 pass
 
             # 2. Look for SIMATIC Manager
-            app = Application(backend="win32").connect(title_re=S7_MANAGER_WINDOW_TITLE_REGEX, timeout=1.5)
+            app = Application(backend="win32").connect(title_re=S7_MANAGER_WINDOW_TITLE_REGEX, timeout=timeout)
             self.app = app
             self.main_win = app.top_window()
             return True, self.main_win.window_text()
@@ -1216,6 +1605,83 @@ class SimaticManagerController:
         except Exception as exc:
             return False, f"Failed to launch SIMATIC Manager: {exc}"
 
+    def create_project(self, project_name: str, plc_type: str = "S7-300") -> Tuple[bool, str, Dict[str, Any]]:
+        """
+        Creates a new project in SIMATIC Manager via native New Project dialog,
+        or creates an offline workspace project when SIMATIC Manager is not running.
+        """
+        profile, profile_err = resolve_s7_plc_profile(plc_type)
+        if profile_err or profile is None:
+            return False, profile_err or "Unsupported PLC type.", {}
+        if not project_name or not re.fullmatch(r"[A-Za-z0-9 _.-]{1,64}", project_name):
+            return False, "project_name must be 1-64 characters using letters, numbers, spaces, _, ., or -.", {}
+
+        # 1. Try native GUI automation if available and running
+        ok, title = self.connect()
+        if not ok:
+            ok, title = self.launch()
+
+        if ok and self.main_win:
+            try:
+                self.main_win.set_focus()
+                time.sleep(0.2)
+                try:
+                    self.main_win.menu_select("File->New...")
+                except Exception:
+                    send_keys("^n")
+                time.sleep(0.5)
+
+                dialog = None
+                deadline = time.time() + 6.0
+                while time.time() < deadline:
+                    for window in self.app.windows(visible_only=True):
+                        if window.handle != self.main_win.handle and window.class_name() == "#32770" and window.is_enabled():
+                            dialog = window
+                            break
+                    if dialog is not None:
+                        break
+                    time.sleep(0.1)
+
+                if dialog is not None:
+                    edits = [c for c in dialog.descendants() if c.friendly_class_name() == "Edit"]
+                    if edits:
+                        edits[0].set_edit_text(project_name)
+                    ok_btn = next((
+                        c for c in dialog.descendants()
+                        if c.friendly_class_name() == "Button"
+                        and c.window_text().replace("&", "").strip().lower() in ("ok", "ja", "yes", "save")
+                    ), None)
+                    if ok_btn:
+                        ok_btn.click()
+                    else:
+                        send_keys("{ENTER}")
+                    time.sleep(1.0)
+                    self._dismiss_popups(confirm=True, timeout=2.0)
+                    self.project_name = project_name
+                    return True, f"Created project '{project_name}' for {profile.name} in SIMATIC Manager.", {
+                        "mode": "gui",
+                        "project_name": project_name,
+                        "plc_type": profile.name,
+                    }
+            except Exception:
+                pass
+
+        # 2. Offline workspace project creation
+        proj_dir = WORKSPACE_DIR / "Projects" / project_name
+        proj_dir.mkdir(parents=True, exist_ok=True)
+        meta_file = proj_dir / "project.json"
+        meta = {
+            "project_name": project_name,
+            "plc_type": profile.name,
+            "created_at": datetime.datetime.now().isoformat(),
+            "workspace": str(proj_dir),
+            "status": "OFFLINE_PROJECT_CREATED",
+            "note": "Offline project workspace created. When SIMATIC Manager is running, use File->Open to attach.",
+        }
+        meta_file.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        self.project_name = project_name
+        return True, f"Initialized offline project workspace for '{project_name}' ({profile.name}).", meta
+
     def is_block_editor_active(self, expected_block: str = "OB1") -> Tuple[bool, str]:
         """Verifies that the target block editor is active and focused."""
         ok, title = self.connect()
@@ -1226,7 +1692,6 @@ class SimaticManagerController:
         current_title = self.main_win.window_text()
         if expected_block.upper() in current_title.upper():
             return True, current_title
-        # Also check child windows for MDI frames
         try:
             for w in self.app.windows():
                 if expected_block.upper() in w.window_text().upper():
@@ -1310,14 +1775,12 @@ class SimaticManagerController:
         try:
             self.main_win.set_focus()
             time.sleep(0.2)
-            # Try menu export or shortcut
             try:
                 self.main_win.menu_select("File->Export...")
             except Exception:
-                send_keys("^e")  # Standard export shortcut or fallback
+                send_keys("^e")
 
             time.sleep(0.5)
-            # Locate file dialog
             picker = self.app.window(title_re=r".*(Export|Save|Speichern).*")
             if picker.exists(timeout=2.0):
                 edit = picker.child_window(class_name="Edit")
@@ -1336,7 +1799,6 @@ class SimaticManagerController:
                 if output_path.exists() and output_path.stat().st_size > 0:
                     return True, str(output_path)
 
-            # Fallback if automation export wasn't visible: return informative notice
             return False, f"Export dialog did not complete. File not created at {output_path}"
         except Exception as exc:
             return False, f"Failed during S7 AWL export: {exc}"
@@ -1398,7 +1860,6 @@ class SimaticManagerController:
         try:
             self.main_win.set_focus()
             time.sleep(0.2)
-            # Save and compile shortcut in S7 LAD/FBD/STL Editor is Ctrl+S
             send_keys("^s")
             time.sleep(0.8)
             popups = self._dismiss_popups(confirm=True, timeout=2.5)
@@ -1406,9 +1867,7 @@ class SimaticManagerController:
             failure_terms = ("error", "fehler", "failed", "unable", "cannot", "invalid")
             if any(term in popup_text for term in failure_terms):
                 return False, popups
-            # Check for compile success indication
             if not popups:
-                # In STEP 7 LAD editor, saving with zero errors produces no modal dialogs or a brief status bar notice
                 return True, ["Save and compile completed with 0 errors."]
             return True, popups
         except Exception as exc:
@@ -1493,32 +1952,59 @@ def s7_get_status() -> str:
 
 
 @mcp.tool()
+def s7_list_supported_plc_types() -> str:
+    """
+    Lists supported Siemens S7 PLC families (S7-300, S7-400, WinAC), limits, aliases, and addressing conventions.
+    """
+    return json.dumps(
+        {
+            "families": [
+                {
+                    "family": profile.name,
+                    "max_input_bytes": profile.max_input_byte,
+                    "max_output_bytes": profile.max_output_byte,
+                    "max_marker_bytes": profile.max_marker_byte,
+                    "max_timers": profile.max_timer_num,
+                    "max_counters": profile.max_counter_num,
+                    "max_dbs": profile.max_db_num,
+                    "max_db_bytes": profile.max_db_byte,
+                    "addressing": "Bit bounds .0 to .7 (byte.bit); byte/word/dword addresses",
+                    "mnemonics": "International (I, Q, M, T, C, A, AN, O, S, R) and German (E, A, M, T, Z, U, UN, O, S, R)",
+                    "aliases": sorted(
+                        alias for alias, family in S7_PLC_TYPE_ALIASES.items() if family == key
+                    ),
+                }
+                for key, profile in sorted(S7_PLC_PROFILES.items())
+            ],
+            "note": (
+                "Family profiles enforce conservative Siemens STEP 7 Classic memory envelopes. "
+                "SIMATIC Manager block consistency check and compile remain authoritative for specific CPU configurations."
+            ),
+        },
+        indent=2,
+    )
+
+
+@mcp.tool()
 @serialized_gui
 def s7_create_project(project_name: str, plc_type: str = "S7-300") -> str:
     """
     Creates a new SIMATIC STEP 7 project targeting S7-300, S7-400, or WinAC.
+    Operates natively via SIMATIC Manager GUI or initializes offline project workspace artifacts.
     """
-    profile, profile_err = resolve_s7_plc_profile(plc_type)
-    if profile_err or profile is None:
-        return json.dumps({"success": False, "error": profile_err}, indent=2)
-    if not project_name or not re.fullmatch(r"[A-Za-z0-9 _.-]{1,64}", project_name):
-        return json.dumps({"success": False, "error": "project_name must be 1-64 characters using letters, numbers, spaces, _, ., or -."}, indent=2)
-
-    ok, title = controller.connect()
-    if not ok:
-        ok, title = controller.launch()
-    if not ok:
+    ok, message, meta = controller.create_project(project_name, plc_type)
+    if ok:
         return json.dumps({
-            "success": False,
-            "error": f"SIMATIC Manager could not be reached: {title}",
-            "hint": "Ensure SIMATIC Manager (s7tgtopx.exe) is installed or launch it manually."
+            "success": True,
+            "project_name": project_name,
+            "plc_type": meta.get("plc_type", plc_type),
+            "message": message,
+            "details": meta,
         }, indent=2)
-
     return json.dumps({
-        "success": True,
-        "project_name": project_name,
-        "plc_type": profile.name,
-        "message": f"Connected to SIMATIC Manager with project context '{project_name}' ready."
+        "success": False,
+        "error": message,
+        "plc_type": plc_type,
     }, indent=2)
 
 
@@ -1526,6 +2012,8 @@ def s7_create_project(project_name: str, plc_type: str = "S7-300") -> str:
 def s7_validate_program(
     networks: List[Dict[str, Any]],
     symbols: Optional[Any] = None,
+    symbol_table: Optional[Any] = None,
+    device_comments: Optional[Any] = None,
     auto_fix_mnemonics: bool = False,
     plc_type: str = "S7-300",
     mnemonic_language: str = "International",
@@ -1537,14 +2025,17 @@ def s7_validate_program(
 
     Args:
         networks: List of network objects: [{"title": "Start/Stop", "comment": "Motor 1", "instructions": ["A I 0.0", "O M 0.0", "AN I 0.1", "= M 0.0"]}].
-        symbols: Optional dictionary or list of symbol entries, e.g. {"START": "I 0.0", "STOP": "I 0.1", "MOTOR": "Q 0.0"}.
-        auto_fix_mnemonics: If True, automatically translates LD/LDI/OUT into Siemens A/AN/=.
+        symbols: Optional symbol mappings for I/O and markers. Can be dict or list.
+        symbol_table: Explicit alias for symbols.
+        device_comments: Explicit alias for symbols (accepts Address -> Comment mapping).
+        auto_fix_mnemonics: If True, automatically translates LD/LDI/OUT or German/International mnemonics.
         plc_type: Target PLC family: 'S7-300', 'S7-400', or 'WinAC'.
         mnemonic_language: 'International' (A, AN, O, I, Q) or 'German' (U, UN, O, E, A).
     """
+    symbols_to_use = symbols if symbols is not None else (symbol_table if symbol_table is not None else device_comments)
     report = validate_and_analyze_program(
         networks,
-        symbols_input=symbols,
+        symbols_input=symbols_to_use,
         auto_fix_mnemonics=auto_fix_mnemonics,
         plc_type=plc_type,
         mnemonic_language=mnemonic_language,
@@ -1575,10 +2066,14 @@ def s7_validate_program(
 def s7_write_program(
     networks: List[Dict[str, Any]],
     symbols: Optional[Any] = None,
+    symbol_table: Optional[Any] = None,
+    device_comments: Optional[Any] = None,
     delivery_mode: str = "awl_source",
     plc_type: str = "S7-300",
     block_name: str = "OB1",
     run_compile_and_check: bool = True,
+    auto_fix_mnemonics: bool = False,
+    mnemonic_language: str = "International",
 ) -> str:
     """
     Validates, backs up, imports, compiles, checks, and reads back an S7 program block.
@@ -1588,10 +2083,14 @@ def s7_write_program(
     Args:
         networks: Ordered network objects with title, comment, and instructions.
         symbols: Optional symbol mappings for I/O and markers.
+        symbol_table: Explicit alias for symbols.
+        device_comments: Explicit alias for symbols.
         delivery_mode: Must be 'awl_source' (Siemens AWL text source import).
         plc_type: Target PLC family ('S7-300', 'S7-400', or 'WinAC').
         block_name: Name of target block ('OB1', 'FC1', 'FB1').
         run_compile_and_check: Must be True; compilation and block checks are mandatory.
+        auto_fix_mnemonics: If True, translates foreign or cross-language mnemonics.
+        mnemonic_language: 'International' or 'German'.
     """
     controller.import_started = False
     GUI_ACTIVE_WRITE.clear()
@@ -1605,12 +2104,15 @@ def s7_write_program(
     if profile_error or profile is None:
         return json.dumps({"status": "REJECTED_BEFORE_WRITE", "error": profile_error}, indent=2)
 
+    symbols_to_use = symbols if symbols is not None else (symbol_table if symbol_table is not None else device_comments)
+
     # 1. Pre-flight deterministic validation
     report = validate_and_analyze_program(
         networks,
-        symbols_input=symbols,
-        auto_fix_mnemonics=False,
+        symbols_input=symbols_to_use,
+        auto_fix_mnemonics=auto_fix_mnemonics,
         plc_type=plc_type,
+        mnemonic_language=mnemonic_language,
     )
     if not report.valid:
         return json.dumps(
@@ -1653,8 +2155,8 @@ def s7_write_program(
 
     # Generate symbol table artifact if symbols provided
     symbol_sdf_path: Optional[Path] = None
-    if symbols:
-        _, sym_entries = _validate_symbol_map(symbols)
+    if symbols_to_use:
+        _, sym_entries = _validate_symbol_map(symbols_to_use)
         if sym_entries:
             symbol_content = generate_s7_symbol_sdf(sym_entries)
             symbol_sdf_path = save_s7_artifact(
@@ -1860,14 +2362,17 @@ def s7_compile_and_check(block_name: str = "OB1") -> str:
 def s7_write_symbol_table(
     symbols: Any,
     import_via_gui: bool = False,
+    plc_type: str = "S7-300",
 ) -> str:
     """
     Saves a validated Siemens STEP 7 Symbol Table artifact (.SDF and .CSV).
     Format: Symbol, Address, Data type, Comment.
 
     Args:
-        symbols: Dict or List of symbols, e.g. {"START": "I 0.0", "STOP": "I 0.1", "MOTOR": "Q 0.0"}.
+        symbols: Dict or List of symbols, e.g. {"START": "I 0.0", "STOP": "I 0.1", "MOTOR": "Q 0.0"}
+                 or Address mapping {"I 0.0": "START", "Q 0.0": "MOTOR"}.
         import_via_gui: Must be False; automated GUI import of symbol tables is not supported safely.
+        plc_type: Target PLC family for symbol verification.
     """
     if not isinstance(import_via_gui, bool):
         return json.dumps({"status": "REJECTED_BEFORE_WRITE", "errors": ["import_via_gui must be a boolean."]}, indent=2)
@@ -1894,6 +2399,23 @@ def s7_write_symbol_table(
         },
         indent=2,
     )
+
+
+@mcp.tool()
+def s7_read_symbol_table(symbol_table_path: str) -> str:
+    """
+    Reads and validates a previously exported Siemens STEP 7 Symbol Table (.SDF, .SEQ, or .CSV).
+
+    Args:
+        symbol_table_path: Path to the .sdf, .seq, or .csv symbol file.
+    """
+    if not isinstance(symbol_table_path, str) or not symbol_table_path.strip():
+        return json.dumps({"success": False, "error": "symbol_table_path must be a non-empty string path."}, indent=2)
+
+    path = Path(symbol_table_path).expanduser()
+    parsed = parse_s7_symbol_table(path)
+    parsed["success"] = "error" not in parsed
+    return json.dumps(parsed, indent=2)
 
 
 # ============================================================================
