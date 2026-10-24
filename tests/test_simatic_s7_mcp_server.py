@@ -283,6 +283,25 @@ class SymbolTableTests(unittest.TestCase):
         ])
         self.assertIn('"START","I 0.0","BOOL","Start PB"', csv_str)
 
+        asc_str = MODULE.generate_s7_symbol_asc([
+            MODULE.S7SymbolEntry(**item) for item in symbols
+        ])
+        self.assertTrue(asc_str.startswith("126,START"))
+        self.assertIn("126,MOTOR", asc_str)
+
+    def test_symbol_table_asc_parsing(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            asc_path = Path(tmp_dir) / "test_symbols.asc"
+            asc_content = (
+                "126,START_REQ               M 10.0      BOOL      START REQUEST\r\n"
+                "126,TIMER_T0                T 0         TIMER     Timer T0 1000ms\r\n"
+            )
+            asc_path.write_text(asc_content, encoding="latin1")
+            parsed = MODULE.parse_s7_symbol_table(asc_path)
+            self.assertEqual(parsed.get("symbol_count"), 2)
+            self.assertEqual(parsed["symbol_map"]["START_REQ"], "M 10.0")
+            self.assertEqual(parsed["symbol_map"]["TIMER_T0"], "T 0")
+
 
 class TransactionTests(unittest.TestCase):
     def run_write(self, mock_controller, networks=SAMPLE_NETWORKS):

@@ -1812,6 +1812,22 @@ def generate_s7_symbol_sdf(symbol_entries: List[S7SymbolEntry]) -> str:
     return "\r\n".join(lines) + "\r\n"
 
 
+def generate_s7_symbol_asc(symbol_entries: List[S7SymbolEntry]) -> str:
+    """
+    Generates native Siemens STEP 7 Symbol Editor fixed-width ASCII export (.ASC).
+    Format: 126,<Symbol: 24><Address: 12><Data Type: 10><Comment: 80>
+    Each line begins with '126,' followed by strictly space-padded fixed width fields.
+    """
+    lines = []
+    for entry in symbol_entries:
+        sym = (entry.symbol or "")[:24].ljust(24)
+        addr = (entry.address or "")[:12].ljust(12)
+        dtype = (entry.data_type or "BOOL")[:10].ljust(10)
+        comm = (entry.comment or "")[:80]
+        lines.append(f"126,{sym}{addr}{dtype}{comm}")
+    return "\r\n".join(lines) + "\r\n"
+
+
 def generate_s7_symbol_csv(symbol_entries: List[S7SymbolEntry]) -> str:
     """
     Generates standard Siemens STEP 7 CSV Symbol Table.
@@ -1855,6 +1871,42 @@ def parse_s7_symbol_table(filepath: Path) -> Dict[str, Any]:
         return {"error": f"Symbol table contains no data: {filepath}"}
 
     first_line = lines[0]
+    if first_line.startswith("126,"):
+        entries: List[Dict[str, str]] = []
+        symbol_map: Dict[str, str] = {}
+        row_errors: List[str] = []
+        for row_idx, line in enumerate(lines, start=1):
+            if not line.startswith("126,"):
+                continue
+            payload = line[4:]
+            sym = payload[:24].strip()
+            addr = payload[24:36].strip()
+            dtype = payload[36:46].strip() or "BOOL"
+            comm = payload[46:].strip()
+            if not sym and not addr:
+                continue
+            if not sym:
+                row_errors.append(f"Row {row_idx}: missing symbol name.")
+                continue
+            if not addr:
+                row_errors.append(f"Row {row_idx}: missing address for symbol '{sym}'.")
+                continue
+            canon_addr = canonical_s7_address(addr)
+            entries.append({
+                "symbol": sym,
+                "address": canon_addr,
+                "raw_address": addr,
+                "data_type": dtype.upper(),
+                "comment": comm,
+            })
+            symbol_map[sym.upper()] = canon_addr
+        return {
+            "symbol_count": len(entries),
+            "entries": entries,
+            "symbol_map": symbol_map,
+            "errors": row_errors,
+        }
+
     delimiter = "\t" if "\t" in first_line else ","
     reader = csv.reader(lines, delimiter=delimiter)
     raw_header = next(reader, [])
@@ -2829,6 +2881,18 @@ class SimaticManagerController:
         """Connects to a running instance of SIMATIC Manager or the LAD/FBD/STL Editor."""
         if not PYWINAUTO_AVAILABLE:
             return False, "pywinauto is not installed."
+        # Ensure desktop attachment for Windows GUI automation
+        try:
+            import ctypes
+            u32 = ctypes.windll.user32
+            hwinsta = u32.OpenWindowStationW("WinSta0", False, 0x037F)
+            if hwinsta:
+                u32.SetProcessWindowStation(hwinsta)
+            hdesk = u32.OpenDesktopW("Default", 0, False, 0x01FF)
+            if hdesk:
+                u32.SetThreadDesktop(hdesk)
+        except Exception:
+            pass
         try:
             # 1. Look for LAD/FBD/STL Editor first if open
             try:
@@ -2839,10 +2903,29 @@ class SimaticManagerController:
             except Exception:
                 pass
 
-            # 2. Look for SIMATIC Manager
-            app = Application(backend="win32").connect(title_re=S7_MANAGER_WINDOW_TITLE_REGEX, timeout=timeout)
+            # 2. Look for SIMATIC Manager by title
+            try:
+                app = Application(backend="win32").connect(title_re=S7_MANAGER_WINDOW_TITLE_REGEX, timeout=timeout)
+                self.app = app
+                win = app.window(class_name="s7tgtopx")
+                if not win.exists():
+                    win = app.window(title_re=S7_MANAGER_WINDOW_TITLE_REGEX)
+                if not win.exists():
+                    win = app.top_window()
+                self.main_win = win
+                return True, self.main_win.window_text()
+            except Exception:
+                pass
+
+            # 3. Look for SIMATIC Manager by path/process
+            app = Application(backend="win32").connect(path="s7tgtopx.exe", timeout=timeout)
             self.app = app
-            self.main_win = app.top_window()
+            win = app.window(class_name="s7tgtopx")
+            if not win.exists():
+                win = app.window(title_re=S7_MANAGER_WINDOW_TITLE_REGEX)
+            if not win.exists():
+                win = app.top_window()
+            self.main_win = win
             return True, self.main_win.window_text()
         except Exception as exc:
             return False, f"Could not connect to SIMATIC Manager: {exc}"
@@ -3690,6 +3773,7 @@ def s7_write_program(
 
     # Generate symbol table artifact if symbols provided
     symbol_sdf_path: Optional[Path] = None
+    symbol_asc_path: Optional[Path] = None
     if symbols_to_use:
         _, sym_entries = _validate_symbol_map(symbols_to_use)
         if sym_entries:
@@ -3697,6 +3781,11 @@ def s7_write_program(
             symbol_sdf_path = save_s7_artifact(
                 symbol_content,
                 new_s7_artifact_path("symbols", suffix=".sdf"),
+            )
+            symbol_asc_content = generate_s7_symbol_asc(sym_entries)
+            symbol_asc_path = save_s7_artifact(
+                symbol_asc_content,
+                new_s7_artifact_path("symbols", suffix=".asc"),
             )
 
     # 3. Connect to SIMATIC Manager
@@ -3717,12 +3806,17 @@ def s7_write_program(
                 "warnings": report.warnings,
                 "awl_source_path": str(after_awl_path),
                 "symbol_table_path": str(symbol_sdf_path) if symbol_sdf_path else None,
+                "symbol_asc_path": str(symbol_asc_path) if symbol_asc_path else None,
             },
             indent=2,
         )
 
-    # Verify editor is open and focused
+    # Verify editor is open and focused; auto-open if not already active
     is_active, active_msg = controller.is_block_editor_active(block_name)
+    if not is_active:
+        controller.open_block(block_name)
+        time.sleep(1.0)
+        is_active, _ = controller.is_block_editor_active(block_name)
     if not is_active:
         return json.dumps(
             {
@@ -3956,13 +4050,17 @@ def s7_write_symbol_table(
     csv_content = generate_s7_symbol_csv(symbol_entries)
     csv_path = save_s7_artifact(csv_content, new_s7_artifact_path("symbols", suffix=".csv"))
 
+    asc_content = generate_s7_symbol_asc(symbol_entries)
+    asc_path = save_s7_artifact(asc_content, new_s7_artifact_path("symbols", suffix=".asc"))
+
     return json.dumps(
         {
             "status": "SUCCESS",
             "symbol_count": len(symbol_entries),
+            "symbol_asc_path": str(asc_path),
             "symbol_sdf_path": str(sdf_path),
             "symbol_csv_path": str(csv_path),
-            "note": "Saved standard Siemens SDF and CSV symbol table artifacts in Codex-Simatic7 workspace.",
+            "note": "Saved standard Siemens ASC, SDF and CSV symbol table artifacts in Codex-Simatic7 workspace.",
         },
         indent=2,
     )
@@ -4026,16 +4124,21 @@ def s7_write_device_comments(
     csv_content = generate_s7_symbol_csv(symbol_entries)
     csv_path = save_s7_artifact(csv_content, new_s7_artifact_path("symbols", suffix=".csv"))
 
+    asc_content = generate_s7_symbol_asc(symbol_entries)
+    asc_path = save_s7_artifact(asc_content, new_s7_artifact_path("symbols", suffix=".asc"))
+
     ws_symbols_dir = WORKSPACE_DIR / "Symbols"
     ws_symbols_dir.mkdir(parents=True, exist_ok=True)
     (ws_symbols_dir / "symbols.sdf").write_text(sdf_content, encoding="utf-8")
     (ws_symbols_dir / "symbols.csv").write_text(csv_content, encoding="utf-8")
+    (ws_symbols_dir / "symbols.asc").write_text(asc_content, encoding="latin1")
 
     return json.dumps(
         {
             "status": "SUCCESS",
             "comment_count": len(symbol_entries),
             "plc_type": profile.name,
+            "symbol_asc_path": str(asc_path),
             "symbol_sdf_path": str(sdf_path),
             "symbol_csv_path": str(csv_path),
             "processed_comments": [
