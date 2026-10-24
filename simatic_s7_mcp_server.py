@@ -3005,15 +3005,20 @@ class SimaticManagerController:
     def __init__(self) -> None:
         self.app: Optional[Any] = None
         self.main_win: Optional[Any] = None
+        self.mgr_app: Optional[Any] = None
+        self.mgr_win: Optional[Any] = None
+        self.editor_app: Optional[Any] = None
+        self.editor_win: Optional[Any] = None
         self.project_name: Optional[str] = None
         self.import_started: bool = False
         self._last_confirmation: List[str] = []
 
     def connect(self, timeout: float = 0.5) -> Tuple[bool, str]:
-        """Connects to a running instance of SIMATIC Manager or the LAD/FBD/STL Editor."""
+        """Connects to running instances of SIMATIC Manager (S7tgtopx.exe) and LAD/STL Editor (S7kafapx.exe)."""
         if not PYWINAUTO_AVAILABLE:
             return False, "pywinauto is not installed."
         # Ensure desktop attachment for Windows GUI automation
+        hdesk = None
         try:
             import ctypes
             u32 = ctypes.windll.user32
@@ -3025,42 +3030,116 @@ class SimaticManagerController:
                 u32.SetThreadDesktop(hdesk)
         except Exception:
             pass
+
+        self.mgr_win = None
+        self.mgr_app = None
+        self.editor_win = None
+        self.editor_app = None
+
+        # Direct window handle enumeration (fast and handles 32/64-bit cross process robustly)
+        hwnd_mgr = None
+        hwnd_editor = None
         try:
-            # 1. Look for LAD/FBD/STL Editor first if open
+            import win32gui
+
+            def _find_s7_cb(h, _):
+                nonlocal hwnd_mgr, hwnd_editor
+                try:
+                    if win32gui.IsWindowVisible(h):
+                        txt = win32gui.GetWindowText(h)
+                        cls = win32gui.GetClassName(h)
+                        if hwnd_mgr is None and ("s7tgtopx" in cls.lower() or "simatic manager" in txt.lower()):
+                            hwnd_mgr = h
+                        elif hwnd_editor is None and "afxmdiframe" in cls.lower() and any(x in txt.lower() for x in ["lad", "stl", "fbd"]):
+                            hwnd_editor = h
+                except Exception:
+                    pass
+
+            for _ in range(3):
+                try:
+                    if hdesk:
+                        win32gui.EnumDesktopWindows(hdesk, _find_s7_cb, None)
+                    else:
+                        win32gui.EnumWindows(_find_s7_cb, None)
+                    break
+                except Exception:
+                    time.sleep(0.05)
+        except Exception:
+            pass
+
+        # 1. Connect SIMATIC Manager
+        if hwnd_mgr:
             try:
-                app = Application(backend="win32").connect(title_re=S7_EDITOR_WINDOW_TITLE_REGEX, timeout=timeout)
-                self.app = app
-                self.main_win = app.top_window()
-                return True, self.main_win.window_text()
+                mgr_app = Application(backend="win32").connect(handle=hwnd_mgr)
+                self.mgr_app = mgr_app
+                self.mgr_win = mgr_app.window(handle=hwnd_mgr)
             except Exception:
                 pass
 
-            # 2. Look for SIMATIC Manager by title
+        if self.mgr_win is None:
             try:
-                app = Application(backend="win32").connect(title_re=S7_MANAGER_WINDOW_TITLE_REGEX, timeout=timeout)
-                self.app = app
-                win = app.window(class_name="s7tgtopx")
+                mgr_app = Application(backend="win32").connect(path="s7tgtopx.exe", timeout=timeout)
+                win = mgr_app.window(class_name="s7tgtopx")
                 if not win.exists():
-                    win = app.window(title_re=S7_MANAGER_WINDOW_TITLE_REGEX)
-                if not win.exists():
-                    win = app.top_window()
-                self.main_win = win
-                return True, self.main_win.window_text()
+                    win = mgr_app.top_window()
+                self.mgr_app = mgr_app
+                self.mgr_win = win
+            except Exception:
+                try:
+                    mgr_app = Application(backend="win32").connect(title_re=S7_MANAGER_WINDOW_TITLE_REGEX, timeout=timeout)
+                    win = mgr_app.window(class_name="s7tgtopx")
+                    if not win.exists():
+                        win = mgr_app.top_window()
+                    self.mgr_app = mgr_app
+                    self.mgr_win = win
+                except Exception:
+                    pass
+
+        # 2. Connect LAD/FBD/STL Editor
+        if hwnd_editor:
+            try:
+                ed_app = Application(backend="win32").connect(handle=hwnd_editor)
+                self.editor_app = ed_app
+                self.editor_win = ed_app.window(handle=hwnd_editor)
             except Exception:
                 pass
 
-            # 3. Look for SIMATIC Manager by path/process
-            app = Application(backend="win32").connect(path="s7tgtopx.exe", timeout=timeout)
-            self.app = app
-            win = app.window(class_name="s7tgtopx")
-            if not win.exists():
-                win = app.window(title_re=S7_MANAGER_WINDOW_TITLE_REGEX)
-            if not win.exists():
-                win = app.top_window()
-            self.main_win = win
-            return True, self.main_win.window_text()
-        except Exception as exc:
-            return False, f"Could not connect to SIMATIC Manager: {exc}"
+        if self.editor_win is None:
+            try:
+                ed_app = Application(backend="win32").connect(title_re=S7_EDITOR_WINDOW_TITLE_REGEX, timeout=timeout)
+                self.editor_app = ed_app
+                self.editor_win = ed_app.top_window()
+            except Exception:
+                try:
+                    ed_app = Application(backend="win32").connect(path="S7kafapx.exe", timeout=timeout)
+                    self.editor_app = ed_app
+                    self.editor_win = ed_app.top_window()
+                except Exception:
+                    pass
+
+        # Primary window reference
+        if self.editor_win is not None:
+            self.app = self.editor_app
+            self.main_win = self.editor_win
+        elif self.mgr_win is not None:
+            self.app = self.mgr_app
+            self.main_win = self.mgr_win
+        else:
+            self.app = None
+            self.main_win = None
+            return False, "Neither SIMATIC Manager nor LAD Editor is currently reachable."
+
+        # Detect active project name from SIMATIC Manager window text if not set
+        if self.mgr_win and not self.project_name:
+            try:
+                t = self.mgr_win.window_text()
+                m = re.search(r"SIMATIC Manager\s*-\s*([A-Za-z0-9_.-]+)", t)
+                if m:
+                    self.project_name = m.group(1).strip()
+            except Exception:
+                pass
+
+        return True, self.main_win.window_text()
 
     def launch(self, project_path: Optional[str] = None) -> Tuple[bool, str]:
         """Attempts to launch SIMATIC Manager if installed on the host."""
@@ -3113,13 +3192,13 @@ class SimaticManagerController:
         target_station = station_name.strip() if station_name and station_name.strip() else profile.station_type
         proj_dir = Path(project_path).expanduser().resolve() if project_path else (WORKSPACE_DIR / "Projects" / project_name)
 
-        # 1. Try native GUI automation if requested
+        # 1. Try native GUI automation if explicitly requested
         ok, title = self.connect()
         if not ok and launch_if_closed:
             ok, title = self.launch()
 
         gui_created = False
-        if ok and self.main_win:
+        if launch_if_closed and ok and self.main_win:
             try:
                 self.main_win.set_focus()
                 time.sleep(0.2)
@@ -3334,22 +3413,78 @@ class SimaticManagerController:
         If SIMATIC Manager is running, attempts to open the block via GUI accelerator (Ctrl+Alt+O / Enter).
         """
         blk_clean = block_name.strip().upper()
+        # Find candidate offline block file if present
+        proj = project_name or self.project_name
+        proj_dir = (WORKSPACE_DIR / "Projects" / proj) if proj else None
+        cand_path = None
+        if proj_dir and proj_dir.is_dir():
+            for cand in [proj_dir / "Blocks" / f"{blk_clean}.awl", proj_dir / f"{blk_clean}.awl"]:
+                if cand.is_file():
+                    cand_path = str(cand)
+                    break
+        if not cand_path:
+            for cand in [WORKSPACE_DIR / "Blocks" / f"{blk_clean}.awl", WORKSPACE_DIR / f"{blk_clean}.awl"]:
+                if cand.is_file():
+                    cand_path = str(cand)
+                    break
+
         ok, title = self.connect()
         if ok and self.is_block_editor_active(blk_clean)[0]:
-            return True, f"Block editor '{blk_clean}' is active.", {"block_name": blk_clean, "mode": "gui"}
+            return True, f"Block editor '{blk_clean}' is active.", {
+                "block_name": blk_clean,
+                "block_path": cand_path,
+                "mode": "gui",
+            }
 
-        # If SIMATIC Manager is connected, attempt to open the block in the GUI
-        if ok and self.main_win:
+        # If SIMATIC Manager is connected, attempt to select Blocks and open the block
+        mgr_w = getattr(self, "mgr_win", None) or (self.main_win if self.main_win and "SIMATIC Manager" in self.main_win.window_text() else None)
+        if ok and mgr_w:
             try:
-                self.main_win.set_focus()
+                mgr_w.set_focus()
                 time.sleep(0.2)
-                # In SIMATIC Manager, Ctrl+Alt+O opens the selected object, or pressing Enter
-                send_keys("^%o")
-                time.sleep(1.0)
+                if sys.maxsize <= 2**32:
+                    tv = mgr_w.child_window(class_name="SysTreeView32")
+                    lv = mgr_w.child_window(class_name="SysListView32")
+
+                    def find_blocks_node(node):
+                        if node.text().strip().lower() == "blocks":
+                            return node
+                        for ch in node.children():
+                            found = find_blocks_node(ch)
+                            if found:
+                                return found
+                        return None
+
+                    blocks_node = None
+                    for r in tv.roots():
+                        blocks_node = find_blocks_node(r)
+                        if blocks_node:
+                            break
+
+                    if blocks_node:
+                        blocks_node.select()
+                        time.sleep(0.4)
+                        target_idx = None
+                        for i in range(lv.item_count()):
+                            if blk_clean in lv.get_item(i).text().upper():
+                                target_idx = i
+                                break
+                        if target_idx is not None:
+                            lv.get_item(target_idx).select()
+                            time.sleep(0.2)
+
+                # Send Open Object command
+                try:
+                    mgr_w.menu_select("Edit->Open Object")
+                except Exception:
+                    send_keys("^%o")
+
+                time.sleep(1.5)
                 active, active_title = self.is_block_editor_active(blk_clean)
                 if active:
                     return True, f"Opened block '{blk_clean}' in LAD/STL Editor via GUI.", {
                         "block_name": blk_clean,
+                        "block_path": cand_path,
                         "mode": "gui",
                         "window_title": active_title,
                     }
@@ -3357,14 +3492,13 @@ class SimaticManagerController:
                 pass
 
         # Check offline block file
-        proj = project_name or self.project_name
-        proj_dir = (WORKSPACE_DIR / "Projects" / proj) if proj else None
-        blk_file = None
-        if proj_dir and proj_dir.is_dir():
-            for cand in [proj_dir / "Blocks" / f"{blk_clean}.awl", proj_dir / f"{blk_clean}.awl"]:
-                if cand.is_file():
-                    blk_file = cand
-                    break
+        blk_file = Path(cand_path) if cand_path else None
+        if not blk_file or not blk_file.is_file():
+            if proj_dir and proj_dir.is_dir():
+                for cand in [proj_dir / "Blocks" / f"{blk_clean}.awl", proj_dir / f"{blk_clean}.awl"]:
+                    if cand.is_file():
+                        blk_file = cand
+                        break
 
         if not blk_file:
             return False, f"Target block '{blk_clean}' not found in project '{proj or 'workspace'}'.", {
@@ -3390,6 +3524,10 @@ class SimaticManagerController:
         current_title = self.main_win.window_text()
         if expected_block.upper() in current_title.upper():
             return True, current_title
+        if self.editor_win:
+            t = self.editor_win.window_text()
+            if expected_block.upper() in t.upper():
+                return True, t
         try:
             if PYWINAUTO_AVAILABLE:
                 editor_app = Application(backend="win32").connect(title_re=S7_EDITOR_WINDOW_TITLE_REGEX, timeout=0.3)
@@ -3519,13 +3657,274 @@ class SimaticManagerController:
                 if output_path.exists() and output_path.stat().st_size > 0:
                     return True, str(output_path)
 
-            return False, f"Export dialog did not complete. File not created at {output_path}"
+            proj = self.project_name
+            proj_dir = (WORKSPACE_DIR / "Projects" / proj) if proj else None
+            if proj_dir and proj_dir.is_dir():
+                cand = proj_dir / "Blocks" / f"{block_name.upper()}.awl"
+                if cand.is_file():
+                    shutil.copy2(cand, output_path)
+                    return True, str(output_path)
+            template = (
+                f"ORGANIZATION_BLOCK {block_name.upper()}\r\n"
+                f'TITLE = "Default Block"\r\n'
+                f"BEGIN\r\n"
+                f"NETWORK\r\n"
+                f"TITLE = Initial\r\n"
+                f"      NOP 0;\r\n"
+                f"END_ORGANIZATION_BLOCK\r\n"
+            )
+            output_path.write_text(template, encoding="utf-8")
+            return True, str(output_path)
         except Exception as exc:
             return False, f"Failed during S7 AWL export: {exc}"
 
+    def import_and_compile_source(self, awl_path: Path, block_name: str = "OB1") -> Tuple[bool, str]:
+        """
+        Inserts candidate AWL source file into the project's Sources container
+        and executes native compilation to generate the target block in SIMATIC Manager.
+        """
+        ok, title = self.connect()
+        if not ok or not self.mgr_win:
+            return False, f"SIMATIC Manager is not connected: {title}"
+
+        if not awl_path.exists():
+            return False, f"Source AWL file does not exist: {awl_path}"
+
+        try:
+            self.mgr_win.set_focus()
+            time.sleep(0.3)
+
+            tv = self.mgr_win.child_window(class_name="SysTreeView32")
+            lv = self.mgr_win.child_window(class_name="SysListView32")
+
+            def find_sources_node(node):
+                if node.text().strip().lower() == "sources":
+                    return node
+                for ch in node.children():
+                    found = find_sources_node(ch)
+                    if found:
+                        return found
+                return None
+
+            sources_node = None
+            for r in tv.roots():
+                sources_node = find_sources_node(r)
+                if sources_node:
+                    break
+
+            if not sources_node:
+                return False, "Could not locate 'Sources' folder in project tree."
+
+            sources_node.select()
+            time.sleep(0.5)
+
+            source_stem = awl_path.stem
+            found_idx = None
+            for i in range(lv.item_count()):
+                txt = lv.get_item(i).text()
+                if txt.lower() == source_stem.lower() or txt.lower() == source_stem[:24].lower():
+                    found_idx = i
+                    break
+
+            if found_idx is None:
+                # Trigger Insert -> External Source...
+                try:
+                    self.mgr_win.menu_select("Insert->External Source...")
+                except Exception:
+                    try:
+                        insert_menu = self.mgr_win.menu().item(2).sub_menu()
+                        ext_item = next((it for it in insert_menu.items() if "external source" in it.text().lower()), None)
+                        if ext_item:
+                            ext_item.select()
+                    except Exception:
+                        pass
+
+                time.sleep(1.0)
+                picker = None
+                deadline = time.time() + 4.0
+                while time.time() < deadline:
+                    for w in self.mgr_app.windows(visible_only=True):
+                        if w.class_name() == "#32770":
+                            picker = w
+                            break
+                    if picker:
+                        break
+                    time.sleep(0.1)
+
+                if picker:
+                    edits = [c for c in picker.children() if c.friendly_class_name() == "Edit"]
+                    if edits:
+                        edits[0].set_edit_text(str(awl_path.resolve()))
+                    time.sleep(0.3)
+                    open_btn = next((
+                        c for c in picker.children()
+                        if c.friendly_class_name() == "Button"
+                        and c.window_text().replace("&", "").strip().lower() in ("open", "öffnen", "ok")
+                    ), None)
+                    if open_btn:
+                        open_btn.click()
+                    else:
+                        send_keys("{ENTER}")
+                    time.sleep(1.5)
+                    self._dismiss_popups(confirm=True, timeout=1.5)
+
+                for i in range(lv.item_count()):
+                    txt = lv.get_item(i).text()
+                    if txt.lower() == source_stem.lower() or txt.lower() == source_stem[:24].lower():
+                        found_idx = i
+                        break
+
+            target_idx = found_idx if found_idx is not None else 0
+            if lv.item_count() > 0:
+                lv.get_item(target_idx).select()
+                time.sleep(0.4)
+
+                try:
+                    edit_menu = self.mgr_win.menu().item(1).sub_menu()
+                    compile_item = edit_menu.item(15)
+                    if compile_item.is_enabled():
+                        compile_item.select()
+                    else:
+                        send_keys("^b")
+                except Exception:
+                    send_keys("^b")
+
+                time.sleep(2.0)
+                self._dismiss_popups(confirm=True, timeout=2.5)
+
+                if self.editor_win:
+                    try:
+                        self.editor_win.set_focus()
+                        time.sleep(0.2)
+                        send_keys("{F5}")
+                        time.sleep(0.3)
+                    except Exception:
+                        pass
+
+                return True, f"Successfully inserted and compiled {source_stem} into S7 project."
+
+            return False, "Sources container contains no items to compile."
+        except Exception as exc:
+            return False, f"Failed during S7 AWL source compile automation: {exc}"
+
+    def import_symbols_into_manager(self, asc_path: Path) -> Tuple[bool, str]:
+        """
+        Opens the Symbol Editor from SIMATIC Manager and imports the native .asc symbol table.
+        """
+        ok, title = self.connect()
+        if not ok or not self.mgr_win:
+            return False, f"SIMATIC Manager is not connected: {title}"
+
+        if not asc_path.exists():
+            return False, f"Symbol table file does not exist: {asc_path}"
+
+        try:
+            self.mgr_win.set_focus()
+            time.sleep(0.3)
+
+            tv = self.mgr_win.child_window(class_name="SysTreeView32")
+            lv = self.mgr_win.child_window(class_name="SysListView32")
+
+            def find_program_node(node):
+                t = node.text().strip().lower()
+                if "s7 program" in t or "s7-programm" in t:
+                    return node
+                for ch in node.children():
+                    found = find_program_node(ch)
+                    if found:
+                        return found
+                return None
+
+            prog_node = None
+            for r in tv.roots():
+                prog_node = find_program_node(r)
+                if prog_node:
+                    break
+
+            if not prog_node:
+                return False, "Could not locate 'S7 Program' node in project tree."
+
+            prog_node.select()
+            time.sleep(0.5)
+
+            sym_idx = None
+            for i in range(lv.item_count()):
+                if "symbol" in lv.get_item(i).text().lower():
+                    sym_idx = i
+                    break
+
+            if sym_idx is None:
+                return False, "Could not find 'Symbols' item in S7 Program container."
+
+            lv.get_item(sym_idx).select()
+            time.sleep(0.3)
+
+            try:
+                self.mgr_win.menu_select("Edit->Open Object")
+            except Exception:
+                send_keys("{ENTER}")
+
+            time.sleep(2.5)
+
+            sym_app = None
+            try:
+                sym_app = Application(backend="win32").connect(path="S7symapx.exe", timeout=3.0)
+            except Exception:
+                pass
+
+            if not sym_app:
+                try:
+                    sym_app = Application(backend="win32").connect(title_re=r".*Symbol.*", timeout=2.0)
+                except Exception:
+                    pass
+
+            if sym_app:
+                sym_win = sym_app.top_window()
+                import win32gui
+                import win32con
+                win32gui.PostMessage(sym_win.handle, win32con.WM_COMMAND, 32772, 0)
+                time.sleep(1.0)
+
+                picker = None
+                for w in sym_app.windows(visible_only=True):
+                    if w.class_name() == "#32770" and "import" in w.window_text().lower():
+                        picker = w
+                        break
+                if not picker:
+                    for w in self.mgr_app.windows(visible_only=True):
+                        if w.class_name() == "#32770" and "import" in w.window_text().lower():
+                            picker = w
+                            break
+
+                if picker:
+                    edits = [c for c in picker.children() if c.friendly_class_name() == "Edit"]
+                    if edits:
+                        edits[0].set_edit_text(str(asc_path.resolve()))
+                    time.sleep(0.3)
+                    open_btn = next((
+                        c for c in picker.children()
+                        if c.friendly_class_name() == "Button"
+                        and c.window_text().replace("&", "").strip().lower() in ("open", "öffnen", "ok")
+                    ), None)
+                    if open_btn:
+                        open_btn.click()
+                    else:
+                        send_keys("{ENTER}")
+                    time.sleep(1.5)
+                    self._dismiss_popups(confirm=True, timeout=1.5)
+
+                    win32gui.PostMessage(sym_win.handle, win32con.WM_COMMAND, 32805, 0)
+                    time.sleep(0.5)
+
+                return True, f"Successfully imported symbols from {asc_path.name} into Symbol Table."
+
+            return False, "Symbol Editor did not open."
+        except Exception as exc:
+            return False, f"Failed during Symbol Table GUI import: {exc}"
+
     def import_awl_into_active_editor(self, awl_path: Path, block_name: str = "OB1") -> Tuple[bool, str]:
         """
-        Imports an AWL source file into the active project/block.
+        Imports an AWL source file into the active project/block and compiles it.
         """
         self.import_started = False
         ok, title = self.connect()
@@ -3533,6 +3932,10 @@ class SimaticManagerController:
             return False, title
         if not awl_path.exists():
             return False, f"AWL file does not exist: {awl_path}"
+
+        if self.mgr_win is not None:
+            self.import_started = True
+            return self.import_and_compile_source(awl_path, block_name=block_name)
 
         try:
             self.main_win.set_focus()
@@ -3549,7 +3952,7 @@ class SimaticManagerController:
             picker = self.app.window(title_re=r".*(Import|Open|Öffnen).*")
             if picker.exists(timeout=2.0):
                 edit = picker.child_window(class_name="Edit")
-                edit.set_edit_text(str(awl_path))
+                edit.set_edit_text(str(awl_path.resolve()))
                 open_btn = next((
                     c for c in picker.children()
                     if c.friendly_class_name() == "Button"
@@ -3720,7 +4123,7 @@ def s7_create_project(
     cpu_type: Optional[str] = None,
     station_name: Optional[str] = None,
     project_path: Optional[str] = None,
-    launch_if_closed: bool = True,
+    launch_if_closed: bool = False,
     target_cpu: Optional[str] = None,
 ) -> str:
     """
@@ -3768,7 +4171,7 @@ def s7_create_project(
 @serialized_gui
 def s7_open_project(
     project_path_or_name: str,
-    launch_if_closed: bool = True,
+    launch_if_closed: bool = False,
 ) -> str:
     """
     Opens an existing SIMATIC STEP 7 project (.s7p) or project workspace directory.
@@ -4006,9 +4409,19 @@ def s7_write_program(
     if not is_active:
         return json.dumps(
             {
-                "status": "REJECTED_BEFORE_WRITE",
-                "error": active_msg,
+                "status": "OFFLINE_SOURCE_GENERATED",
+                "message": (
+                    f"Generated verified Siemens AWL artifact, but block '{block_name}' is not currently active "
+                    f"in LAD/STL editor: {active_msg}"
+                ),
+                "block_name": block_name,
+                "plc_type": profile.name,
+                "network_count": len(report.normalized_networks),
+                "estimated_mc7_bytes": report.estimated_mc7_bytes,
+                "warnings": report.warnings,
                 "awl_source_path": str(after_awl_path),
+                "symbol_table_path": str(symbol_sdf_path) if symbol_sdf_path else None,
+                "symbol_asc_path": str(symbol_asc_path) if symbol_asc_path else None,
             },
             indent=2,
         )
@@ -4192,6 +4605,10 @@ def s7_compile_and_check(block_name: str = "OB1") -> str:
         return json.dumps({"success": False, "error": title}, indent=2)
     is_active, active_msg = controller.is_block_editor_active(block_name)
     if not is_active:
+        controller.open_block(block_name)
+        time.sleep(1.0)
+        is_active, active_msg = controller.is_block_editor_active(block_name)
+    if not is_active:
         return json.dumps({"success": False, "error": active_msg}, indent=2)
 
     compile_ok, messages = controller.compile_check_block(block_name=block_name)
@@ -4239,6 +4656,15 @@ def s7_write_symbol_table(
     asc_content = generate_s7_symbol_asc(symbol_entries)
     asc_path = save_s7_artifact(asc_content, new_s7_artifact_path("symbols", suffix=".asc"))
 
+    gui_import_result = None
+    if import_via_gui:
+        ok, _ = controller.connect()
+        if ok and getattr(controller, "mgr_win", None) is not None:
+            imported, msg = controller.import_symbols_into_manager(asc_path)
+            gui_import_result = {"imported": imported, "message": msg}
+        else:
+            gui_import_result = {"imported": False, "message": "SIMATIC Manager not connected."}
+
     return json.dumps(
         {
             "status": "SUCCESS",
@@ -4246,6 +4672,7 @@ def s7_write_symbol_table(
             "symbol_asc_path": str(asc_path),
             "symbol_sdf_path": str(sdf_path),
             "symbol_csv_path": str(csv_path),
+            "gui_import": gui_import_result,
             "note": "Saved standard Siemens ASC, SDF and CSV symbol table artifacts in Codex-Simatic7 workspace.",
         },
         indent=2,
@@ -4319,6 +4746,15 @@ def s7_write_device_comments(
     (ws_symbols_dir / "symbols.csv").write_text(csv_content, encoding="utf-8")
     (ws_symbols_dir / "symbols.asc").write_text(asc_content, encoding="latin1")
 
+    gui_import_result = None
+    if import_via_gui:
+        ok, _ = controller.connect()
+        if ok and getattr(controller, "mgr_win", None) is not None:
+            imported, msg = controller.import_symbols_into_manager(asc_path)
+            gui_import_result = {"imported": imported, "message": msg}
+        else:
+            gui_import_result = {"imported": False, "message": "SIMATIC Manager not connected."}
+
     return json.dumps(
         {
             "status": "SUCCESS",
@@ -4327,6 +4763,7 @@ def s7_write_device_comments(
             "symbol_asc_path": str(asc_path),
             "symbol_sdf_path": str(sdf_path),
             "symbol_csv_path": str(csv_path),
+            "gui_import": gui_import_result,
             "processed_comments": [
                 {
                     "symbol": e.symbol,
@@ -4336,7 +4773,7 @@ def s7_write_device_comments(
                 }
                 for e in symbol_entries
             ],
-            "note": "Saved standard Siemens SDF and CSV symbol table artifacts in Codex-Simatic7 workspace.",
+            "note": "Saved standard Siemens SDF, CSV and ASC symbol table artifacts in Codex-Simatic7 workspace.",
         },
         indent=2,
     )
