@@ -726,13 +726,14 @@ class AdditionalEdgeCaseTests(unittest.TestCase):
 class QualityOfLifeAndToolsTests(unittest.TestCase):
     def setUp(self):
         self.old_ws = MODULE.WORKSPACE_DIR
-        self.old_proj = MODULE.controller.project_name
+        self.old_controller = MODULE.controller
         self.temp_dir = tempfile.TemporaryDirectory()
         MODULE.WORKSPACE_DIR = Path(self.temp_dir.name)
+        MODULE.controller = MODULE.SimaticManagerController()
 
     def tearDown(self):
         MODULE.WORKSPACE_DIR = self.old_ws
-        MODULE.controller.project_name = self.old_proj
+        MODULE.controller = self.old_controller
         self.temp_dir.cleanup()
 
     def test_device_comments_read_write_roundtrip(self):
@@ -871,6 +872,7 @@ class QualityOfLifeAndToolsTests(unittest.TestCase):
                 plc_type="S7-300",
                 cpu_type="CPU 315-2 DP",
                 station_name="Cell1_Station",
+                launch_if_closed=False,
             )
         )
         self.assertTrue(res_create["success"])
@@ -885,7 +887,7 @@ class QualityOfLifeAndToolsTests(unittest.TestCase):
         self.assertTrue((proj_dir / "Symbols" / "symbols.sdf").is_file())
 
         # Test open project
-        res_open = json.loads(MODULE.s7_open_project(str(s7p_file)))
+        res_open = json.loads(MODULE.s7_open_project(str(s7p_file), launch_if_closed=False))
         self.assertTrue(res_open["success"])
         self.assertEqual(MODULE.controller.project_name, "Assembly_Cell_1")
 
@@ -1092,6 +1094,266 @@ class QualityOfLifeAndToolsTests(unittest.TestCase):
         self.assertIn("simatic_manager_exe", res)
         self.assertIn("running_siemens_processes", res)
         self.assertIn("workspace_dir", res)
+        self.assertIn("plcsim_exe", res)
+
+    def test_device_comments_duplicate_string_disambiguation(self):
+        dup_comments = {
+            "I 0.0": "Spare",
+            "I 0.1": "Spare",
+            "I 0.2": "Spare",
+        }
+        res_write = json.loads(MODULE.s7_write_device_comments(device_comments=dup_comments))
+        self.assertEqual(res_write["status"], "SUCCESS")
+        self.assertEqual(res_write["comment_count"], 3)
+        symbols = [p["symbol"] for p in res_write["processed_comments"]]
+        self.assertEqual(len(symbols), len(set(symbols)), "Generated symbols must be unique")
+        # Check that comment text is preserved, not emptied
+        for p in res_write["processed_comments"]:
+            self.assertEqual(p["comment"], "Spare")
+
+        # Read back
+        res_read = json.loads(MODULE.s7_read_device_comments(res_write["symbol_sdf_path"]))
+        self.assertTrue(res_read["success"])
+        self.assertEqual(res_read["device_comments"]["I 0.0"], "Spare")
+        self.assertEqual(res_read["device_comments"]["I 0.1"], "Spare")
+
+    def test_device_comments_list_without_symbol_name(self):
+        list_comments = [
+            {"address": "I 0.0", "comment": "Start PB"},
+            {"address": "I 0.1", "comment": "Stop PB"},
+            {"address": "Q 0.0", "comment": "Main Motor Contactor"},
+        ]
+        res_write = json.loads(MODULE.s7_write_device_comments(device_comments=list_comments))
+        self.assertEqual(res_write["status"], "SUCCESS")
+        self.assertEqual(res_write["comment_count"], 3)
+        self.assertEqual(res_write["processed_comments"][0]["symbol"], "Start_PB")
+        self.assertEqual(res_write["processed_comments"][0]["data_type"], "BOOL")
+        self.assertEqual(res_write["processed_comments"][0]["comment"], "Start PB")
+
+    def test_search_symbols_special_regex_characters(self):
+        comments = {
+            "I 0.0": "Pump (Main)",
+            "I 0.1": "Sensor [High+Low]",
+            "DB1.DBX 0.0": "DB Valve Status",
+        }
+        res_write = json.loads(MODULE.s7_write_device_comments(device_comments=comments))
+        sdf_path = res_write["symbol_sdf_path"]
+
+        # Search with parentheses in glob
+        s1 = json.loads(MODULE.s7_search_symbols_and_comments(query="Pump (*", comment_file_path=sdf_path))
+        self.assertTrue(s1["success"])
+        self.assertEqual(s1["total_matches"], 1)
+
+        # Search with brackets and plus
+        s2 = json.loads(MODULE.s7_search_symbols_and_comments(query="*High+Low*", comment_file_path=sdf_path))
+        self.assertTrue(s2["success"])
+        self.assertEqual(s2["total_matches"], 1)
+
+        # Search with DB dot
+        s3 = json.loads(MODULE.s7_search_symbols_and_comments(query="DB1.*", comment_file_path=sdf_path))
+        self.assertTrue(s3["success"])
+        self.assertEqual(s3["total_matches"], 1)
+
+    def test_annotate_awl_snippet_and_normalized_networks(self):
+        snippet = "A I 0.0\n= Q 0.0"
+        symbols = {"START": "I 0.0", "MOTOR": "Q 0.0"}
+
+        # Annotate bare snippet
+        res = json.loads(MODULE.s7_annotate_awl_code(source_code=snippet, symbols=symbols, style="SYMBOLIC"))
+        self.assertTrue(res["success"])
+        self.assertIn('"START"', res["annotated_awl_source"])
+        self.assertIn('"MOTOR"', res["annotated_awl_source"])
+        # Check that normalized_networks reflects symbolic style
+        instructions = res["normalized_networks"][0]["instructions"]
+        self.assertEqual(instructions, ['A "START"', '= "MOTOR"'])
+
+        # Absolute style
+        res_abs = json.loads(MODULE.s7_annotate_awl_code(source_code=snippet, symbols=symbols, style="ABSOLUTE"))
+        self.assertTrue(res_abs["success"])
+        self.assertEqual(res_abs["normalized_networks"][0]["instructions"], ["A I 0.0", "= Q 0.0"])
+
+    def test_parse_awl_network_number_and_data_block(self):
+        awl_content = (
+            "ORGANIZATION_BLOCK OB 1\n"
+            "BEGIN\n"
+            "NETWORK 1\n"
+            "TITLE = Sweep 1\n"
+            "A I 0.0\n"
+            "NETWORK 2 : Sweep 2\n"
+            "= Q 0.0\n"
+            "END_ORGANIZATION_BLOCK\n"
+        )
+        p = MODULE.WORKSPACE_DIR / "test_net_numbered.awl"
+        p.write_text(awl_content, encoding="utf-8")
+        try:
+            parsed = MODULE.parse_s7_awl_source(p)
+            self.assertNotIn("error", parsed)
+            self.assertEqual(parsed["network_count"], 2)
+            self.assertEqual(parsed["networks"][0]["instructions"], ["A I 0.0"])
+            self.assertEqual(parsed["networks"][1]["instructions"], ["= Q 0.0"])
+        finally:
+            if p.exists():
+                p.unlink()
+
+        # Parse Data Block
+        db_content = (
+            "DATA_BLOCK DB 1\n"
+            "TITLE = Plant Data Block\n"
+            "BEGIN\n"
+            "END_DATA_BLOCK\n"
+        )
+        pdb = MODULE.WORKSPACE_DIR / "test_db1.awl"
+        pdb.write_text(db_content, encoding="utf-8")
+        try:
+            parsed_db = MODULE.parse_s7_awl_source(pdb)
+            self.assertNotIn("error", parsed_db)
+            self.assertEqual(parsed_db["block_type"], "DATA_BLOCK")
+            self.assertEqual(parsed_db["block_number"], "1")
+        finally:
+            if pdb.exists():
+                pdb.unlink()
+
+    def test_block_overview_by_project_name(self):
+        res_create = json.loads(MODULE.s7_create_project(project_name="Overview_Named_Project"))
+        self.assertTrue(res_create["success"])
+        res_overview = json.loads(MODULE.s7_get_block_overview("Overview_Named_Project"))
+        self.assertTrue(res_overview["success"])
+        self.assertGreaterEqual(res_overview["total_blocks"], 1)
+        self.assertTrue(any("OB1" in b.get("tag", b.get("block_tag", "")) for b in res_overview["blocks"]))
+
+    def test_comprehensive_memory_overlaps_md_and_db(self):
+        networks = [
+            {
+                "title": "DWord and Word Overlap",
+                "instructions": ["L 100", "T MD 0", "L MW 2"],
+            },
+            {
+                "title": "DB DWord and Bit Overlap",
+                "instructions": ["L 500", "T DB1.DBD 0", "A DB1.DBX 0.0", "= M 0.0"],
+            },
+            {
+                "title": "Odd Word Overlap",
+                "instructions": ["L 20", "T MW 10", "L MW 11"],
+            },
+        ]
+        res = json.loads(MODULE.s7_get_cross_references(networks=networks))
+        self.assertTrue(res["success"])
+        overlaps = res["memory_overlaps"]
+        self.assertTrue(
+            any("MD 0" in o and "MW 2" in o for o in overlaps),
+            f"Expected MD 0 / MW 2 overlap in {overlaps}",
+        )
+        self.assertTrue(
+            any("DB1.DBD 0" in o and "DB1.DBX 0.0" in o for o in overlaps),
+            f"Expected DB1.DBD 0 / DB1.DBX 0.0 overlap in {overlaps}",
+        )
+        self.assertTrue(
+            any("MW 10" in o and "MW 11" in o for o in overlaps),
+            f"Expected MW 10 / MW 11 overlap in {overlaps}",
+        )
+
+    def test_memory_usage_map_symbolic_resolution(self):
+        networks = [
+            {
+                "title": "Symbolic IO",
+                "instructions": ['A "START_PB"', '= "MOTOR_RUN"'],
+            }
+        ]
+        symbols = {"START_PB": "I 0.0", "MOTOR_RUN": "Q 0.0"}
+        res = json.loads(MODULE.s7_get_memory_usage_map(networks=networks, symbols=symbols))
+        self.assertTrue(res["success"])
+        self.assertEqual(res["inputs"]["used_bytes"], 1)
+        self.assertEqual(res["outputs"]["used_bytes"], 1)
+        self.assertTrue(any("0:X" in row for row in res["inputs"]["bit_grid"]))
+        self.assertTrue(any("0:X" in row for row in res["outputs"]["bit_grid"]))
+
+    def test_write_program_with_spaced_block_name(self):
+        networks = [{"title": "FC Test", "instructions": ["NOP 0"]}]
+        res = json.loads(MODULE.s7_write_program(networks=networks, block_name="FC 10"))
+        self.assertEqual(res["status"], "OFFLINE_SOURCE_GENERATED")
+        awl_path = Path(res["awl_source_path"])
+        content = awl_path.read_text(encoding="utf-8")
+        self.assertIn("FUNCTION FC 10", content)
+
+    def test_read_program_offline_fallback(self):
+        proj = "Offline_Read_Proj"
+        res_create = json.loads(MODULE.s7_create_project(project_name=proj))
+        self.assertTrue(res_create["success"])
+        # s7_read_program in offline mode should find OB1.awl in project
+        res_read = json.loads(MODULE.s7_read_program("OB1"))
+        self.assertTrue(res_read["success"])
+        self.assertEqual(res_read["mode"], "offline")
+        self.assertEqual(res_read["block_number"], "1")
+
+    def test_deep_analysis_counts_word_and_float_ops_and_unmatched_paren(self):
+        networks = [
+            {
+                "title": "Float and DWord math",
+                "instructions": [
+                    "L 1.5",
+                    "L 2.5",
+                    "+R",
+                    "T MD 10",
+                    "==R",
+                    "AW",
+                    "ROUND",
+                ],
+            },
+            {
+                "title": "Unmatched parenthesis",
+                "instructions": ["A I 0.0", ")", "= Q 0.0"],
+            },
+        ]
+        res = json.loads(MODULE.s7_analyze_program(networks=networks))
+        self.assertTrue(res["success"])
+        self.assertGreater(res["metrics"]["word_operations"], 3)
+        self.assertTrue(any("Unmatched closing parenthesis" in h for h in res["hazards"]))
+
+    def test_dismiss_popups_multilingual(self):
+        class MockBtn:
+            def __init__(self, text):
+                self._text = text
+                self.clicked = False
+
+            def friendly_class_name(self):
+                return "Button"
+
+            def window_text(self):
+                return self._text
+
+            def click(self):
+                self.clicked = True
+
+        class MockStatic:
+            def friendly_class_name(self):
+                return "Static"
+
+            def window_text(self):
+                return "Voulez-vous enregistrer les modifications ?"
+
+        class MockDlg:
+            def __init__(self, buttons):
+                self._children = [MockStatic()] + [MockBtn(b) for b in buttons]
+                self.handle = 12345
+
+            def class_name(self):
+                return "#32770"
+
+            def is_enabled(self):
+                return True
+
+            def window_text(self):
+                return "SIMATIC Confirmation"
+
+            def children(self):
+                return self._children
+
+        ctrl = MODULE.SimaticManagerController()
+        ctrl.app = type("MockApp", (), {
+            "windows": lambda self, visible_only=True: [MockDlg(["Oui", "Non"])]
+        })()
+        msgs = ctrl._dismiss_popups(confirm=True, timeout=0.1)
+        self.assertTrue(any("enregistrer" in m for m in msgs))
 
 
 if __name__ == "__main__":

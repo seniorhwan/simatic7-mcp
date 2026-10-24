@@ -68,6 +68,7 @@ from __future__ import annotations
 
 import csv
 import datetime
+import fnmatch
 import io
 import json
 import os
@@ -989,40 +990,53 @@ def _validate_symbol_map(symbols_input: Any) -> Tuple[List[str], List[S7SymbolEn
                 addr_slug = re.sub(r"[^A-Za-z0-9]", "_", k_str).strip("_")
                 if isinstance(v, str):
                     v_str = v.strip()
-                    if re.fullmatch(r"^[A-Za-z_][A-Za-z0-9_]{0,23}$", v_str):
-                        items.append({"symbol": v_str, "address": k_str, "data_type": inferred_type, "comment": ""})
-                    else:
-                        gen_sym = re.sub(r"[^A-Za-z0-9_]", "_", v_str).strip("_")[:24]
-                        if not gen_sym or not gen_sym[0].isalpha():
-                            gen_sym = f"SYM_{gen_sym}"[:24]
-                        if gen_sym.upper() in seen_gen_syms:
-                            gen_sym = f"{gen_sym[:17]}_{addr_slug}"[:24]
-                        seen_gen_syms.add(gen_sym.upper())
-                        items.append({
-                            "symbol": gen_sym,
-                            "address": k_str,
-                            "data_type": inferred_type,
-                            "comment": v_str,
-                        })
+                    gen_sym = re.sub(r"[^A-Za-z0-9_]", "_", v_str).strip("_")[:24]
+                    if not gen_sym or not gen_sym[0].isalpha():
+                        gen_sym = f"SYM_{gen_sym}"[:24]
+                    if gen_sym.upper() in seen_gen_syms:
+                        gen_sym = f"{gen_sym[:17]}_{addr_slug}"[:24]
+                    counter = 1
+                    while gen_sym.upper() in seen_gen_syms:
+                        gen_sym = f"{gen_sym[:20]}_{counter}"[:24]
+                        counter += 1
+                    seen_gen_syms.add(gen_sym.upper())
+                    items.append({
+                        "symbol": gen_sym,
+                        "address": k_str,
+                        "data_type": inferred_type,
+                        "comment": v_str,
+                    })
                 elif isinstance(v, dict):
                     sym = v.get("symbol")
+                    comment_str = v.get("comment", "")
                     if not sym:
-                        comment_str = v.get("comment", "")
                         if comment_str:
-                            gen_sym = re.sub(r"[^A-Za-z0-9_]", "_", comment_str).strip("_")[:24]
+                            gen_sym = re.sub(r"[^A-Za-z0-9_]", "_", str(comment_str)).strip("_")[:24]
                             if not gen_sym or not gen_sym[0].isalpha():
                                 gen_sym = f"SYM_{gen_sym}"[:24]
                             if gen_sym.upper() in seen_gen_syms:
                                 gen_sym = f"{gen_sym[:17]}_{addr_slug}"[:24]
+                            counter = 1
+                            while gen_sym.upper() in seen_gen_syms:
+                                gen_sym = f"{gen_sym[:20]}_{counter}"[:24]
+                                counter += 1
                             seen_gen_syms.add(gen_sym.upper())
                             sym = gen_sym
                         else:
                             sym = f"DEV_{addr_slug}"[:24]
+                            counter = 1
+                            while sym.upper() in seen_gen_syms:
+                                sym = f"{sym[:20]}_{counter}"[:24]
+                                counter += 1
+                            seen_gen_syms.add(sym.upper())
+                    else:
+                        sym = str(sym).strip()
+                        seen_gen_syms.add(sym.upper())
                     items.append({
                         "symbol": str(sym),
                         "address": k_str,
                         "data_type": v.get("data_type", inferred_type),
-                        "comment": v.get("comment", ""),
+                        "comment": comment_str,
                     })
                 else:
                     errors.append(f"Invalid symbol entry value for address key '{k}'.")
@@ -1047,7 +1061,40 @@ def _validate_symbol_map(symbols_input: Any) -> Tuple[List[str], List[S7SymbolEn
             if not isinstance(item, dict):
                 errors.append(f"Symbol item {idx} must be a dictionary object.")
                 continue
-            items.append(item)
+            addr_val = str(item.get("address", "")).strip()
+            addr_slug = re.sub(r"[^A-Za-z0-9]", "_", addr_val).strip("_") if addr_val else f"DEV_{idx}"
+            inferred_type = infer_s7_data_type(addr_val) if addr_val else "BOOL"
+            sym_val = item.get("symbol")
+            comm_val = item.get("comment", "")
+            if not sym_val:
+                if comm_val:
+                    gen_sym = re.sub(r"[^A-Za-z0-9_]", "_", str(comm_val)).strip("_")[:24]
+                    if not gen_sym or not gen_sym[0].isalpha():
+                        gen_sym = f"SYM_{gen_sym}"[:24]
+                    if gen_sym.upper() in seen_gen_syms:
+                        gen_sym = f"{gen_sym[:17]}_{addr_slug}"[:24]
+                    counter = 1
+                    while gen_sym.upper() in seen_gen_syms:
+                        gen_sym = f"{gen_sym[:20]}_{counter}"[:24]
+                        counter += 1
+                    seen_gen_syms.add(gen_sym.upper())
+                    sym_val = gen_sym
+                else:
+                    sym_val = f"DEV_{addr_slug}"[:24]
+                    counter = 1
+                    while sym_val.upper() in seen_gen_syms:
+                        sym_val = f"{sym_val[:20]}_{counter}"[:24]
+                        counter += 1
+                    seen_gen_syms.add(sym_val.upper())
+            else:
+                sym_val = str(sym_val).strip()
+                seen_gen_syms.add(sym_val.upper())
+            items.append({
+                "symbol": sym_val,
+                "address": addr_val,
+                "data_type": item.get("data_type", inferred_type),
+                "comment": comm_val,
+            })
     else:
         errors.append("symbols must be a dictionary or list of symbol objects.")
         return errors, symbol_entries
@@ -1587,7 +1634,11 @@ def parse_s7_awl_source(filepath: Path) -> Dict[str, Any]:
     block_type = ""
     block_number = None
     for i, line in enumerate(lines):
-        m_blk = re.match(r"^(ORGANIZATION_BLOCK|FUNCTION_BLOCK|FUNCTION)\s+([A-Za-z0-9]+)\s*(\d*)", line, re.IGNORECASE)
+        m_blk = re.match(
+            r"^(ORGANIZATION_BLOCK|FUNCTION_BLOCK|FUNCTION|DATA_BLOCK|TYPE)\s+([A-Za-z0-9_\"]+)\s*(\d*)",
+            line,
+            re.IGNORECASE,
+        )
         if m_blk:
             block_header_idx = i
             block_type = m_blk.group(1).upper()
@@ -1600,23 +1651,26 @@ def parse_s7_awl_source(filepath: Path) -> Dict[str, Any]:
     # Find BEGIN marker
     begin_idx = None
     for i in range(block_header_idx, len(lines)):
-        if lines[i].upper() == "BEGIN":
+        if re.match(r"^BEGIN\b", lines[i], re.IGNORECASE):
             begin_idx = i
             break
-
-    if begin_idx is None:
-        return {"error": "Missing 'BEGIN' section in S7 AWL source file."}
 
     # Find END_<BLOCK> marker
     end_marker = f"END_{block_type}"
     end_idx = None
-    for i in range(begin_idx, len(lines)):
+    for i in range(block_header_idx + 1, len(lines)):
         if lines[i].upper().startswith(end_marker):
             end_idx = i
             break
 
     if end_idx is None:
         return {"error": f"Missing terminal '{end_marker}' in S7 AWL source file."}
+
+    if begin_idx is None:
+        if block_type in ("DATA_BLOCK", "TYPE"):
+            begin_idx = block_header_idx
+        else:
+            return {"error": "Missing 'BEGIN' section in S7 AWL source file."}
 
     # Parse Networks
     networks: List[Dict[str, Any]] = []
@@ -1625,7 +1679,7 @@ def parse_s7_awl_source(filepath: Path) -> Dict[str, Any]:
     for line in lines[begin_idx + 1:end_idx]:
         if not line:
             continue
-        if line.upper() == "NETWORK":
+        if re.match(r"^NETWORK(\s+\d+)?\s*(:.*)?$", line, re.IGNORECASE):
             if current_net is not None:
                 networks.append(current_net)
             current_net = {"title": "", "comment": "", "instructions": []}
@@ -1868,10 +1922,11 @@ def search_symbols_and_comments_entries(
     q_str = query.strip()
     is_wildcard = "*" in q_str or "?" in q_str
     if is_wildcard:
-        regex_pat = re.compile(
-            r"^" + q_str.replace(".", r"\.").replace("*", ".*").replace("?", ".") + r"$",
-            re.IGNORECASE,
-        )
+        try:
+            pat = fnmatch.translate(q_str)
+            regex_pat = re.compile(pat, re.IGNORECASE)
+        except Exception:
+            regex_pat = re.compile(re.escape(q_str), re.IGNORECASE)
     else:
         q_lower = q_str.lower()
 
@@ -1879,7 +1934,10 @@ def search_symbols_and_comments_entries(
         if not val:
             return False
         if is_wildcard:
-            return regex_pat.search(val) is not None
+            try:
+                return regex_pat.search(val) is not None
+            except Exception:
+                return False
         return q_lower in val.lower()
 
     matched: List[Dict[str, str]] = []
@@ -1934,24 +1992,125 @@ def annotate_awl_source_text(
             except Exception:
                 pass
 
-    if parsed.get("error"):
-        raise ValueError(parsed["error"])
-
     networks_raw = parsed.get("networks", [])
+    block_type = parsed.get("block_type", "OB")
+    block_number = int(parsed.get("block_number", 1) or 1)
+
+    if parsed.get("error"):
+        # Check if source_text is an AWL snippet (without block headers)
+        lines = [line.strip() for line in source_text.splitlines() if line.strip()]
+        inst_lines = [ln for ln in lines if not ln.startswith("//") and not ln.upper().startswith("TITLE")]
+        if inst_lines:
+            networks_raw = [{"title": "", "comment": "", "instructions": inst_lines}]
+            block_type = "OB"
+            block_number = 1
+        else:
+            raise ValueError(parsed["error"])
+
     report = validate_and_analyze_program(networks_raw, symbols_input=symbols, plc_type=plc_type)
+    if not report.valid:
+        raise ValueError(f"Program validation failed: {'; '.join(report.errors)}")
+
     annotated_code = generate_s7_awl_source(
         report.normalized_networks,
-        block_type=parsed.get("block_type", "OB"),
-        block_number=int(parsed.get("block_number", 1) or 1),
+        block_type=block_type,
+        block_number=block_number,
         symbols=symbols,
         annotate_comments=True,
         style=style,
     )
     ann_count = sum(1 for line in annotated_code.splitlines() if "//" in line and not line.strip().startswith("//"))
-    return annotated_code, [
-        {"title": n.title, "comment": n.comment, "instructions": n.instructions}
-        for n in report.normalized_networks
-    ], ann_count
+
+    temp_ann = WORKSPACE_DIR / f"temp_ann_{uuid.uuid4().hex[:8]}.awl"
+    temp_ann.write_text(annotated_code, encoding="utf-8")
+    final_networks: List[Dict[str, Any]] = []
+    try:
+        ann_parsed = parse_s7_awl_source(temp_ann)
+        final_networks = ann_parsed.get("networks", [])
+    finally:
+        if temp_ann.exists():
+            try:
+                temp_ann.unlink()
+            except Exception:
+                pass
+
+    if not final_networks:
+        final_networks = [
+            {"title": n.title, "comment": n.comment, "instructions": n.instructions}
+            for n in report.normalized_networks
+        ]
+
+    return annotated_code, final_networks, ann_count
+
+
+def get_s7_memory_span(addr_str: str) -> Optional[Tuple[str, int, int, Optional[int]]]:
+    """
+    Returns (domain, start_byte, end_byte, bit_num_or_None) for an S7 operand.
+    domain: e.g. 'M', 'I', 'Q', 'L', 'PI', 'PQ', 'DB1', 'DB2', 'DB0'.
+    """
+    clean = canonical_s7_address(addr_str)
+    # 1. Bit device: I, Q, M, L, E, A
+    m_bit = S7_BIT_DEVICE_REGEX.fullmatch(clean)
+    if m_bit:
+        pfx, b_str, bit_str = m_bit.groups()
+        b_val, bit_val = int(b_str), int(bit_str)
+        domain = "I" if pfx.upper() in ("I", "E") else ("Q" if pfx.upper() in ("Q", "A") else pfx.upper())
+        return (domain, b_val, b_val, bit_val)
+
+    # 2. Byte device
+    m_b = S7_BYTE_DEVICE_REGEX.fullmatch(clean)
+    if m_b:
+        pfx, b_str = m_b.groups()
+        b_val = int(b_str)
+        pfx_up = pfx.upper()
+        domain = (
+            "I" if pfx_up in ("IB", "EB")
+            else ("Q" if pfx_up in ("QB", "AB") else ("M" if pfx_up == "MB" else pfx_up[:-1]))
+        )
+        return (domain, b_val, b_val, None)
+
+    # 3. Word device
+    m_w = S7_WORD_DEVICE_REGEX.fullmatch(clean)
+    if m_w:
+        pfx, b_str = m_w.groups()
+        b_val = int(b_str)
+        pfx_up = pfx.upper()
+        domain = (
+            "I" if pfx_up in ("IW", "EW")
+            else ("Q" if pfx_up in ("QW", "AW") else ("M" if pfx_up == "MW" else pfx_up[:-1]))
+        )
+        return (domain, b_val, b_val + 1, None)
+
+    # 4. DWord device
+    m_d = S7_DWORD_DEVICE_REGEX.fullmatch(clean)
+    if m_d:
+        pfx, b_str = m_d.groups()
+        b_val = int(b_str)
+        pfx_up = pfx.upper()
+        domain = (
+            "I" if pfx_up in ("ID", "ED")
+            else ("Q" if pfx_up in ("QD", "AD") else ("M" if pfx_up == "MD" else pfx_up[:-1]))
+        )
+        return (domain, b_val, b_val + 3, None)
+
+    # 5. DB Elements
+    m_db = S7_DB_ELEMENT_REGEX.fullmatch(clean)
+    if m_db:
+        db_pfx = m_db.group(2)
+        db_domain = db_pfx.upper() if db_pfx else "DB0"
+        elem_type = m_db.group(3).upper()
+        offset = int(m_db.group(4))
+        bit_num = int(m_db.group(6)) if m_db.group(6) is not None else None
+        if "X" in elem_type:
+            return (db_domain, offset, offset, bit_num)
+        elif "B" in elem_type:
+            return (db_domain, offset, offset, None)
+        elif "W" in elem_type:
+            return (db_domain, offset, offset + 1, None)
+        elif "D" in elem_type:
+            return (db_domain, offset, offset + 3, None)
+
+    return None
 
 
 def generate_cross_references(
@@ -2047,54 +2206,37 @@ def generate_cross_references(
                 "access": access,
             })
 
-    # Memory Overlap Detection
-    for k in list(cross_refs.keys()):
-        m_bit = S7_BIT_DEVICE_REGEX.fullmatch(k)
-        if m_bit:
-            area = m_bit.group(1).upper()
-            if area in ("M", "Q", "I", "A", "E"):
-                byte_val = int(m_bit.group(2))
-                candidates = [
-                    f"{area}B {byte_val}",
-                    f"{area}W {byte_val}",
-                    f"{area}W {byte_val - 1}" if byte_val > 0 else None,
-                    f"{area}D {byte_val}",
-                    f"{area}D {byte_val - 1}" if byte_val > 0 else None,
-                    f"{area}D {byte_val - 2}" if byte_val > 1 else None,
-                    f"{area}D {byte_val - 3}" if byte_val > 2 else None,
-                ]
-                for cand in candidates:
-                    if cand and cand in cross_refs:
-                        w_ref = cross_refs[cand]
-                        b_ref = cross_refs[k]
-                        if w_ref["write_count"] > 0 or b_ref["write_count"] > 0:
-                            msg = (
-                                f"Memory Overlap Hazard: Bit '{k}' (read:{b_ref['read_count']}, "
-                                f"write:{b_ref['write_count']}) overlaps with '{cand}' "
-                                f"(read:{w_ref['read_count']}, write:{w_ref['write_count']})."
-                            )
-                            if msg not in memory_overlaps:
-                                memory_overlaps.append(msg)
-
-        m_word = S7_WORD_DEVICE_REGEX.fullmatch(k)
-        if m_word:
-            word_pfx = m_word.group(1).upper()
-            if word_pfx in ("MW", "QW", "IW", "EW", "AW"):
-                byte_val = int(m_word.group(2))
-                base_area = word_pfx[0]
-                byte_cands = [f"{base_area}B {byte_val}", f"{base_area}B {byte_val + 1}"]
-                for bc in byte_cands:
-                    if bc in cross_refs:
-                        w_ref = cross_refs[bc]
-                        b_ref = cross_refs[k]
-                        if w_ref["write_count"] > 0 or b_ref["write_count"] > 0:
-                            msg = (
-                                f"Memory Overlap Hazard: Word '{k}' (read:{b_ref['read_count']}, "
-                                f"write:{b_ref['write_count']}) overlaps with '{bc}' "
-                                f"(read:{w_ref['read_count']}, write:{w_ref['write_count']})."
-                            )
-                            if msg not in memory_overlaps:
-                                memory_overlaps.append(msg)
+    # Comprehensive Multi-Byte Memory Overlap Detection
+    keys = list(cross_refs.keys())
+    for i in range(len(keys)):
+        k1 = keys[i]
+        span1 = get_s7_memory_span(k1)
+        if not span1:
+            continue
+        dom1, s1, e1, bit1 = span1
+        ref1 = cross_refs[k1]
+        for j in range(i + 1, len(keys)):
+            k2 = keys[j]
+            span2 = get_s7_memory_span(k2)
+            if not span2:
+                continue
+            dom2, s2, e2, bit2 = span2
+            if dom1 != dom2:
+                continue
+            if max(s1, s2) <= min(e1, e2):
+                ref2 = cross_refs[k2]
+                if ref1["write_count"] > 0 or ref2["write_count"] > 0:
+                    if bit1 is not None and bit2 is not None:
+                        if bit1 != bit2:
+                            continue
+                    type1 = "Bit" if bit1 is not None else ("Byte" if s1 == e1 else ("Word" if e1 - s1 == 1 else "DWord"))
+                    type2 = "Bit" if bit2 is not None else ("Byte" if s2 == e2 else ("Word" if e2 - s2 == 1 else "DWord"))
+                    msg = (
+                        f"Memory Overlap Hazard: {type1} '{k1}' (read:{ref1['read_count']}, write:{ref1['write_count']}) "
+                        f"overlaps with {type2} '{k2}' (read:{ref2['read_count']}, write:{ref2['write_count']})."
+                    )
+                    if msg not in memory_overlaps:
+                        memory_overlaps.append(msg)
 
     return {
         "total_devices": len(cross_refs),
@@ -2123,6 +2265,9 @@ def generate_memory_usage_map(
     dbs_used: Dict[int, Set[int]] = {}
     multi_byte_overlaps: List[str] = []
 
+    _, symbol_entries = _validate_symbol_map(symbols) if symbols else ([], [])
+    sym_to_addr = {e.symbol.upper(): canonical_s7_address(e.address) for e in symbol_entries}
+
     for net in networks:
         for inst in net.get("instructions", []):
             code = inst.split("//", 1)[0].strip()
@@ -2135,6 +2280,10 @@ def generate_memory_usage_map(
             if len(tokens) < 2:
                 continue
             arg = tokens[1].strip()
+            m_sym = S7_NAMED_SYMBOL_REGEX.fullmatch(arg)
+            sym_k = m_sym.group(1).upper() if m_sym else arg.strip('"').upper()
+            if sym_k in sym_to_addr:
+                arg = sym_to_addr[sym_k]
 
             # 1. Bit devices
             m_bit = S7_BIT_DEVICE_REGEX.fullmatch(arg)
@@ -2271,8 +2420,19 @@ def inspect_project_blocks(project_dir_or_file: Optional[Path] = None) -> Dict[s
     """
     target_dir: Optional[Path] = None
     if project_dir_or_file:
-        p = Path(project_dir_or_file)
-        target_dir = p if p.is_dir() else p.parent
+        p = Path(project_dir_or_file).expanduser()
+        if p.is_dir():
+            target_dir = p
+        elif p.is_file():
+            target_dir = p.parent
+        else:
+            cand_proj = WORKSPACE_DIR / "Projects" / str(project_dir_or_file)
+            if cand_proj.is_dir():
+                target_dir = cand_proj
+            elif (WORKSPACE_DIR / "Projects" / f"{project_dir_or_file}.s7p").is_file():
+                target_dir = (WORKSPACE_DIR / "Projects" / f"{project_dir_or_file}.s7p").parent
+            else:
+                target_dir = p.parent if p.parent.is_dir() else WORKSPACE_DIR
     else:
         if controller.project_name:
             cand = WORKSPACE_DIR / "Projects" / controller.project_name
@@ -2296,6 +2456,7 @@ def inspect_project_blocks(project_dir_or_file: Optional[Path] = None) -> Dict[s
             "FUNCTION": "FC",
             "FUNCTION_BLOCK": "FB",
             "DATA_BLOCK": "DB",
+            "TYPE": "UDT",
         }
         short_type = type_prefix_map.get(blk_type.upper(), blk_type)
         blk_tag = f"{short_type}{blk_num}"
@@ -2331,6 +2492,8 @@ def inspect_project_blocks(project_dir_or_file: Optional[Path] = None) -> Dict[s
 
         call_graph[blk_tag] = called
         blocks.append({
+            "name": blk_tag,
+            "tag": blk_tag,
             "file": str(f),
             "block_tag": blk_tag,
             "block_type": blk_type,
@@ -2418,12 +2581,25 @@ def perform_deep_program_analysis(
                 if nesting_stack > max_nesting_depth:
                     max_nesting_depth = nesting_stack
             elif opcode == ")":
-                nesting_stack = max(0, nesting_stack - 1)
+                if nesting_stack <= 0:
+                    hazards.append(f"Network {net_idx}: Unmatched closing parenthesis ')' with no open nesting stack.")
+                else:
+                    nesting_stack -= 1
 
             # Instruction category for timing estimation
             if opcode in ("A", "AN", "O", "ON", "X", "XN", "U", "UN", "=", "S", "R", "NOT", "SET", "CLR"):
                 bit_ops_count += 1
-            elif opcode in ("L", "T", "+I", "-I", "*I", "/I", "+D", "-D", "*D", "/D", "==I", "<>I", ">I", "<I"):
+            elif opcode in (
+                "L", "T", "+I", "-I", "*I", "/I", "+D", "-D", "*D", "/D", "MOD",
+                "+R", "-R", "*R", "/R", "ABS", "SQR", "SQRT", "EXP", "LN", "SIN", "COS", "TAN",
+                "==I", "<>I", ">I", "<I", ">=I", "<=I",
+                "==D", "<>D", ">D", "<D", ">=D", "<=D",
+                "==R", "<>R", ">R", "<R", ">=R", "<=R",
+                "AW", "OW", "XOW", "AD", "OD", "XOD",
+                "SLW", "SRW", "SLD", "SRD", "SSI", "SSD", "RLD", "RRD",
+                "BTI", "ITB", "BTD", "DTB", "ITD", "DTR", "ROUND", "TRUNC", "NEGI", "NEGD", "NEGR",
+                "LAR1", "LAR2", "TAR1", "TAR2",
+            ):
                 word_ops_count += 1
             elif opcode in ("SP", "SE", "SD", "SS", "SF", "SI", "SV", "SA", "CU", "CD", "ZV", "ZR"):
                 timer_ops_count += 1
@@ -2609,6 +2785,11 @@ def detect_simatic_environment() -> Dict[str, Any]:
     s7bin = exe_path.parent if exe_path else STEP7_DEFAULT_BIN
     editor_path = s7bin / STEP7_EDITOR_EXE if s7bin.is_dir() else None
     hwcnf_path = s7bin / STEP7_HWCNF_EXE if s7bin.is_dir() else None
+    plcsim_path = s7bin / "s7wndx.exe" if s7bin.is_dir() else None
+    if not plcsim_path or not plcsim_path.is_file():
+        alt_plcsim = s7bin / "s7plcsim.exe" if s7bin.is_dir() else None
+        if alt_plcsim and alt_plcsim.is_file():
+            plcsim_path = alt_plcsim
 
     projects_dir = WORKSPACE_DIR / "Projects"
     existing_projects = [p.name for p in projects_dir.iterdir() if p.is_dir()] if projects_dir.is_dir() else []
@@ -2618,6 +2799,7 @@ def detect_simatic_environment() -> Dict[str, Any]:
         "simatic_manager_exe": str(exe_path) if exe_path else None,
         "editor_exe": str(editor_path) if editor_path and editor_path.is_file() else None,
         "hw_config_exe": str(hwcnf_path) if hwcnf_path and hwcnf_path.is_file() else None,
+        "plcsim_exe": str(plcsim_path) if plcsim_path and plcsim_path.is_file() else None,
         "installed_versions": installed_versions or (["v5.5 / v5.6 / v5.7"] if exe_path else []),
         "running_siemens_processes": running_siemens_procs,
         "pywinauto_available": PYWINAUTO_AVAILABLE,
@@ -2756,6 +2938,29 @@ class SimaticManagerController:
                     time.sleep(1.0)
                     self._dismiss_popups(confirm=True, timeout=2.0)
                     gui_created = True
+
+                    # Select target PLC family by inserting station in SIMATIC Manager station tree
+                    try:
+                        time.sleep(0.5)
+                        self.main_win.set_focus()
+                        station_menu = {
+                            "S7-300": "Insert->Station->1 SIMATIC 300 Station",
+                            "S7-400": "Insert->Station->2 SIMATIC 400 Station",
+                            "WINAC": "Insert->Station->SIMATIC PC Station",
+                        }.get(profile.name, "Insert->Station->1 SIMATIC 300 Station")
+                        try:
+                            self.main_win.menu_select(station_menu)
+                        except Exception:
+                            de_menu = {
+                                "S7-300": "Einfügen->Station->1 SIMATIC 300-Station",
+                                "S7-400": "Einfügen->Station->2 SIMATIC 400-Station",
+                                "WINAC": "Einfügen->Station->SIMATIC PC-Station",
+                            }.get(profile.name, "Einfügen->Station->1 SIMATIC 300-Station")
+                            self.main_win.menu_select(de_menu)
+                        time.sleep(0.5)
+                        self._dismiss_popups(confirm=True, timeout=1.0)
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
@@ -2911,10 +3116,10 @@ class SimaticManagerController:
                     blk_file = cand
                     break
 
-        if not ok and not blk_file:
+        if not blk_file:
             return False, f"Target block '{blk_clean}' not found in project '{proj or 'workspace'}'.", {
                 "block_name": blk_clean,
-                "gui_connected": False,
+                "gui_connected": ok,
             }
 
         return True, f"Target block '{blk_clean}' ready.", {
@@ -2950,17 +3155,27 @@ class SimaticManagerController:
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
-                main_handle = self.main_win.handle if self.main_win else None
+                main_handle = getattr(self.main_win, "handle", None) if self.main_win else None
                 dialogs = []
                 for window in self.app.windows(visible_only=True):
-                    if (window.handle == main_handle or window.class_name() != "#32770" or not window.is_enabled()):
+                    win_handle = getattr(window, "handle", None)
+                    if (win_handle == main_handle or window.class_name() != "#32770" or not window.is_enabled()):
                         continue
                     buttons = [
                         child.window_text().replace("&", "").strip().lower()
                         for child in window.children()
                         if child.friendly_class_name() == "Button"
                     ]
-                    has_message_buttons = any(label in buttons for label in ("yes", "no", "ok", "ja", "nein"))
+                    confirm_labels = (
+                        "yes", "ja", "ok", "oui", "si", "sí", "da", "save", "speichern", "enregistrer", "guardar", "salva"
+                    )
+                    deny_labels = (
+                        "no", "nein", "non", "cancel", "abbrechen", "annuler", "cancelar", "annulla"
+                    )
+                    file_labels = (
+                        "open", "save", "cancel", "abbrechen", "öffnen", "ouvrir", "guardar", "enregistrer", "annuler", "cancelar"
+                    )
+                    has_message_buttons = any(label in buttons for label in confirm_labels + deny_labels)
                     has_text = any(
                         child.friendly_class_name() == "Static" and child.window_text().strip()
                         for child in window.children()
@@ -2969,7 +3184,7 @@ class SimaticManagerController:
                         dialogs.append(window)
                     elif not buttons:
                         continue
-                    elif any(label in buttons for label in ("open", "save", "cancel", "abbrechen")):
+                    elif any(label in buttons for label in file_labels):
                         continue
                     else:
                         raise RuntimeError(
@@ -2989,7 +3204,7 @@ class SimaticManagerController:
                     yes = next((
                         child for child in dlg.children()
                         if child.friendly_class_name() == "Button"
-                        and child.window_text().replace("&", "").strip().lower() in ("yes", "ja", "ok")
+                        and child.window_text().replace("&", "").strip().lower() in confirm_labels
                     ), None)
                     if yes:
                         yes.click()
@@ -3237,6 +3452,7 @@ def s7_create_project(
     station_name: Optional[str] = None,
     project_path: Optional[str] = None,
     launch_if_closed: bool = True,
+    target_cpu: Optional[str] = None,
 ) -> str:
     """
     Creates a new SIMATIC STEP 7 project targeting S7-300, S7-400, or WinAC.
@@ -3250,11 +3466,13 @@ def s7_create_project(
         station_name: Optional station name (e.g. 'SIMATIC 300(1)').
         project_path: Optional custom folder path for project.
         launch_if_closed: If True (default), automatically starts SIMATIC Manager if closed.
+        target_cpu: Optional alias for cpu_type.
     """
+    eff_cpu = cpu_type or target_cpu
     ok, message, meta = controller.create_project(
         project_name,
         plc_type=plc_type,
-        cpu_type=cpu_type,
+        cpu_type=eff_cpu,
         station_name=station_name,
         project_path=project_path,
         launch_if_closed=launch_if_closed,
@@ -3441,7 +3659,7 @@ def s7_write_program(
         )
 
     # Parse block type and number
-    m_blk = re.match(r"^([A-Za-z]+)(\d+)$", block_name.strip())
+    m_blk = re.match(r"^([A-Za-z]+)\s*(\d+)$", block_name.strip())
     blk_type = m_blk.group(1).upper() if m_blk else "OB"
     blk_num = int(m_blk.group(2)) if m_blk else 1
 
@@ -3635,23 +3853,52 @@ def s7_read_program(block_name: str = "OB1") -> str:
     Returns network titles, comments, and instructions.
     """
     ok, title = controller.connect()
-    if not ok:
-        return json.dumps({"success": False, "error": title}, indent=2)
-    is_active, active_msg = controller.is_block_editor_active(block_name)
-    if not is_active:
-        return json.dumps({"success": False, "error": active_msg}, indent=2)
+    if ok:
+        is_active, active_msg = controller.is_block_editor_active(block_name)
+        if is_active:
+            export_path = new_s7_artifact_path(f"{block_name.lower()}-read")
+            ok_exp, msg = controller.export_current_awl(export_path, block_name=block_name)
+            if ok_exp:
+                parsed = parse_s7_awl_source(export_path)
+                if not parsed.get("error"):
+                    parsed["success"] = True
+                    parsed["mode"] = "gui"
+                    return json.dumps(parsed, indent=2)
 
-    export_path = new_s7_artifact_path(f"{block_name.lower()}-read")
-    ok, msg = controller.export_current_awl(export_path, block_name=block_name)
-    if not ok:
-        return json.dumps({"success": False, "error": msg}, indent=2)
+    blk_clean = block_name.strip().upper()
+    proj = controller.project_name
+    proj_dir = (WORKSPACE_DIR / "Projects" / proj) if proj else None
+    blk_file = None
+    if proj_dir and proj_dir.is_dir():
+        for cand in [proj_dir / "Blocks" / f"{blk_clean}.awl", proj_dir / f"{blk_clean}.awl"]:
+            if cand.is_file():
+                blk_file = cand
+                break
+    if not blk_file:
+        cands = sorted(
+            WORKSPACE_DIR.glob(f"{blk_clean.lower()}-*.awl"),
+            key=lambda f: f.stat().st_mtime,
+            reverse=True,
+        )
+        if cands:
+            blk_file = cands[0]
 
-    parsed = parse_s7_awl_source(export_path)
-    if parsed.get("error"):
-        return json.dumps({"success": False, "error": parsed["error"]}, indent=2)
+    if blk_file and blk_file.is_file():
+        parsed = parse_s7_awl_source(blk_file)
+        if parsed.get("error"):
+            return json.dumps({"success": False, "error": parsed["error"]}, indent=2)
+        parsed["success"] = True
+        parsed["mode"] = "offline"
+        return json.dumps(parsed, indent=2)
 
-    parsed["success"] = True
-    return json.dumps(parsed, indent=2)
+    err = (
+        f"Target block '{block_name}' is not open in the LAD/FBD/STL Editor, "
+        f"and no offline block file was found in project '{controller.project_name or 'workspace'}'."
+    )
+    return json.dumps({
+        "success": False,
+        "error": err,
+    }, indent=2)
 
 
 @mcp.tool()
