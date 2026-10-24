@@ -105,56 +105,107 @@ Branching jumps with labels are fully supported:
 
 ---
 
-## Global Symbol Tables & Comments
+## Device Comments & Global Symbol Table Integration
 
-Symbol tables can be provided as a dictionary mapping symbol name to address, address to symbol name, or a detailed list of objects:
+The server provides bidirectional integration for Siemens STEP 7 Symbol Tables (`.SDF`, `.SEQ`, and `.CSV`), supporting device comments and symbolic programming:
 
-```json
-{
-  "symbols": {
-    "START_PB": "I 0.0",
-    "STOP_PB": "I 0.1",
-    "MOTOR_CONTACTOR": "Q 0.0"
-  }
-}
-```
+### 1. Defining Device Comments and Symbols
+Pass either a symbol-to-address map or an address-to-comment dictionary:
 
-Or address-first mapping (compatible with GX Works2 device comments):
 ```json
 {
   "device_comments": {
-    "I 0.0": "START BUTTON",
-    "Q 0.0": "MAIN CONTACTOR"
+    "I 0.0": "Main Motor Start Pushbutton",
+    "I 0.1": "Main Motor Stop Pushbutton",
+    "Q 0.0": "Main Motor Contactor Coil",
+    "M 10.0": "Cycle Running Marker",
+    "T 1": "Motor Acceleration Timer"
   }
 }
 ```
 
-- `s7_write_symbol_table`: Exports validated `.SDF` (tab-delimited) and `.CSV` Symbol Table artifacts.
-- `s7_read_symbol_table`: Parses exported `.SDF`, `.SEQ`, or `.CSV` Symbol Tables back into structured entries.
+- **Auto-Type Inference**: The server automatically infers canonical S7 data types (`BOOL`, `BYTE`, `WORD`, `DWORD`, `TIMER`, `COUNTER`, etc.).
+- **Disambiguation**: If multiple addresses share the identical comment text (e.g., spare inputs), symbol identifiers are automatically disambiguated with address slugs (`Spare_Input_I_0_0`, `Spare_Input_I_0_1`) to prevent duplicate symbol collisions.
+- **SDF & CSV Artifacts**: Writes both tab-delimited Siemens `.SDF` and comma-separated `.CSV` tables.
+
+### 2. Querying and Searching Comments & Symbols
+Use `s7_search_symbols_and_comments` to query symbols by wildcard pattern or substring across addresses, symbol identifiers, comments, or data types:
+```json
+{
+  "query": "*Motor*",
+  "filter_type": "COMMENT",
+  "max_results": 20
+}
+```
+
+### 3. Annotating AWL / STL Source Code
+Use `s7_annotate_awl_code` to translate or document AWL source text using three distinct formatting styles:
+- **`COMMENTS`**: Appends inline comments: `A I 0.0;  // "START_PB": Main Motor Start Pushbutton`
+- **`SYMBOLIC`**: Substitutes physical operands with symbolic names: `A "START_PB";  // I 0.0: Main Motor Start Pushbutton`
+- **`ABSOLUTE`**: Canonical physical addressing: `A I 0.0;  // "START_PB"`
 
 ---
 
-## Static Safety & Engineering Checks
+## Project & Station Management
 
-The server performs deterministic pre-flight static analysis on every candidate:
-1. **Star-Delta Switching Hazards**: Warns if Star contactor output and Delta contactor output are activated without mutual software interlocking (`AN` the opposing coil). Supports English ("STAR"/"DELTA") and German ("STERN"/"DREIECK") naming and resolves symbolic references.
-2. **Duplicate Assignment Coils**: Detects multiple `=` coil writes to the identical bit address across networks (which causes the first assignment to be overwritten during PLC scan cycles), resolving symbolic coils to physical addresses.
-3. **Timer Value Initializations**: Flags S7 timers triggered without prior `L S5T#...` time constants.
-4. **Symbol Table Consistency**: Verifies declared symbols and warns about unreferenced device definitions.
+The server automates SIMATIC Manager (`s7tgtopx.exe`) launching, project creation, and block editing:
+
+- **`s7_create_project`**: Creates a new STEP 7 project targeting `S7-300`, `S7-400`, or `WinAC`. Automatically starts SIMATIC Manager if closed, selects the target CPU model (e.g. `CPU 315-2 DP`), and establishes standard directory structures (`.s7p`, `station.json`, `Blocks/OB1.awl`, `Symbols/symbols.sdf`).
+- **`s7_open_project`**: Opens an existing project folder or `.s7p` file, automatically launching SIMATIC Manager if closed.
+- **`s7_open_block`**: Opens or focuses the target block in the LAD/FBD/STL Editor (`s7kotx.exe`).
 
 ---
 
-## Available MCP Tools
+## Deep Program Analysis & Quality of Life (QoL) Tools
 
-- `s7_get_status`: Checks whether SIMATIC Manager or the LAD/FBD/STL Editor is running, lists active window and recent workspace artifacts.
-- `s7_list_supported_plc_types`: Lists supported Siemens S7 PLC families, limits, aliases, and addressing conventions.
-- `s7_create_project`: Connects to SIMATIC Manager to create a project via native New Project dialog or establishes offline project workspace artifacts.
-- `s7_read_program`: Exports and parses the currently displayed block (`OB1`, `FC`, `FB`).
-- `s7_validate_program`: Pre-validates candidate networks, opcodes, operand boundaries, and static safety rules without touching SIMATIC Manager.
-- `s7_write_program`: Validates candidate, creates local AWL artifact, backs up existing block, imports candidate into SIMATIC Manager, compiles/checks block, and verifies readback equality.
-- `s7_compile_and_check`: Triggers save and compilation (Check Block Consistency) in SIMATIC Manager.
-- `s7_write_symbol_table`: Validates and saves standard Siemens `.SDF` (tab-delimited) and `.CSV` Symbol Table artifacts.
-- `s7_read_symbol_table`: Reads and validates a previously exported Siemens STEP 7 Symbol Table (`.SDF`, `.SEQ`, or `.CSV`).
+### 1. Cross-Reference Table (`s7_get_cross_references`)
+Builds a complete Siemens Querverweisliste tracking every operand read, assignment (`=`), SET (`S`), RESET (`R`), and transfer (`T`).
+- **Memory Overlap Detection**: Detects multi-byte hazards where a bit address (e.g. `M 0.1` or `Q 0.0`) overlaps with a byte, word, or double-word write (e.g. `MB 0`, `MW 0`, `QB 0`).
+
+### 2. Memory Usage Allocation Map (`s7_get_memory_usage_map`)
+Computes exact memory allocation and visual ASCII bit grids (`[ 0:X 1:. 2:. 3:. 4:. 5:. 6:. 7:X ]`) across Inputs (`I`), Outputs (`Q`), Markers (`M`), Timers (`T`), Counters (`C`), and Data Blocks (`DB`). Enforces family-specific hardware limits.
+
+### 3. Block Inspection & Call Hierarchy (`s7_get_block_overview`)
+Scans workspace projects for all compiled and source blocks (`OB`, `FB`, `FC`, `DB`), extracts estimated MC7 byte sizes, network counts, and generates the complete call dependency graph (`OB1 -> [FC 10, FB 1]`).
+
+### 4. Comprehensive Program Safety Analysis (`s7_analyze_program`)
+Performs static engineering validation:
+- **Star-Delta Switching Hazards**: Enforces reciprocal interlocks (`AN Delta` in Star network, `AN Star` in Delta network) to prevent phase-to-phase dead shorts. Supports English and German naming.
+- **Duplicate Output Coils**: Flags destructive duplicate `=` assignments to identical bit addresses.
+- **Unpaired SET / RESET Coils**: Detects set bits never reset within the block.
+- **Nesting Stack Limit**: Enforces the Siemens hardware parenthetical nesting depth limit (`depth <= 7`).
+- **Direct Peripheral Access**: Warns on direct peripheral access (`PIW`, `PQW`) bypassing the process image.
+- **Cycle Time & Safety Score**: Estimates CPU scan sweep time in microseconds and calculates an overall safety score (0-100).
+
+### 5. Controller Environment Auto-Detection (`s7_auto_detect_controllers`)
+Auto-detects installed STEP 7 Classic versions via Windows registry, identifies executable paths (`s7tgtopx.exe`, `s7kotx.exe`, `s7hwcnfx.exe`), lists running Siemens background services, and inspects local workspace health.
+
+---
+
+## Complete MCP Tools Directory (20 Tools)
+
+| Tool Name | Type | Description |
+| :--- | :--- | :--- |
+| `s7_get_status` | Inspection | Checks SIMATIC Manager / Editor connection status, active windows, and recent artifacts. |
+| `s7_list_supported_plc_types` | Inspection | Lists supported PLC families (S7-300, S7-400, WinAC), limits, and CPU aliases. |
+| `s7_auto_detect_controllers` | Inspection | Auto-detects installed STEP 7 Classic environment, binaries, and active Siemens processes. |
+| `s7_create_project` | Project | Creates a STEP 7 project with CPU family selection and offline workspace structure. |
+| `s7_open_project` | Project | Opens an existing `.s7p` project or workspace folder in SIMATIC Manager. |
+| `s7_open_block` | Project | Opens or focuses a target block (`OB1`, `FC`, `FB`) in the LAD/FBD/STL editor. |
+| `s7_validate_program` | Safety | Pre-validates AWL networks, syntax, and interlock rules without modifying SIMATIC Manager. |
+| `s7_write_program` | Execution | Verified atomic write: backups, candidate import, compilation, and readback verification. |
+| `s7_read_program` | Execution | Exports and parses the active block in SIMATIC Manager. |
+| `s7_compile_and_check` | Execution | Triggers save and Check Block Consistency in SIMATIC Manager. |
+| `s7_write_symbol_table` | Symbols | Exports validated `.SDF` and `.CSV` Symbol Table artifacts. |
+| `s7_read_symbol_table` | Symbols | Parses exported `.SDF`, `.SEQ`, or `.CSV` Symbol Tables. |
+| `s7_write_device_comments` | Comments | Saves global device comments with automatic type inference and symbol disambiguation. |
+| `s7_read_device_comments` | Comments | Reads device comments and symbol dictionaries from active project or workspace. |
+| `s7_search_symbols_and_comments` | Search | Searches symbols/comments with wildcards and category filters. |
+| `s7_annotate_awl_code` | Code Gen | Annotates AWL code in `COMMENTS`, `SYMBOLIC`, or `ABSOLUTE` styles. |
+| `s7_get_cross_references` | Analysis | Generates operand cross-references and flags memory overlap hazards. |
+| `s7_get_memory_usage_map` | Analysis | Visual bit matrices and utilization statistics across all memory areas. |
+| `s7_get_block_overview` | Analysis | Scans workspace blocks, estimated MC7 sizes, and call dependency trees. |
+| `s7_analyze_program` | Analysis | Deep safety analysis: Star-Delta, duplicate coils, nesting limits, cycle times, safety score. |
 
 ---
 

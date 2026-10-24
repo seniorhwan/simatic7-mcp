@@ -124,11 +124,19 @@ class ValidatorTests(unittest.TestCase):
 
     def test_target_family_address_boundaries(self):
         # S7-300 max input byte 1023
-        self.assertTrue(MODULE.validate_and_analyze_program([{"instructions": ["A I 1023.7", "= Q 1023.7"]}], plc_type="S7-300").valid)
-        self.assertFalse(MODULE.validate_and_analyze_program([{"instructions": ["A I 1024.0", "= Q 0.0"]}], plc_type="S7-300").valid)
+        self.assertTrue(
+            MODULE.validate_and_analyze_program([{"instructions": ["A I 1023.7", "= Q 1023.7"]}], plc_type="S7-300").valid
+        )
+        self.assertFalse(
+            MODULE.validate_and_analyze_program([{"instructions": ["A I 1024.0", "= Q 0.0"]}], plc_type="S7-300").valid
+        )
         # S7-400 allows up to 16383
-        self.assertTrue(MODULE.validate_and_analyze_program([{"instructions": ["A I 1024.0", "= Q 0.0"]}], plc_type="S7-400").valid)
-        self.assertFalse(MODULE.validate_and_analyze_program([{"instructions": ["A I 16384.0", "= Q 0.0"]}], plc_type="S7-400").valid)
+        self.assertTrue(
+            MODULE.validate_and_analyze_program([{"instructions": ["A I 1024.0", "= Q 0.0"]}], plc_type="S7-400").valid
+        )
+        self.assertFalse(
+            MODULE.validate_and_analyze_program([{"instructions": ["A I 16384.0", "= Q 0.0"]}], plc_type="S7-400").valid
+        )
 
     def test_german_mnemonic_support(self):
         german_net = [
@@ -713,6 +721,377 @@ class AdditionalEdgeCaseTests(unittest.TestCase):
                 self.assertTrue(meta_path.is_file())
             finally:
                 MODULE.WORKSPACE_DIR = old_ws
+
+
+class QualityOfLifeAndToolsTests(unittest.TestCase):
+    def setUp(self):
+        self.old_ws = MODULE.WORKSPACE_DIR
+        self.old_proj = MODULE.controller.project_name
+        self.temp_dir = tempfile.TemporaryDirectory()
+        MODULE.WORKSPACE_DIR = Path(self.temp_dir.name)
+
+    def tearDown(self):
+        MODULE.WORKSPACE_DIR = self.old_ws
+        MODULE.controller.project_name = self.old_proj
+        self.temp_dir.cleanup()
+
+    def test_device_comments_read_write_roundtrip(self):
+        comments = {
+            "I 0.0": "Main Start Pushbutton",
+            "I 0.1": "Main Stop Pushbutton",
+            "Q 0.0": "Main Contactor Coil",
+        }
+        res_write = json.loads(MODULE.s7_write_device_comments(device_comments=comments))
+        self.assertEqual(res_write["status"], "SUCCESS")
+        self.assertEqual(res_write["comment_count"], 3)
+        self.assertTrue(Path(res_write["symbol_sdf_path"]).is_file())
+        self.assertTrue(Path(res_write["symbol_csv_path"]).is_file())
+
+        # Read back from SDF
+        res_read_sdf = json.loads(MODULE.s7_read_device_comments(res_write["symbol_sdf_path"]))
+        self.assertTrue(res_read_sdf["success"])
+        self.assertEqual(res_read_sdf["device_comments"]["I 0.0"], "Main Start Pushbutton")
+        self.assertEqual(res_read_sdf["symbol_to_address"]["Main_Start_Pushbutton"], "I 0.0")
+
+        # Read back without path (workspace default)
+        res_read_def = json.loads(MODULE.s7_read_device_comments())
+        self.assertTrue(res_read_def["success"])
+        self.assertEqual(res_read_def["device_comments"]["Q 0.0"], "Main Contactor Coil")
+
+    def test_duplicate_device_comments_disambiguation(self):
+        dup_comments = {
+            "I 0.1": "Spare Input Sensor",
+            "I 0.2": "Spare Input Sensor",
+            "I 0.3": "Spare Input Sensor",
+        }
+        res_write = json.loads(MODULE.s7_write_device_comments(device_comments=dup_comments))
+        self.assertEqual(res_write["status"], "SUCCESS")
+        self.assertEqual(res_write["comment_count"], 3)
+        symbols = [p["symbol"] for p in res_write["processed_comments"]]
+        self.assertEqual(len(symbols), len(set(symbols)), "Symbols must be unique despite identical comments")
+
+        # Verify readback works
+        res_read = json.loads(MODULE.s7_read_device_comments(res_write["symbol_sdf_path"]))
+        self.assertTrue(res_read["success"])
+        self.assertEqual(len(res_read["symbols"]), 3)
+
+    def test_search_symbols_and_comments(self):
+        comments = {
+            "I 0.0": "Start Conveyor",
+            "I 0.1": "Stop Conveyor",
+            "Q 0.0": "Conveyor Motor 1",
+            "Q 0.1": "Water Pump Run",
+            "M 10.0": "Conveyor Running State",
+        }
+        res_write = json.loads(MODULE.s7_write_device_comments(device_comments=comments))
+        sdf_path = res_write["symbol_sdf_path"]
+
+        # Search wildcard
+        s1 = json.loads(MODULE.s7_search_symbols_and_comments(query="*Conveyor*", comment_file_path=sdf_path))
+        self.assertTrue(s1["success"])
+        self.assertGreaterEqual(s1["total_matches"], 3)
+
+        # Filter by ADDRESS
+        s2 = json.loads(MODULE.s7_search_symbols_and_comments(
+            query="Q 0.*", filter_type="ADDRESS", comment_file_path=sdf_path
+        ))
+        self.assertTrue(s2["success"])
+        self.assertEqual(s2["total_matches"], 2)
+
+        # Filter by COMMENT
+        s3 = json.loads(MODULE.s7_search_symbols_and_comments(
+            query="*Pump*", filter_type="COMMENT", comment_file_path=sdf_path
+        ))
+        self.assertTrue(s3["success"])
+        self.assertEqual(s3["total_matches"], 1)
+        self.assertEqual(s3["matches"][0]["symbol"], "Water_Pump_Run")
+
+        # Filter by DATA_TYPE
+        s4 = json.loads(MODULE.s7_search_symbols_and_comments(
+            query="BOOL", filter_type="DATA_TYPE", comment_file_path=sdf_path
+        ))
+        self.assertTrue(s4["success"])
+        self.assertEqual(s4["total_matches"], 5)
+
+        # Empty query error
+        s_err = json.loads(MODULE.s7_search_symbols_and_comments(query="", comment_file_path=sdf_path))
+        self.assertFalse(s_err["success"])
+
+    def test_annotate_awl_code_styles(self):
+        source_awl = (
+            "ORGANIZATION_BLOCK OB 1\n"
+            "BEGIN\n"
+            "NETWORK\n"
+            "TITLE = Motor Control\n"
+            "      A     I 0.0;\n"
+            "      AN    I 0.1;\n"
+            "      =     Q 0.0;\n"
+            "END_ORGANIZATION_BLOCK\n"
+        )
+        symbols = {"START_PB": "I 0.0", "STOP_PB": "I 0.1", "MOTOR_RUN": "Q 0.0"}
+
+        # COMMENTS style
+        res_comm = json.loads(MODULE.s7_annotate_awl_code(source_code=source_awl, symbols=symbols, style="COMMENTS"))
+        self.assertTrue(res_comm["success"])
+        self.assertIn("// \"START_PB\"", res_comm["annotated_awl_source"])
+        self.assertIn("// \"MOTOR_RUN\"", res_comm["annotated_awl_source"])
+
+        # Parsable after annotation
+        parsed = MODULE.parse_s7_awl_source(Path(res_comm["annotated_awl_path"]))
+        self.assertNotIn("error", parsed)
+        self.assertEqual(parsed["networks"][0]["instructions"], ["A I 0.0", "AN I 0.1", "= Q 0.0"])
+
+        # SYMBOLIC style
+        res_sym = json.loads(MODULE.s7_annotate_awl_code(source_code=source_awl, symbols=symbols, style="SYMBOLIC"))
+        self.assertTrue(res_sym["success"])
+        self.assertIn("\"START_PB\"", res_sym["annotated_awl_source"])
+        self.assertIn("\"MOTOR_RUN\"", res_sym["annotated_awl_source"])
+
+        # ABSOLUTE style
+        sym_awl = (
+            "ORGANIZATION_BLOCK OB 1\n"
+            "BEGIN\n"
+            "NETWORK\n"
+            "TITLE = Symbolic Control\n"
+            "      A     \"START_PB\";\n"
+            "      =     \"MOTOR_RUN\";\n"
+            "END_ORGANIZATION_BLOCK\n"
+        )
+        res_abs = json.loads(MODULE.s7_annotate_awl_code(source_code=sym_awl, symbols=symbols, style="ABSOLUTE"))
+        self.assertTrue(res_abs["success"])
+        self.assertIn("I 0.0", res_abs["annotated_awl_source"])
+        self.assertIn("Q 0.0", res_abs["annotated_awl_source"])
+        parsed_abs = MODULE.parse_s7_awl_source(Path(res_abs["annotated_awl_path"]))
+        self.assertEqual(parsed_abs["networks"][0]["instructions"], ["A I 0.0", "= Q 0.0"])
+
+    def test_project_and_station_creation_and_open(self):
+        res_create = json.loads(
+            MODULE.s7_create_project(
+                project_name="Assembly_Cell_1",
+                plc_type="S7-300",
+                cpu_type="CPU 315-2 DP",
+                station_name="Cell1_Station",
+            )
+        )
+        self.assertTrue(res_create["success"])
+        self.assertEqual(res_create["cpu_type"], "CPU 315-2 DP")
+        self.assertEqual(res_create["station_name"], "Cell1_Station")
+        s7p_file = Path(res_create["s7p_path"])
+        self.assertTrue(s7p_file.is_file())
+
+        proj_dir = s7p_file.parent
+        self.assertTrue((proj_dir / "station.json").is_file())
+        self.assertTrue((proj_dir / "Blocks" / "OB1.awl").is_file())
+        self.assertTrue((proj_dir / "Symbols" / "symbols.sdf").is_file())
+
+        # Test open project
+        res_open = json.loads(MODULE.s7_open_project(str(s7p_file)))
+        self.assertTrue(res_open["success"])
+        self.assertEqual(MODULE.controller.project_name, "Assembly_Cell_1")
+
+        # Test open block
+        res_block = json.loads(MODULE.s7_open_block("OB1"))
+        self.assertTrue(res_block["success"])
+        self.assertIn("block_path", res_block["details"])
+
+        # Test open non-existent block
+        res_bad_blk = json.loads(MODULE.s7_open_block("FC999"))
+        self.assertFalse(res_bad_blk["success"])
+
+        # Test open non-existent project
+        res_bad_proj = json.loads(MODULE.s7_open_project("NonExistent_Proj_99"))
+        self.assertFalse(res_bad_proj["success"])
+
+    def test_cross_references_and_memory_overlaps(self):
+        networks = [
+            {
+                "title": "Bit and Byte output write",
+                "instructions": ["A I 0.0", "= Q 0.0", "= QB 0"],
+            },
+            {
+                "title": "Word and Byte memory access",
+                "instructions": ["L MW 10", "T MB 11"],
+            },
+            {
+                "title": "Unpaired Set Marker",
+                "instructions": ["A I 0.2", "S M 20.0"],
+            },
+        ]
+        res = json.loads(MODULE.s7_get_cross_references(networks=networks))
+        self.assertTrue(res["success"])
+        refs = res["cross_references"]
+        self.assertIn("I 0.0", refs)
+        self.assertEqual(refs["I 0.0"]["read_count"], 1)
+        self.assertEqual(refs["I 0.0"]["write_count"], 0)
+
+        self.assertIn("Q 0.0", refs)
+        self.assertEqual(refs["Q 0.0"]["write_count"], 1)
+
+        self.assertIn("QB 0", refs)
+        self.assertEqual(refs["QB 0"]["write_count"], 1)
+
+        # Verify memory overlaps detected
+        overlaps = res["memory_overlaps"]
+        self.assertTrue(
+            any("Q 0.0" in o and "QB 0" in o for o in overlaps),
+            f"Expected Q 0.0/QB 0 overlap in {overlaps}",
+        )
+        self.assertTrue(
+            any("MW 10" in o and "MB 11" in o for o in overlaps),
+            f"Expected MW 10/MB 11 overlap in {overlaps}",
+        )
+
+    def test_memory_usage_map(self):
+        networks = [
+            {
+                "title": "IO and Markers",
+                "instructions": [
+                    "A I 0.0",
+                    "A I 0.7",
+                    "= Q 0.1",
+                    "= M 10.5",
+                    "L S5T#5S",
+                    "SD T 3",
+                    "A I 1.0",
+                    "CU C 2",
+                    "A DB1.DBX 0.0",
+                    "= DB1.DBX 0.1",
+                ],
+            }
+        ]
+        res = json.loads(MODULE.s7_get_memory_usage_map(networks=networks, plc_type="S7-300"))
+        self.assertTrue(res["success"])
+        self.assertEqual(res["inputs"]["used_bytes"], 2)
+        self.assertEqual(res["outputs"]["used_bytes"], 1)
+        self.assertEqual(res["markers"]["used_bytes"], 1)
+        self.assertTrue(any("0:X" in row and "7:X" in row for row in res["inputs"]["bit_grid"]))
+        self.assertEqual(res["timers"]["used_count"], 1)
+        self.assertIn(3, res["timers"]["indices"])
+        self.assertEqual(res["counters"]["used_count"], 1)
+        self.assertIn(2, res["counters"]["indices"])
+        self.assertIn("DB1", res["data_blocks"]["dbs"])
+
+    def test_block_overview(self):
+        proj_dir = MODULE.WORKSPACE_DIR / "Projects" / "Overview_Test" / "Blocks"
+        proj_dir.mkdir(parents=True, exist_ok=True)
+        ob1_code = (
+            "ORGANIZATION_BLOCK OB 1\n"
+            "BEGIN\n"
+            "NETWORK\n"
+            "TITLE = Call FC10\n"
+            "      CALL  FC 10;\n"
+            "END_ORGANIZATION_BLOCK\n"
+        )
+        fc10_code = (
+            "FUNCTION FC 10 : VOID\n"
+            "BEGIN\n"
+            "NETWORK\n"
+            "TITLE = FC Rung\n"
+            "      A     I 0.0;\n"
+            "      =     Q 0.0;\n"
+            "END_FUNCTION\n"
+        )
+        (proj_dir / "OB1.awl").write_text(ob1_code, encoding="utf-8")
+        (proj_dir / "FC10.awl").write_text(fc10_code, encoding="utf-8")
+
+        res = json.loads(MODULE.s7_get_block_overview(project_path_or_name=str(proj_dir.parent)))
+        self.assertTrue(res["success"])
+        self.assertEqual(res["total_blocks"], 2)
+        call_graph = res["call_hierarchy"]
+        self.assertIn("OB1", call_graph)
+        self.assertIn("FC 10", call_graph["OB1"])
+
+    def test_deep_program_analysis_detects_hazards(self):
+        hazard_networks = [
+            {
+                "title": "Motor STAR contactor",
+                "instructions": ["A M 0.0", "= Q 0.1"],
+            },
+            {
+                "title": "Motor DELTA contactor",
+                "instructions": ["A M 0.1", "= Q 0.2"],
+            },
+            {
+                "title": "Duplicate Coil net 1",
+                "instructions": ["A I 0.0", "= Q 0.5"],
+            },
+            {
+                "title": "Duplicate Coil net 2",
+                "instructions": ["A I 0.1", "= Q 0.5"],
+            },
+            {
+                "title": "Unpaired Set",
+                "instructions": ["A I 0.2", "S M 30.0"],
+            },
+            {
+                "title": "Timer without evaluation",
+                "instructions": ["A I 0.3", "L S5T#1S", "SD T 4"],
+            },
+            {
+                "title": "Direct Peripheral Access",
+                "instructions": ["L PIW 256", "T PQW 256"],
+            },
+            {
+                "title": "Excessive nesting depth > 7",
+                "instructions": [
+                    "A(", "A(", "A(", "A(", "A(", "A(", "A(", "A(",
+                    "A I 0.0",
+                    ")", ")", ")", ")", ")", ")", ")", ")",
+                    "= M 40.0",
+                ],
+            },
+        ]
+        res = json.loads(MODULE.s7_analyze_program(networks=hazard_networks, plc_type="S7-300"))
+        self.assertTrue(res["success"])
+        self.assertEqual(res["status"], "FAILED")
+        self.assertLess(res["safety_score"], 70)
+
+        hazards_str = " ".join(res["hazards"])
+        warnings_str = " ".join(res["warnings"])
+        self.assertIn("CRITICAL INTERLOCK HAZARD", hazards_str)
+        self.assertIn("DUPLICATE COIL HAZARD", hazards_str)
+        self.assertIn("NESTING STACK OVERFLOW", hazards_str)
+        self.assertIn("UNPAIRED SET COIL", warnings_str)
+        self.assertIn("TIMER HYGIENE", warnings_str)
+        self.assertIn("PERIPHERAL DIRECT ACCESS", warnings_str)
+        self.assertGreater(res["metrics"]["estimated_sweep_time_us"], 0)
+
+    def test_deep_program_analysis_clean_program(self):
+        clean_networks = [
+            {
+                "title": "Motor STAR contactor with reciprocal interlock",
+                "instructions": ["A M 0.0", "AN Q 0.2", "= Q 0.1"],
+            },
+            {
+                "title": "Motor DELTA contactor with reciprocal interlock",
+                "instructions": ["A M 0.1", "AN Q 0.1", "= Q 0.2"],
+            },
+            {
+                "title": "Paired Set",
+                "instructions": ["A I 0.2", "S M 30.0"],
+            },
+            {
+                "title": "Paired Reset",
+                "instructions": ["A I 0.3", "R M 30.0"],
+            },
+            {
+                "title": "Timer evaluated properly",
+                "instructions": ["A I 0.4", "L S5T#2S", "SD T 1", "A T 1", "= Q 0.3"],
+            },
+        ]
+        res = json.loads(MODULE.s7_analyze_program(networks=clean_networks, plc_type="S7-300"))
+        self.assertTrue(res["success"])
+        self.assertEqual(res["status"], "PASSED")
+        self.assertEqual(res["safety_score"], 100)
+        self.assertEqual(len(res["hazards"]), 0)
+
+    def test_auto_detect_controllers_tool(self):
+        res = json.loads(MODULE.s7_auto_detect_controllers())
+        self.assertTrue(res["success"])
+        self.assertIn("step7_installed", res)
+        self.assertIn("simatic_manager_exe", res)
+        self.assertIn("running_siemens_processes", res)
+        self.assertIn("workspace_dir", res)
 
 
 if __name__ == "__main__":
