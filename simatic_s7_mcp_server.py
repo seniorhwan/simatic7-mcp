@@ -72,12 +72,10 @@ import io
 import json
 import os
 import re
-import subprocess
 import sys
 import threading
 import time
 import uuid
-import unicodedata
 from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
@@ -271,15 +269,15 @@ SUPPORTED_S7_OPCODES: Dict[str, Tuple[int, int]] = {
     "CAD": (0, 0),  # Byte swap dword in ACCU1
     "NOP": (0, 1),  # NOP or NOP 0 / NOP 1
     # Address Register & Stack Instructions
-    "LAR1": (0, 1), # Load Address Register 1
-    "LAR2": (0, 1), # Load Address Register 2
-    "TAR1": (0, 1), # Transfer Address Register 1
-    "TAR2": (0, 1), # Transfer Address Register 2
+    "LAR1": (0, 1),  # Load Address Register 1
+    "LAR2": (0, 1),  # Load Address Register 2
+    "TAR1": (0, 1),  # Transfer Address Register 1
+    "TAR2": (0, 1),  # Transfer Address Register 2
     "CAR": (0, 0),  # Exchange Address Registers AR1 and AR2
-    "PUSH": (0, 0), # Push ACCU stack
+    "PUSH": (0, 0),  # Push ACCU stack
     "POP": (0, 0),  # Pop ACCU stack
     "ENT": (0, 0),  # Enter ACCU stack
-    "LEAVE": (0, 0),# Leave ACCU stack
+    "LEAVE": (0, 0),  # Leave ACCU stack
     # Comparison Instructions (operate on ACCU1 and ACCU2)
     "==I": (0, 0), "<>I": (0, 0), ">I": (0, 0), "<I": (0, 0), ">=I": (0, 0), "<=I": (0, 0),
     "==D": (0, 0), "<>D": (0, 0), ">D": (0, 0), "<D": (0, 0), ">=D": (0, 0), "<=D": (0, 0),
@@ -318,10 +316,10 @@ SUPPORTED_S7_OPCODES: Dict[str, Tuple[int, int]] = {
     # Program Flow, Calls and Jumps (German aliases)
     "SPA": (1, 1),  # Sprung Absolut = JU
     "SPB": (1, 1),  # Sprung Bedingt = JC
-    "SPBN": (1, 1), # Sprung Bedingt Nicht = JCN
-    "SPBB": (1, 1), # Sprung mit BR = JCB
-    "SPBI": (1, 1), # Sprung wenn BR=1 = JBI
-    "SPBIN": (1, 1),# Sprung wenn BR=0 = JNBI
+    "SPBN": (1, 1),  # Sprung Bedingt Nicht = JCN
+    "SPBB": (1, 1),  # Sprung mit BR = JCB
+    "SPBI": (1, 1),  # Sprung wenn BR=1 = JBI
+    "SPBIN": (1, 1),  # Sprung wenn BR=0 = JNBI
     "SPL": (1, 1),  # Sprungleiste = JL
     "BEA": (0, 0),  # Bausteinende Absolut = BE
     "BEB": (0, 0),  # Bausteinende Bedingt = BEC

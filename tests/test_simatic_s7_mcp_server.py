@@ -389,19 +389,25 @@ class GuiResultTests(unittest.TestCase):
         class Child:
             def __init__(self, text, kind):
                 self.text, self.kind = text, kind
+
             def window_text(self):
                 return self.text
+
             def friendly_class_name(self):
                 return self.kind
 
         class Dialog:
             handle = 2
+
             def window_text(self):
                 return "Unexpected"
+
             def class_name(self):
                 return "#32770"
+
             def is_enabled(self):
                 return True
+
             def children(self):
                 return [
                     Child("Unexpected message", "Static"),
@@ -417,7 +423,6 @@ class GuiResultTests(unittest.TestCase):
         c.main_win = type("Main", (), {"handle": 1})()
         with self.assertRaisesRegex(RuntimeError, "Unrecognized modal dialog"):
             c._dismiss_popups()
-
 
 
 class AdditionalEdgeCaseTests(unittest.TestCase):
@@ -712,4 +717,3 @@ class AdditionalEdgeCaseTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
