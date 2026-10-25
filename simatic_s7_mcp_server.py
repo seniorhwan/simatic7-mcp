@@ -5141,6 +5141,84 @@ def s7_auto_detect_controllers() -> str:
     return json.dumps(res, indent=2)
 
 
+@mcp.tool()
+def s7_validate_lad_compliance(
+    source_code: Optional[str] = None,
+    awl_source_path: Optional[str] = None,
+) -> str:
+    """
+    Validates candidate Siemens S7 AWL/STL source code against strict STEP 7 LAD decompiler constraints.
+    Detects patterns that cause networks to fail Ladder Diagram rendering in S7KAFAPX.EXE (falling back to STL text):
+      - Multiple sequential coils in series without planar branch syntax (e.g. S Q0.0; R Q0.1)
+      - Unparenthesized combinations of OR (O) and AND (A) operations
+      - Bare register loads/transfers (L / T) not enclosed in Siemens MOVE box pattern (JNB ... NOP 0)
+      - Raw STL jumps and illegal control flow instructions
+    """
+    from lad_converter import validate_lad_source
+
+    code = source_code
+    if not code and awl_source_path:
+        p = Path(awl_source_path).expanduser()
+        if not p.is_file():
+            return json.dumps({"success": False, "error": f"File not found: {awl_source_path}"}, indent=2)
+        code = p.read_text(encoding="utf-8", errors="ignore")
+
+    if not code:
+        return json.dumps({"success": False, "error": "No source code or awl_source_path provided for LAD validation."}, indent=2)
+
+    report = validate_lad_source(code)
+    res = report.to_dict()
+    res["success"] = True
+    return json.dumps(res, indent=2)
+
+
+@mcp.tool()
+def s7_convert_to_ladder(
+    source_code: Optional[str] = None,
+    awl_source_path: Optional[str] = None,
+    target_awl_path: Optional[str] = None,
+    block_title: str = "Pure Ladder Diagram Block",
+) -> str:
+    """
+    Deterministically transforms candidate Siemens S7 AWL/STL source code into 100% LAD-compliant code:
+      - Splits multi-coil networks into dedicated single-action networks (guaranteeing single coil per rung)
+      - Encloses all parallel OR branches in explicit parentheses A( O ... O ... )
+      - Transforms conditional L/T transfers into Siemens LAD MOVE boxes (JNB ... NOP 0)
+      - Pads Timer instructions with NOP 0 placeholders for unused parameters
+      - Validates the converted output to guarantee 0 LAD violations
+    """
+    from lad_converter import convert_awl_to_pure_lad, validate_lad_source
+
+    code = source_code
+    if not code and awl_source_path:
+        p = Path(awl_source_path).expanduser()
+        if not p.is_file():
+            return json.dumps({"success": False, "error": f"File not found: {awl_source_path}"}, indent=2)
+        code = p.read_text(encoding="utf-8", errors="ignore")
+
+    if not code:
+        return json.dumps({"success": False, "error": "No source code or awl_source_path provided for conversion."}, indent=2)
+
+    converted_code = convert_awl_to_pure_lad(code, block_title=block_title)
+    report = validate_lad_source(converted_code)
+
+    saved_path = None
+    if target_awl_path:
+        tpath = Path(target_awl_path).expanduser()
+        tpath.parent.mkdir(parents=True, exist_ok=True)
+        tpath.write_text(converted_code, encoding="ascii")
+        saved_path = str(tpath.resolve())
+
+    return json.dumps({
+        "success": True,
+        "is_lad_compliant": report.is_lad_compliant,
+        "total_networks": report.total_networks,
+        "violations_count": len(report.violations),
+        "target_awl_path": saved_path,
+        "converted_code": converted_code,
+    }, indent=2)
+
+
 # ============================================================================
 # 9. SERVER ENTRY POINT
 # ============================================================================
