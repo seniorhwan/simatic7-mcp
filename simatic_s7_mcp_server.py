@@ -100,12 +100,42 @@ except ImportError as exc:
 
 # Optional Windows GUI automation imports (handled gracefully if offline)
 try:
+    import pywinauto.mouse as _pywinauto_mouse
     from pywinauto import Application
+    from pywinauto.controls.hwndwrapper import HwndWrapper
     from pywinauto.keyboard import send_keys
+
+    # Priority 2 Audit Fix: Disable physical cursor movement and guard set_focus
+    # so locked screens (Win+L), disconnected RDP sessions, and headless Session 0
+    # never crash with 'RuntimeError: There is no active desktop required for moving mouse cursor!'.
+    _pywinauto_mouse.move = lambda *args, **kwargs: None
+    _ORIG_HWND_SET_FOCUS = HwndWrapper.set_focus
+
+    def _headless_safe_set_focus(self):
+        try:
+            import win32con
+            import win32gui
+
+            hwnd = getattr(self, "handle", None)
+            if hwnd and win32gui.IsWindow(hwnd):
+                try:
+                    win32gui.SetForegroundWindow(hwnd)
+                except Exception:
+                    win32gui.PostMessage(hwnd, win32con.WM_ACTIVATE, win32con.WA_ACTIVE, 0)
+                return self
+        except Exception:
+            pass
+        try:
+            return _ORIG_HWND_SET_FOCUS(self)
+        except Exception:
+            return self
+
+    HwndWrapper.set_focus = _headless_safe_set_focus
     PYWINAUTO_AVAILABLE = True
 except ImportError:
     PYWINAUTO_AVAILABLE = False
     Application = None
+    HwndWrapper = None
 
     def send_keys(*args, **kwargs):
         pass
@@ -496,8 +526,9 @@ SUPPORTED_S7_OPCODES: Dict[str, Tuple[int, int]] = {
     "ABS": (0, 0), "SQR": (0, 0), "SQRT": (0, 0), "EXP": (0, 0), "LN": (0, 0),
     "SIN": (0, 0), "COS": (0, 0), "TAN": (0, 0), "ASIN": (0, 0), "ACOS": (0, 0), "ATAN": (0, 0),
     # Word Logic
-    "UW": (0, 1), "OW": (0, 1), "XOW": (0, 1),
-    "UD": (0, 1), "OD": (0, 1), "XOD": (0, 1),
+    "AW": (0, 1), "OW": (0, 1), "XW": (0, 1), "XOW": (0, 1),
+    "AD": (0, 1), "OD": (0, 1), "XD": (0, 1), "XOD": (0, 1),
+    "UW": (0, 1), "UD": (0, 1),
     # Shift and Rotate
     "SLW": (0, 1), "SRW": (0, 1), "SSI": (0, 1), "SSD": (0, 1),
     "SLD": (0, 1), "SRD": (0, 1), "RLD": (0, 1), "RRD": (0, 1),
@@ -505,16 +536,20 @@ SUPPORTED_S7_OPCODES: Dict[str, Tuple[int, int]] = {
     # Data Conversion
     "BTI": (0, 0), "ITB": (0, 0), "BTD": (0, 0), "ITD": (0, 0),
     "DTR": (0, 0), "DTB": (0, 0), "TRUNC": (0, 0), "ROUND": (0, 0),
+    "RND": (0, 0), "RND+": (0, 0), "RND-": (0, 0),
     "CEIL": (0, 0), "FLOOR": (0, 0), "INVI": (0, 0), "INVD": (0, 0),
+    "INV_I": (0, 0), "INV_D": (0, 0),
     "NEGI": (0, 0), "NEGD": (0, 0), "NEGR": (0, 0),
+    "NEG_I": (0, 0), "NEG_D": (0, 0), "NEG_R": (0, 0),
     # Program Flow, Calls and Jumps (English)
     "JU": (1, 1), "JC": (1, 1), "JCN": (1, 1), "JCB": (1, 1), "JNB": (1, 1),
     "JBI": (1, 1), "JNBI": (1, 1), "JL": (1, 1), "LOOP": (1, 1),
     "BE": (0, 0), "BEC": (0, 0), "BEU": (0, 0),
-    "CALL": (1, 10),
+    "CALL": (1, 32),
     "CC": (1, 1),
     "UC": (1, 1),
     "OPN": (1, 1),  # Open DB or DI
+    "BLD": (1, 1),  # Block Display instruction (used by STEP 7 LAD/FBD editor)
     "MCR(": (0, 0), ")MCR": (0, 0), "MCRA": (0, 0), "MCRD": (0, 0),
     "STP": (0, 0),  # Stop CPU
     # Program Flow, Calls and Jumps (German aliases)
@@ -636,9 +671,13 @@ S7_DB_ELEMENT_REGEX = re.compile(
 S7_STATUS_BIT_REGEX = re.compile(
     r"^(==0|<>0|>0|<0|>=0|<=0|OV|OS|BR|UO)$", re.IGNORECASE
 )
-# 10. Named Symbols and Local Block Variables
-S7_NAMED_SYMBOL_REGEX = re.compile(r"^\"([A-Za-z0-9_]{1,24})\"$")
-S7_LOCAL_VAR_REGEX = re.compile(r"^#([A-Za-z0-9_]{1,24})$")
+# 10. Named Symbols, Local Block Variables, and Symbolic DB/Struct Members
+S7_NAMED_SYMBOL_REGEX = re.compile(r'^"([^"]{1,64})"$')
+S7_LOCAL_VAR_REGEX = re.compile(r"^#([A-Za-z0-9_]{1,64})$")
+S7_SYMBOLIC_MEMBER_REGEX = re.compile(
+    r'^("[^"]+"|#[A-Za-z0-9_]+|DB\s*\d+|DI\s*\d+)(\.("[^"]+"|[A-Za-z_][A-Za-z0-9_]*))+$',
+    re.IGNORECASE,
+)
 
 # S7 Constants
 S7_S5TIME_REGEX = re.compile(r"^(S5T|S5TIME)#(\d+[A-Za-z]+)(_\d+[A-Za-z]+)*$", re.IGNORECASE)
@@ -687,6 +726,12 @@ class S7NetworkSpec:
     comment: str = ""
     instructions: List[str] = field(default_factory=list)
 
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
 
 @dataclass
 class S7SymbolEntry:
@@ -695,6 +740,12 @@ class S7SymbolEntry:
     address: str
     data_type: str = "BOOL"
     comment: str = ""
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
 
 
 @dataclass
@@ -967,8 +1018,12 @@ def _validate_s7_operand(operand: str, profile: S7PLCProfile) -> Tuple[bool, Opt
     if S7_INDIRECT_ADDR_REGEX.fullmatch(clean):
         return True, None, clean.upper()
 
-    # 11. Named Symbols or Local Variables: "MOTOR_RUN" or #TEMP_VAL
-    if S7_NAMED_SYMBOL_REGEX.fullmatch(clean) or S7_LOCAL_VAR_REGEX.fullmatch(clean):
+    # 11. Named Symbols, Local Variables, or Symbolic Struct/DB Members: "MOTOR_RUN", #TEMP_VAL, "S_Data".Speed
+    if (
+        S7_NAMED_SYMBOL_REGEX.fullmatch(clean)
+        or S7_LOCAL_VAR_REGEX.fullmatch(clean)
+        or S7_SYMBOLIC_MEMBER_REGEX.fullmatch(clean)
+    ):
         return True, None, clean
 
     # 12. Constants: S5T#, TIME#, D#, TOD#, DT#, 16#, 2#, integer, real, pointer, char, byte
@@ -1276,6 +1331,45 @@ def validate_and_analyze_program(
         symbol_to_addr[entry.symbol.upper()] = entry.address.upper()
         addr_to_symbol[entry.address.upper()] = entry.symbol.upper()
 
+    # AI-Agent Ergonomics: Coerce raw AWL strings or flat lists of instruction strings into network objects
+    if isinstance(networks_input, str) and networks_input.strip():
+        try:
+            from lad_converter import parse_awl_networks
+            parsed_nets = parse_awl_networks(networks_input)
+            if parsed_nets:
+                networks_input = [
+                    {
+                        "title": getattr(n, "title", "") if not isinstance(n, dict) else n.get("title", ""),
+                        "comment": (
+                            "\n".join(getattr(n, "comment_lines", []) or [])
+                            if not isinstance(n, dict)
+                            else ("\n".join(n.get("comments", [])) if isinstance(n.get("comments"), list) else n.get("comment", ""))
+                        ),
+                        "instructions": (
+                            list(getattr(n, "raw_instructions", []) or [])
+                            if not isinstance(n, dict)
+                            else (n.get("clean_instructions") or n.get("instructions", []))
+                        ),
+                    }
+                    for n in parsed_nets
+                ]
+            else:
+                inst_lines = [
+                    ln.strip()
+                    for ln in networks_input.splitlines()
+                    if ln.strip() and not ln.strip().upper().startswith(("NETWORK", "TITLE"))
+                ]
+                networks_input = [{"title": "Network 1", "instructions": inst_lines}]
+        except Exception:
+            inst_lines = [
+                ln.strip()
+                for ln in networks_input.splitlines()
+                if ln.strip() and not ln.strip().upper().startswith(("NETWORK", "TITLE"))
+            ]
+            networks_input = [{"title": "Network 1", "instructions": inst_lines}]
+    elif isinstance(networks_input, list) and networks_input and all(isinstance(x, str) for x in networks_input):
+        networks_input = [{"title": "Network 1", "comment": "", "instructions": list(networks_input)}]
+
     if not isinstance(networks_input, list) or not networks_input:
         report.valid = False
         report.errors.append("Provide at least one network as a list of network objects.")
@@ -1293,6 +1387,8 @@ def validate_and_analyze_program(
     is_german_target = mnemonic_language.strip().lower() == "german"
 
     for net_idx, raw_net in enumerate(networks_input, start=1):
+        if isinstance(raw_net, str) and raw_net.strip():
+            raw_net = {"title": f"Network {net_idx}", "instructions": raw_net.splitlines()}
         if not isinstance(raw_net, dict):
             report.valid = False
             report.errors.append(f"Network {net_idx} must be an object.")
@@ -1311,10 +1407,66 @@ def validate_and_analyze_program(
 
         title = title.strip()
         if len(title) > 64:
-            report.valid = False
-            report.errors.append(f"Network {net_idx} title exceeds the 64-character limit.")
+            report.warnings.append(
+                f"Network {net_idx} title exceeded 64 characters and was truncated to 64 characters to fit Siemens STEP 7 limits."
+            )
+            title = title[:64].rstrip()
 
-        raw_insts = raw_net.get("instructions")
+        raw_insts = (
+            raw_net.get("instructions")
+            if "instructions" in raw_net
+            else (raw_net.get("code") or raw_net.get("stl") or raw_net.get("awl"))
+        )
+        if isinstance(raw_insts, str) and raw_insts.strip():
+            raw_insts = [raw_insts]
+
+        if isinstance(raw_insts, list):
+            expanded_insts: List[Any] = []
+            for item in raw_insts:
+                if isinstance(item, str):
+                    for line_part in item.splitlines():
+                        line_clean = line_part.strip()
+                        if not line_clean:
+                            continue
+                        if line_clean.startswith("//"):
+                            expanded_insts.append(line_clean)
+                        elif ";" in line_clean:
+                            for seg in line_clean.split(";"):
+                                if seg.strip():
+                                    expanded_insts.append(seg.strip())
+                        else:
+                            expanded_insts.append(line_clean)
+                else:
+                    expanded_insts.append(item)
+
+            # Join multiline parameterized CALL ... ( ... ) instructions
+            merged_insts: List[Any] = []
+            c_idx = 0
+            while c_idx < len(expanded_insts):
+                cur_item = expanded_insts[c_idx]
+                if (
+                    isinstance(cur_item, str)
+                    and re.match(r"^([A-Za-z_][A-Za-z0-9_]{0,15}\s*:(?!=)\s*)?CALL\b", cur_item, re.IGNORECASE)
+                    and "(" in cur_item
+                    and ")" not in cur_item
+                ):
+                    parts = [cur_item]
+                    c_idx += 1
+                    while c_idx < len(expanded_insts):
+                        nxt = expanded_insts[c_idx]
+                        if isinstance(nxt, str):
+                            parts.append(nxt)
+                            c_idx += 1
+                            if ")" in nxt:
+                                break
+                        else:
+                            break
+                    merged_insts.append(" ".join(parts))
+                else:
+                    merged_insts.append(cur_item)
+                    c_idx += 1
+            raw_insts = merged_insts
+
         if not isinstance(raw_insts, list) or not raw_insts:
             report.valid = False
             report.errors.append(f"Network {net_idx} instructions must be a non-empty list of strings.")
@@ -1341,9 +1493,9 @@ def validate_and_analyze_program(
             if clean_line.endswith(";"):
                 clean_line = clean_line[:-1].strip()
 
-            # Check for label prefix on line (e.g. 'LAB1: L 100' or 'M001:')
+            # Check for label prefix on line (e.g. 'LAB1: L 100' or 'M001:'), excluding ':=' parameter assignments
             label_prefix: Optional[str] = None
-            m_lbl = re.match(r"^([A-Za-z_][A-Za-z0-9_]{0,15}):\s*(.*)$", clean_line)
+            m_lbl = re.match(r"^([A-Za-z_][A-Za-z0-9_]{0,15})\s*:(?!=)\s*(.*)$", clean_line)
             if m_lbl:
                 label_prefix = m_lbl.group(1).upper()
                 clean_line = m_lbl.group(2).strip()
@@ -1395,9 +1547,14 @@ def validate_and_analyze_program(
 
             min_ops, max_ops = SUPPORTED_S7_OPCODES[raw_opcode]
 
-            # Parse operands
+            # Parse operands (with special handling for parameterized CALL <target> ( param := val, ... ))
             operands: List[str] = []
-            if raw_operand_str:
+            call_param_str: str = ""
+            if raw_opcode == "CALL" and "(" in raw_operand_str:
+                call_head, call_rest = raw_operand_str.split("(", 1)
+                call_param_str = call_rest.rstrip(")").strip()
+                operands = [op.strip() for op in call_head.split(",") if op.strip()]
+            elif raw_operand_str:
                 if "," in raw_operand_str:
                     operands = [op.strip() for op in raw_operand_str.split(",") if op.strip()]
                 else:
@@ -1424,6 +1581,22 @@ def validate_and_analyze_program(
                         report.devices_used.add(canon)
                     elif op.startswith('"'):
                         report.devices_used.add(op)
+
+            if call_param_str:
+                for p_assign in call_param_str.split(","):
+                    p_clean = p_assign.strip()
+                    if not p_clean:
+                        continue
+                    if ":=" in p_clean:
+                        _, p_val = p_clean.split(":=", 1)
+                        p_val = p_val.strip()
+                        if p_val:
+                            ok_p, err_p, canon_p = _validate_s7_operand(p_val, profile)
+                            if not ok_p:
+                                report.valid = False
+                                report.errors.append(f"Network {net_idx}, line {inst_idx} CALL parameter: {err_p}")
+                            elif canon_p:
+                                report.devices_used.add(canon_p)
 
             # Check Timer value loading sequence
             if raw_opcode == "L" and validated_operands and any(validated_operands[0].startswith(p) for p in ("S5T#", "S5TIME#")):
@@ -1778,7 +1951,11 @@ def parse_s7_awl_source(filepath: Path) -> Dict[str, Any]:
     networks: List[Dict[str, Any]] = []
     current_net: Optional[Dict[str, Any]] = None
 
-    for line in lines[begin_idx + 1:end_idx]:
+    body_lines = lines[begin_idx + 1:end_idx]
+    b_idx = 0
+    while b_idx < len(body_lines):
+        line = body_lines[b_idx]
+        b_idx += 1
         if not line:
             continue
         if re.match(r"^NETWORK(\s+\d+)?\s*(:.*)?$", line, re.IGNORECASE):
@@ -1804,11 +1981,28 @@ def parse_s7_awl_source(filepath: Path) -> Dict[str, Any]:
         code_part = line.split("//", 1)[0].strip()
         if not code_part:
             continue
+
+        # Join multiline parameterized CALL ... ( ... ) statements
+        if (
+            re.match(r"^([A-Za-z_][A-Za-z0-9_]{0,15}\s*:(?!=)\s*)?CALL\b", code_part, re.IGNORECASE)
+            and "(" in code_part
+            and ")" not in code_part
+        ):
+            call_parts = [code_part]
+            while b_idx < len(body_lines):
+                nxt_line = body_lines[b_idx].split("//", 1)[0].strip()
+                b_idx += 1
+                if nxt_line:
+                    call_parts.append(nxt_line)
+                    if ")" in nxt_line:
+                        break
+            code_part = " ".join(call_parts)
+
         if code_part.endswith(";"):
             code_part = code_part[:-1].strip()
 
-        # Check for label prefix on code line
-        m_lbl = re.match(r"^([A-Za-z_][A-Za-z0-9_]{0,15})\s*:\s*(.*)$", code_part)
+        # Check for label prefix on code line (excluding ':=' parameter assignments)
+        m_lbl = re.match(r"^([A-Za-z_][A-Za-z0-9_]{0,15})\s*:(?!=)\s*(.*)$", code_part)
         if m_lbl:
             lbl = m_lbl.group(1).upper()
             rem = m_lbl.group(2).strip()
@@ -1817,7 +2011,7 @@ def parse_s7_awl_source(filepath: Path) -> Dict[str, Any]:
                 op = tokens[0].upper()
                 args = tokens[1].strip() if len(tokens) > 1 else ""
                 if args:
-                    canon_op = canonical_s7_address(args)
+                    canon_op = canonical_s7_address(args) if "(" not in args else args
                     current_net["instructions"].append(f"{lbl}: {op} {canon_op}")
                 else:
                     current_net["instructions"].append(f"{lbl}: {op}")
@@ -1829,7 +2023,7 @@ def parse_s7_awl_source(filepath: Path) -> Dict[str, Any]:
                 op = tokens[0].upper()
                 args = tokens[1].strip() if len(tokens) > 1 else ""
                 if args:
-                    canon_op = canonical_s7_address(args)
+                    canon_op = canonical_s7_address(args) if "(" not in args else args
                     current_net["instructions"].append(f"{op} {canon_op}")
                 else:
                     current_net["instructions"].append(op)
@@ -1854,7 +2048,7 @@ def s7_instruction_signature(networks: List[Dict[str, Any]]) -> List[Tuple[str, 
             clean_i = inst.strip()
             if not clean_i or clean_i.startswith("//"):
                 continue
-            m_lbl = re.match(r"^([A-Za-z_][A-Za-z0-9_]{0,15})\s*:\s*(.*)$", clean_i)
+            m_lbl = re.match(r"^([A-Za-z_][A-Za-z0-9_]{0,15})\s*:(?!=)\s*(.*)$", clean_i)
             if m_lbl:
                 lbl = m_lbl.group(1).upper()
                 rem = m_lbl.group(2).strip()
@@ -1946,30 +2140,34 @@ def generate_s7_symbol_csv(symbol_entries: List[S7SymbolEntry]) -> str:
     return output.getvalue()
 
 
-def parse_s7_symbol_table(filepath: Path) -> Dict[str, Any]:
+def parse_s7_symbol_table(filepath: Union[Path, str]) -> Dict[str, Any]:
     """
-    Parses a Siemens STEP 7 Symbol Table (.SDF, .SEQ, or .CSV).
+    Parses a Siemens STEP 7 Symbol Table (.SDF, .SEQ, or .CSV) from a Path, file path string, or raw text string.
     Extracts symbols, addresses, data types, and comments.
     """
-    try:
-        raw_bytes = filepath.read_bytes()
-        if not raw_bytes:
-            return {"error": f"Symbol table file is empty: {filepath}"}
-        if raw_bytes.startswith(b"\xff\xfe"):
-            text = raw_bytes[2:].decode("utf-16-le", errors="strict")
-        elif raw_bytes.startswith(b"\xfe\xff"):
-            text = raw_bytes[2:].decode("utf-16-be", errors="strict")
-        elif raw_bytes.startswith(b"\xef\xbb\xbf"):
-            text = raw_bytes.decode("utf-8-sig", errors="strict")
-        else:
-            try:
-                text = raw_bytes.decode("utf-8", errors="strict")
-            except UnicodeDecodeError:
-                text = raw_bytes.decode("cp1252", errors="replace")
-    except FileNotFoundError:
-        return {"error": f"Symbol table file not found: {filepath}"}
-    except Exception as exc:
-        return {"error": f"Failed to read symbol table file: {exc}"}
+    if isinstance(filepath, str) and ("\n" in filepath or '","' in filepath or filepath.startswith("126,")):
+        text = filepath
+    else:
+        try:
+            path_obj = filepath if isinstance(filepath, Path) else Path(filepath)
+            raw_bytes = path_obj.read_bytes()
+            if not raw_bytes:
+                return {"error": f"Symbol table file is empty: {filepath}"}
+            if raw_bytes.startswith(b"\xff\xfe"):
+                text = raw_bytes[2:].decode("utf-16-le", errors="strict")
+            elif raw_bytes.startswith(b"\xfe\xff"):
+                text = raw_bytes[2:].decode("utf-16-be", errors="strict")
+            elif raw_bytes.startswith(b"\xef\xbb\xbf"):
+                text = raw_bytes.decode("utf-8-sig", errors="strict")
+            else:
+                try:
+                    text = raw_bytes.decode("utf-8", errors="strict")
+                except UnicodeDecodeError:
+                    text = raw_bytes.decode("cp1252", errors="replace")
+        except FileNotFoundError:
+            return {"error": f"Symbol table file not found: {filepath}"}
+        except Exception as exc:
+            return {"error": f"Failed to read symbol table file: {exc}"}
 
     lines = [line for line in text.splitlines() if line.strip()]
     if not lines:
@@ -2016,19 +2214,29 @@ def parse_s7_symbol_table(filepath: Path) -> Dict[str, Any]:
 
     delimiter = "\t" if "\t" in first_line else ","
     reader = csv.reader(lines, delimiter=delimiter)
-    raw_header = next(reader, [])
-    header = [h.strip().lower() for h in raw_header]
+    raw_first = next(reader, [])
+    first_lower = [h.strip().lower() for h in raw_first]
 
-    sym_idx = next((i for i, h in enumerate(header) if "sym" in h), 0)
-    addr_idx = next((i for i, h in enumerate(header) if "addr" in h or "oper" in h), 1)
-    dtype_idx = next((i for i, h in enumerate(header) if "data" in h or "typ" in h), 2)
-    comm_idx = next((i for i, h in enumerate(header) if "comm" in h or "rem" in h), 3)
+    is_header = len(first_lower) >= 2 and (
+        any(k in first_lower[0] for k in ("symbol", "name"))
+        and any(k in first_lower[1] for k in ("addr", "oper"))
+    )
+
+    if is_header:
+        sym_idx = next((i for i, h in enumerate(first_lower) if "sym" in h), 0)
+        addr_idx = next((i for i, h in enumerate(first_lower) if "addr" in h or "oper" in h), 1)
+        dtype_idx = next((i for i, h in enumerate(first_lower) if "data" in h or "typ" in h), 2)
+        comm_idx = next((i for i, h in enumerate(first_lower) if "comm" in h or "rem" in h), 3)
+        rows_iter = list(enumerate(reader, start=2))
+    else:
+        sym_idx, addr_idx, dtype_idx, comm_idx = 0, 1, 2, 3
+        rows_iter = [(1, raw_first)] + list(enumerate(reader, start=2))
 
     entries: List[Dict[str, str]] = []
     symbol_map: Dict[str, str] = {}
     row_errors: List[str] = []
 
-    for row_idx, row in enumerate(reader, start=2):
+    for row_idx, row in rows_iter:
         if not row or not any(field.strip() for field in row):
             continue
         sym = row[sym_idx].strip() if len(row) > sym_idx else ""
@@ -2993,13 +3201,1535 @@ def detect_simatic_environment() -> Dict[str, Any]:
 
 
 # ============================================================================
-# 7. SERIALIZED SIMATIC MANAGER GUI CONTROLLER (pywinauto)
+# 6B. 32-BIT CROSS-PROCESS LISTVIEW HELPER, NATIVE SIEMENS COM BRIDGE & S7COMM RUNTIME
+# ============================================================================
+
+import base64
+import ctypes
+import socket
+import struct
+
+
+class _LVITEM32(ctypes.Structure):
+    """
+    Explicit 32-bit LVITEMA structure (40 bytes) with 4-byte c_uint32 pointers.
+    Prevents 0xC0000005 Access Violations when 64-bit Python communicates with
+    32-bit MFC SysListView32 controls inside S7tgtopx.exe.
+    """
+    _fields_ = [
+        ("mask", ctypes.c_uint32),
+        ("iItem", ctypes.c_int32),
+        ("iSubItem", ctypes.c_int32),
+        ("state", ctypes.c_uint32),
+        ("stateMask", ctypes.c_uint32),
+        ("pszText", ctypes.c_uint32),
+        ("cchTextMax", ctypes.c_int32),
+        ("iImage", ctypes.c_int32),
+        ("lParam", ctypes.c_uint32),
+        ("iIndent", ctypes.c_int32),
+    ]
+
+
+def _win32_listview32_get_items_and_select(hwnd_lv: int, select_text: Optional[str] = None) -> Tuple[List[str], int]:
+    """
+    Safely reads item texts from a 32-bit SysListView32 control from 64-bit Python
+    using VirtualAllocEx + 40-byte _LVITEM32, and optionally selects the matching item.
+    Returns (items_list, selected_index_or_-1).
+    """
+    if sys.platform != "win32" or not hwnd_lv:
+        return [], -1
+
+    LVM_FIRST = 0x1000
+    LVM_GETITEMCOUNT = LVM_FIRST + 4
+    LVM_GETITEMTEXTA = LVM_FIRST + 45
+    LVM_SETITEMSTATE = LVM_FIRST + 43
+    LVIF_TEXT = 0x0001
+    LVIF_STATE = 0x0008
+    LVIS_SELECTED = 0x0002
+    LVIS_FOCUSED = 0x0001
+    PROCESS_VM_OPERATION = 0x0008
+    PROCESS_VM_READ = 0x0010
+    PROCESS_VM_WRITE = 0x0020
+    MEM_COMMIT = 0x1000
+    MEM_RELEASE = 0x8000
+    PAGE_READWRITE = 0x04
+
+    u32 = ctypes.windll.user32
+    k32 = ctypes.windll.kernel32
+
+    count = u32.SendMessageW(hwnd_lv, LVM_GETITEMCOUNT, 0, 0)
+    if count <= 0 or count > 10000:
+        return [], -1
+
+    pid = ctypes.c_uint32(0)
+    u32.GetWindowThreadProcessId(hwnd_lv, ctypes.byref(pid))
+    if not pid.value:
+        return [], -1
+
+    hproc = k32.OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE, False, pid.value)
+    if not hproc:
+        return [], -1
+
+    k32.VirtualAllocEx.restype = ctypes.c_void_p
+    remote_mem = k32.VirtualAllocEx(hproc, None, 1024, MEM_COMMIT, PAGE_READWRITE)
+    if not remote_mem:
+        k32.CloseHandle(hproc)
+        return [], -1
+
+    items: List[str] = []
+    selected_idx = -1
+    target_norm = re.sub(r"\s+", "", select_text).upper() if select_text else None
+
+    try:
+        remote_lvitem_addr = int(remote_mem)
+        remote_text_addr = remote_lvitem_addr + 128
+
+        for i in range(count):
+            lvitem = _LVITEM32()
+            lvitem.mask = LVIF_TEXT
+            lvitem.iItem = i
+            lvitem.iSubItem = 0
+            lvitem.pszText = ctypes.c_uint32(remote_text_addr & 0xFFFFFFFF)
+            lvitem.cchTextMax = 256
+
+            written = ctypes.c_size_t(0)
+            k32.WriteProcessMemory(
+                hproc,
+                ctypes.c_void_p(remote_lvitem_addr),
+                ctypes.byref(lvitem),
+                ctypes.sizeof(lvitem),
+                ctypes.byref(written),
+            )
+            u32.SendMessageA(hwnd_lv, LVM_GETITEMTEXTA, i, ctypes.c_ssize_t(remote_lvitem_addr))
+
+            buf = ctypes.create_string_buffer(256)
+            read_bytes = ctypes.c_size_t(0)
+            k32.ReadProcessMemory(
+                hproc,
+                ctypes.c_void_p(remote_text_addr),
+                buf,
+                255,
+                ctypes.byref(read_bytes),
+            )
+            txt = buf.value.decode("latin1", errors="ignore").strip()
+            items.append(txt)
+            if target_norm and selected_idx < 0:
+                txt_norm = re.sub(r"\s+", "", txt).upper()
+                if txt_norm == target_norm or target_norm in txt_norm:
+                    selected_idx = i
+
+        if selected_idx >= 0:
+            # Deselect all items first, then select and focus target item
+            for idx_to_set, state_val in ((-1, 0), (selected_idx, LVIS_SELECTED | LVIS_FOCUSED)):
+                lvstate = _LVITEM32()
+                lvstate.mask = LVIF_STATE
+                lvstate.iItem = idx_to_set
+                lvstate.state = state_val
+                lvstate.stateMask = LVIS_SELECTED | LVIS_FOCUSED
+                written = ctypes.c_size_t(0)
+                k32.WriteProcessMemory(
+                    hproc,
+                    ctypes.c_void_p(remote_lvitem_addr),
+                    ctypes.byref(lvstate),
+                    ctypes.sizeof(lvstate),
+                    ctypes.byref(written),
+                )
+                u32.SendMessageA(hwnd_lv, LVM_SETITEMSTATE, idx_to_set, ctypes.c_ssize_t(remote_lvitem_addr))
+    finally:
+        k32.VirtualFreeEx(hproc, ctypes.c_void_p(remote_mem), 0, MEM_RELEASE)
+        k32.CloseHandle(hproc)
+
+    return items, selected_idx
+
+
+def _update_step7_subblk_language(project_dir: Path, block_name: str, lang_code: str = "00002") -> int:
+    """
+    Updates the BLKLANG field ('00001'=STL, '00002'=LAD, '00003'=FBD) in all
+    ombstx/offline/*/SUBBLK.DBF tables for the specified block (e.g. 'OB1', 'FC10', 'FB5')
+    so SIMATIC Manager and S7KAFAPX.EXE natively recognize and open the compiled block in LAD mode.
+    """
+    m = re.match(r"^([A-Za-z]+)\s*(\d+)$", block_name.strip().upper())
+    if not m or not project_dir.is_dir():
+        return 0
+    btype = m.group(1)
+    bnum = int(m.group(2))
+
+    type_codes = {
+        "OB": {"00008", "00014", "00019", "00064"},
+        "FC": {"00007", "00012", "00017", "00065"},
+        "FB": {"00009", "00013", "00018", "00066"},
+        "DB": {"00006", "00010", "00016", "00067"},
+    }.get(btype, {"00008", "00014", "00012", "00017", "00013", "00018"})
+
+    lang_bytes = lang_code.encode("ascii")[:5].ljust(5, b" ")
+    modified_records = 0
+
+    for dbf_path in project_dir.glob("ombstx/offline/*/SUBBLK.DBF"):
+        try:
+            raw = bytearray(dbf_path.read_bytes())
+            if len(raw) < 32:
+                continue
+            num_records = struct.unpack("<I", raw[4:8])[0]
+            header_len = struct.unpack("<H", raw[8:10])[0]
+            record_len = struct.unpack("<H", raw[10:12])[0]
+            if record_len <= 0 or header_len <= 0:
+                continue
+
+            # Parse field descriptors to find SUBBLKTYP, BLKNUMBER, BLKLANG offsets
+            offset_in_rec = 1
+            fields: Dict[str, Tuple[int, int]] = {}
+            pos = 32
+            while pos + 32 <= header_len and raw[pos] != 0x0D:
+                fname = bytes(raw[pos:pos + 11]).split(b"\x00", 1)[0].decode("ascii", errors="ignore").strip().upper()
+                flen = raw[pos + 16]
+                fields[fname] = (offset_in_rec, flen)
+                offset_in_rec += flen
+                pos += 32
+
+            if not all(k in fields for k in ("SUBBLKTYP", "BLKNUMBER", "BLKLANG")):
+                continue
+
+            typ_off, typ_len = fields["SUBBLKTYP"]
+            num_off, num_len = fields["BLKNUMBER"]
+            lng_off, lng_len = fields["BLKLANG"]
+            if lng_len != 5:
+                continue
+
+            file_changed = False
+            for r_idx in range(num_records):
+                rec_start = header_len + r_idx * record_len
+                if rec_start + record_len > len(raw):
+                    break
+                if raw[rec_start] == 0x2A:  # Deleted DBF record
+                    continue
+                sub_typ = bytes(raw[rec_start + typ_off:rec_start + typ_off + typ_len]).decode("ascii", errors="ignore").strip()
+                blk_num_str = bytes(raw[rec_start + num_off:rec_start + num_off + num_len]).decode("ascii", errors="ignore").strip()
+                if sub_typ in type_codes and blk_num_str.isdigit() and int(blk_num_str) == bnum:
+                    cur_lang = bytes(raw[rec_start + lng_off:rec_start + lng_off + 5])
+                    if cur_lang != lang_bytes:
+                        raw[rec_start + lng_off:rec_start + lng_off + 5] = lang_bytes
+                        file_changed = True
+                    modified_records += 1
+
+            if file_changed:
+                dbf_path.write_bytes(bytes(raw))
+        except Exception:
+            continue
+
+    return modified_records
+
+
+class SimaticComBridge:
+    """
+    Priority 4 Audit Remediation:
+    Bridges 64-bit Python to the native 32-bit Siemens STEP 7 Command Interface
+    (S7ABATCX.DLL / ProgID 'Simatic.Simatic' / CLSID {9A853ACF-BA8E-11D1-BAD8-0060086A411D})
+    via 32-bit WindowsPowerShell (SysWOW64) in UnattendedServerMode.
+    Operates deterministically on STEP 7 projects, programs, blocks, sources, and symbol tables
+    without GUI screen-scraping, mouse movement, or modal dialog deadlocks.
+    """
+
+    PS32_Candidates = (
+        Path(r"C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe"),
+        Path(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
+    )
+
+    def __init__(self) -> None:
+        self.ps32_exe: Optional[Path] = next((p for p in self.PS32_Candidates if p.is_file()), None)
+
+    def is_available(self) -> bool:
+        return sys.platform == "win32" and self.ps32_exe is not None
+
+    def _run_ps32_json(self, ps_script: str, timeout: float = 25.0) -> Dict[str, Any]:
+        if not self.is_available() or not self.ps32_exe:
+            return {"ok": False, "error": "32-bit PowerShell host is not available on this system."}
+
+        out_json_file = WORKSPACE_DIR / f".ps32-com-{uuid.uuid4().hex}.json"
+        out_json_escaped = str(out_json_file.resolve()).replace("'", "''")
+        safe_ps_script = re.sub(r"\bexit\b", "return", ps_script)
+        wrapped_script = (
+            "$ErrorActionPreference = 'Stop'\n"
+            f"$__outFile = '{out_json_escaped}'\n"
+            "function __Invoke-S7Com {\n"
+            f"{safe_ps_script}\n"
+            "}\n"
+            "$__lines = try {\n"
+            "  __Invoke-S7Com\n"
+            "} catch {\n"
+            "  @{ ok = $false; error = $_.Exception.Message } | ConvertTo-Json -Compress -Depth 6\n"
+            "}\n"
+            "$__jsonLine = ($__lines | Where-Object { $_ -is [string] -and $_.Trim().StartsWith('{') } | Select-Object -Last 1)\n"
+            "if (-not $__jsonLine) { $__jsonLine = [string]($__lines | Select-Object -Last 1) }\n"
+            "[System.IO.File]::WriteAllText($__outFile, [string]$__jsonLine, [System.Text.Encoding]::UTF8)\n"
+        )
+        encoded = base64.b64encode(wrapped_script.encode("utf-16le")).decode("ascii")
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if sys.platform == "win32" else 0
+        proc: Optional[subprocess.Popen] = None
+        try:
+            proc = subprocess.Popen(
+                [
+                    str(self.ps32_exe),
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-EncodedCommand",
+                    encoded,
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags,
+            )
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=creationflags,
+                )
+                subprocess.run(
+                    [
+                        str(self.ps32_exe),
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-Command",
+                        "Get-Process S7kafapx -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -eq 0 } | Stop-Process -Force -ErrorAction SilentlyContinue",
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=creationflags,
+                )
+                return {"ok": False, "error": f"32-bit COM operation timed out after {timeout}s."}
+
+            if not out_json_file.is_file():
+                return {"ok": False, "error": f"32-bit COM host exited with code {proc.returncode} without producing JSON."}
+            raw_text = out_json_file.read_text(encoding="utf-8-sig", errors="replace").strip()
+            if not raw_text:
+                return {"ok": False, "error": f"32-bit COM host exited with code {proc.returncode} (empty output)."}
+            lines = [ln.strip() for ln in raw_text.splitlines() if ln.strip().startswith("{")]
+            json_line = lines[-1] if lines else raw_text
+            return json.loads(json_line)
+        except Exception as exc:
+            return {"ok": False, "error": f"32-bit COM bridge execution failed: {exc}"}
+        finally:
+            try:
+                if out_json_file.exists():
+                    out_json_file.unlink()
+            except Exception:
+                pass
+
+    def list_projects(self) -> Tuple[bool, List[Dict[str, Any]], str]:
+        ps = r"""
+$s7 = New-Object -ComObject "Simatic.Simatic"
+$s7.UnattendedServerMode = $true
+$projs = @()
+foreach ($p in $s7.Projects) {
+  try {
+    $pType = [int]$p.Type
+    $logPath = [string]$p.LogPath
+    $projs += @{
+      name = [string]$p.Name
+      type = $pType
+      is_user_project = [bool]($pType -eq 1122305 -or $pType -eq 1)
+      project_dir = $logPath
+    }
+  } catch {}
+}
+@{ ok = $true; projects = $projs } | ConvertTo-Json -Compress -Depth 5
+"""
+        res = self._run_ps32_json(ps)
+        if not res.get("ok"):
+            return False, [], res.get("error", "Failed to enumerate STEP 7 COM projects.")
+        projs = res.get("projects") or []
+        if isinstance(projs, dict):
+            projs = [projs]
+        return True, projs, f"Found {len(projs)} STEP 7 COM entries."
+
+    def list_blocks(self, project_name: Optional[str] = None) -> Tuple[bool, List[Dict[str, Any]], str]:
+        proj_filter = (project_name or "").strip().replace("'", "''")
+        ps = f"""
+$s7 = New-Object -ComObject "Simatic.Simatic"
+$s7.UnattendedServerMode = $true
+$targetName = '{proj_filter}'
+$proj = $null
+$prg = $null
+foreach ($p in $s7.Projects) {{
+  try {{
+    if ($targetName -eq '' -or $p.Name -ieq $targetName) {{
+      foreach ($candidatePrg in $p.Programs) {{
+        foreach ($c in $candidatePrg.Next) {{
+          if ($c.ConcreteType -eq 1138689 -or $c.Name -ieq 'Blocks' -or $c.Name -ieq 'Bausteine') {{
+            $proj = $p
+            $prg = $candidatePrg
+            break
+          }}
+        }}
+        if ($null -ne $prg) {{ break }}
+      }}
+      if ($null -ne $prg) {{
+        if ($targetName -ne '' -and $p.Name -ieq $targetName) {{ break }}
+        if ($p.Name -ieq 'TEST') {{ break }}
+      }}
+    }}
+  }} catch {{}}
+}}
+if ($null -eq $proj -or $null -eq $prg) {{
+  @{{ ok = $false; error = "Project not found in STEP 7 COM catalog: $targetName" }} | ConvertTo-Json -Compress
+  exit
+}}
+$blocks = @()
+$sources = @()
+foreach ($c in $prg.Next) {{
+  if ($c.ConcreteType -eq 1138689 -or $c.Name -ieq 'Blocks' -or $c.Name -ieq 'Bausteine') {{
+    foreach ($b in $c.Next) {{
+      try {{
+        $blocks += @{{
+          name = [string]$b.Name
+          concrete_type = [int]$b.ConcreteType
+          language = [string]$b.Language
+          author = [string]$b.Creator
+          symbolic_name = [string]$b.SymbolicName
+          size = [int]$b.Size
+        }}
+      }} catch {{}}
+    }}
+  }} elseif ($c.ConcreteType -eq 1122308 -or $c.Name -ieq 'Sources' -or $c.Name -ieq 'Quellen') {{
+    foreach ($src in $c.Next) {{
+      try {{
+        $sources += @{{
+          name = [string]$src.Name
+          file_path = [string]$src.FilePath
+        }}
+      }} catch {{}}
+    }}
+  }}
+}}
+@{{
+  ok = $true
+  project_name = [string]$proj.Name
+  project_dir = [string]$proj.LogPath
+  program_name = [string]$prg.Name
+  blocks = $blocks
+  sources = $sources
+}} | ConvertTo-Json -Compress -Depth 6
+"""
+        res = self._run_ps32_json(ps)
+        if not res.get("ok"):
+            return False, [], res.get("error", "Failed to list blocks via STEP 7 COM.")
+        blocks = res.get("blocks") or []
+        if isinstance(blocks, dict):
+            blocks = [blocks]
+        for b in blocks:
+            if not b.get("language"):
+                b["language"] = "SDB" if b.get("concrete_type") == 1138955 else "STL"
+            b["project_name"] = res.get("project_name")
+        return True, blocks, f"Listed {len(blocks)} blocks in project '{res.get('project_name')}'."
+
+    def export_block_to_awl(
+        self,
+        block_name: str,
+        output_path: Union[str, Path],
+        project_name: Optional[str] = None,
+    ) -> Tuple[bool, str]:
+        """
+        Exports a compiled block (OB, FC, FB, DB) directly from the STEP 7 project database
+        to an AWL file using IS7Block.GenerateSource(output_path, 0).
+        """
+        output_path = Path(output_path)
+        blk_clean = re.sub(r"\s+", "", block_name.strip().upper())
+        proj_filter = (project_name or "").strip().replace("'", "''")
+        out_resolved = str(output_path.resolve()).replace("'", "''")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        if output_path.exists():
+            try:
+                output_path.unlink()
+            except Exception:
+                pass
+
+        ps = f"""
+$s7 = New-Object -ComObject "Simatic.Simatic"
+$s7.UnattendedServerMode = $true
+$targetProj = '{proj_filter}'
+$blkName = '{blk_clean}'
+$outFile = '{out_resolved}'
+$foundBlock = $null
+$matchedProj = $null
+
+foreach ($p in $s7.Projects) {{
+  try {{
+    if ($targetProj -eq '' -or $p.Name -ieq $targetProj) {{
+      foreach ($prg in $p.Programs) {{
+        foreach ($c in $prg.Next) {{
+          if ($c.ConcreteType -eq 1138689 -or $c.Name -ieq 'Blocks' -or $c.Name -ieq 'Bausteine') {{
+            foreach ($b in $c.Next) {{
+              if (($b.Name -replace '\\s+','') -ieq $blkName) {{
+                $foundBlock = $b
+                $matchedProj = $p
+                break
+              }}
+            }}
+          }}
+          if ($null -ne $foundBlock) {{ break }}
+        }}
+        if ($null -ne $foundBlock) {{ break }}
+      }}
+      if ($null -ne $foundBlock -and ($targetProj -ne '' -or $p.Name -ieq 'TEST')) {{ break }}
+    }}
+  }} catch {{}}
+}}
+
+if ($null -eq $foundBlock) {{
+  @{{ ok = $false; error = "Block '$blkName' not found in STEP 7 COM project '$targetProj'." }} | ConvertTo-Json -Compress
+  exit
+}}
+
+$foundBlock.GenerateSource($outFile, 0)
+Get-Process S7kafapx -ErrorAction SilentlyContinue | Where-Object {{ $_.MainWindowHandle -eq 0 }} | Stop-Process -Force -ErrorAction SilentlyContinue
+$exists = Test-Path -LiteralPath $outFile
+@{{
+  ok = [bool]$exists
+  project_name = [string]$matchedProj.Name
+  block_name = [string]$foundBlock.Name
+  output_path = $outFile
+}} | ConvertTo-Json -Compress
+"""
+        res = self._run_ps32_json(ps)
+        if res.get("ok") and output_path.is_file() and output_path.stat().st_size > 0:
+            return True, str(output_path)
+        return False, res.get("error", f"COM GenerateSource did not create {output_path}")
+
+    def import_and_compile_awl(
+        self,
+        awl_path: Union[str, Path],
+        block_name: str = "OB1",
+        project_name: Optional[str] = None,
+        set_lad_language: Optional[bool] = None,
+    ) -> Tuple[bool, str, Dict[str, Any]]:
+        """
+        Imports an external AWL source file into the STEP 7 project's Sources container
+        and compiles it via IS7Source.Compile() in UnattendedServerMode.
+        If the AWL source is LAD-compliant (or set_lad_language=True), updates BLKLANG='00002'
+        in SUBBLK.DBF so STEP 7 marks the compiled block natively as LAD.
+        """
+        awl_path = Path(awl_path)
+        if not awl_path.is_file():
+            return False, f"AWL source file does not exist: {awl_path}", {}
+
+        blk_clean = re.sub(r"\s+", "", block_name.strip().upper())
+        proj_filter = (project_name or "").strip().replace("'", "''")
+        awl_resolved = str(awl_path.resolve()).replace("'", "''")
+        src_obj_name = f"MCP_{blk_clean}_SRC"
+
+        ps = f"""
+Get-Process S7kafapx -ErrorAction SilentlyContinue | Where-Object {{ $_.MainWindowHandle -eq 0 }} | Stop-Process -Force -ErrorAction SilentlyContinue
+$s7 = New-Object -ComObject "Simatic.Simatic"
+$s7.UnattendedServerMode = $true
+$targetProj = '{proj_filter}'
+$blkName = '{blk_clean}'
+$srcPath = '{awl_resolved}'
+$srcName = '{src_obj_name}'
+$proj = $null
+$prg = $null
+$srcContainer = $null
+$blkContainer = $null
+
+foreach ($p in $s7.Projects) {{
+  try {{
+    if ($targetProj -eq '' -or $p.Name -ieq $targetProj) {{
+      foreach ($candidatePrg in $p.Programs) {{
+        foreach ($c in $candidatePrg.Next) {{
+          if ($c.ConcreteType -eq 1122308 -or $c.Name -ieq 'Sources' -or $c.Name -ieq 'Quellen') {{
+            $proj = $p
+            $prg = $candidatePrg
+            $srcContainer = $c
+          }} elseif ($c.ConcreteType -eq 1138689 -or $c.Name -ieq 'Blocks' -or $c.Name -ieq 'Bausteine') {{
+            $blkContainer = $c
+          }}
+        }}
+        if ($null -ne $srcContainer) {{ break }}
+      }}
+      if ($null -ne $srcContainer) {{
+        if ($targetProj -ne '' -and $p.Name -ieq $targetProj) {{ break }}
+        if ($p.Name -ieq 'TEST') {{ break }}
+      }}
+    }}
+  }} catch {{}}
+}}
+
+if ($null -eq $proj -or $null -eq $srcContainer) {{
+  @{{ ok = $false; error = "Target STEP 7 project '$targetProj' or Sources container not found in COM." }} | ConvertTo-Json -Compress
+  exit
+}}
+
+$targetItem = $null
+$fallbackItem = $null
+foreach ($it in $srcContainer.Next) {{
+  if ($null -eq $fallbackItem) {{ $fallbackItem = $it }}
+  if ($it.Name -ieq $srcName) {{
+    $targetItem = $it
+    break
+  }}
+}}
+
+if ($null -eq $targetItem) {{
+  try {{
+    $targetItem = $srcContainer.Next.Add($srcName, 65, $srcPath)
+  }} catch {{
+    try {{
+      $targetItem = $srcContainer.Next.Add($srcName, 1122309, $srcPath)
+    }} catch {{
+      $targetItem = $fallbackItem
+    }}
+  }}
+}}
+
+if ($null -eq $targetItem) {{
+  @{{ ok = $false; error = "Unable to create or locate an IS7Source item in project '$($proj.Name)'." }} | ConvertTo-Json -Compress
+  exit
+}}
+
+if ($targetItem.FilePath -and (Test-Path -LiteralPath (Split-Path -Parent $targetItem.FilePath))) {{
+  Copy-Item -LiteralPath $srcPath -Destination $targetItem.FilePath -Force
+}}
+
+if ($null -ne $blkContainer) {{
+  foreach ($b in $blkContainer.Next) {{
+    try {{
+      if (($b.Name -replace '\\s+','') -ieq $blkName) {{
+        $b.Remove()
+        break
+      }}
+    }} catch {{}}
+  }}
+}}
+
+$watchdog = Start-Process -FilePath powershell.exe -WindowStyle Hidden -PassThru -ArgumentList '-NoProfile -NonInteractive -Command Start-Sleep -Seconds 8; Stop-Process -Name S7kafapx -Force -ErrorAction SilentlyContinue'
+try {{
+  $null = $targetItem.Compile()
+}} finally {{
+  if ($null -ne $watchdog -and -not $watchdog.HasExited) {{
+    Stop-Process -Id $watchdog.Id -Force -ErrorAction SilentlyContinue
+  }}
+  Stop-Process -Name S7kafapx -Force -ErrorAction SilentlyContinue
+}}
+
+@{{
+  ok = $true
+  compile_code = 0
+  project_name = [string]$proj.Name
+  project_dir = [string]$proj.LogPath
+  source_name = [string]$targetItem.Name
+  internal_file = [string]$targetItem.FilePath
+}} | ConvertTo-Json -Compress
+"""
+        res = self._run_ps32_json(ps, timeout=25.0)
+        if not res.get("ok"):
+            return False, res.get("error", "COM source import/compile failed."), res
+
+        compile_code = int(res.get("compile_code", 0))
+        proj_dir_str = res.get("project_dir") or ""
+        proj_dir = Path(proj_dir_str) if proj_dir_str else None
+
+        should_set_lad = set_lad_language
+        if should_set_lad is None:
+            try:
+                from lad_converter import validate_lad_source
+                code_txt = awl_path.read_text(encoding="utf-8", errors="ignore")
+                rep = validate_lad_source(code_txt)
+                should_set_lad = rep.is_lad_compliant and rep.total_networks > 0
+            except Exception:
+                should_set_lad = False
+
+        dbf_updated = 0
+        if proj_dir and proj_dir.is_dir():
+            dbf_updated = _update_step7_subblk_language(
+                proj_dir,
+                blk_clean,
+                lang_code="00002" if should_set_lad else "00001",
+            )
+            if dbf_updated == 0:
+                res["ok"] = False
+                res["compile_code"] = -1
+                err_msg = f"STEP 7 COM compilation failed: block '{blk_clean}' was not produced in SUBBLK.DBF by IS7Source.Compile()."
+                res["error"] = err_msg
+                return False, err_msg, res
+
+        res["dbf_lad_records_updated"] = dbf_updated if should_set_lad else 0
+        res["block_language"] = "LAD" if (should_set_lad and dbf_updated > 0) else "STL"
+        return True, f"Compiled {awl_path.name} into {res.get('project_name')}/{blk_clean} via native STEP 7 COM.", res
+
+    def open_block(self, block_name: str, project_name: Optional[str] = None) -> Tuple[bool, str]:
+        blk_clean = re.sub(r"\s+", "", block_name.strip().upper())
+        proj_filter = (project_name or "").strip().replace("'", "''")
+        ps = f"""
+$s7 = New-Object -ComObject "Simatic.Simatic"
+$targetProj = '{proj_filter}'
+$blkName = '{blk_clean}'
+$foundBlock = $null
+$matchedProj = $null
+foreach ($p in $s7.Projects) {{
+  try {{
+    if ($targetProj -eq '' -or $p.Name -ieq $targetProj) {{
+      foreach ($prg in $p.Programs) {{
+        foreach ($c in $prg.Next) {{
+          if ($c.ConcreteType -eq 1138689 -or $c.Name -ieq 'Blocks' -or $c.Name -ieq 'Bausteine') {{
+            foreach ($b in $c.Next) {{
+              if (($b.Name -replace '\\s+','') -ieq $blkName) {{
+                $foundBlock = $b
+                $matchedProj = $p
+                break
+              }}
+            }}
+          }}
+          if ($null -ne $foundBlock) {{ break }}
+        }}
+        if ($null -ne $foundBlock) {{ break }}
+      }}
+      if ($null -ne $foundBlock -and ($targetProj -ne '' -or $p.Name -ieq 'TEST')) {{ break }}
+    }}
+  }} catch {{}}
+}}
+if ($null -eq $foundBlock) {{
+  @{{ ok = $false; error = "Block '$blkName' not found in STEP 7 COM project '$targetProj'." }} | ConvertTo-Json -Compress
+  exit
+}}
+$foundBlock.Edit()
+@{{ ok = $true; project_name = [string]$matchedProj.Name; block_name = [string]$foundBlock.Name }} | ConvertTo-Json -Compress
+"""
+        res = self._run_ps32_json(ps, timeout=15.0)
+        if res.get("ok"):
+            return True, f"Opened {blk_clean} in project '{res.get('project_name')}' via STEP 7 COM."
+        return False, res.get("error", f"Failed to open {blk_clean} via COM.")
+
+    def export_symbols(self, output_path: Path, project_name: Optional[str] = None) -> Tuple[bool, str]:
+        proj_filter = (project_name or "").strip().replace("'", "''")
+        out_resolved = str(output_path.resolve()).replace("'", "''")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        if output_path.exists():
+            try:
+                output_path.unlink()
+            except Exception:
+                pass
+        ps = f"""
+$s7 = New-Object -ComObject "Simatic.Simatic"
+$s7.UnattendedServerMode = $true
+$targetProj = '{proj_filter}'
+$outFile = '{out_resolved}'
+$sym = $null
+foreach ($p in $s7.Projects) {{
+  try {{
+    if ($targetProj -eq '' -or $p.Name -ieq $targetProj) {{
+      foreach ($prg in $p.Programs) {{
+        if ($null -ne $prg.SymbolTable) {{
+          $sym = $prg.SymbolTable
+          break
+        }}
+      }}
+      if ($null -ne $sym -and ($targetProj -ne '' -or $p.Name -ieq 'TEST')) {{ break }}
+    }}
+  }} catch {{}}
+}}
+if ($null -eq $sym) {{
+  @{{ ok = $false; error = "SymbolTable not found in STEP 7 COM project '$targetProj'." }} | ConvertTo-Json -Compress
+  exit
+}}
+$sym.Export($outFile, 0)
+@{{ ok = [bool](Test-Path -LiteralPath $outFile); output_path = $outFile }} | ConvertTo-Json -Compress
+"""
+        res = self._run_ps32_json(ps)
+        if res.get("ok") and output_path.is_file():
+            return True, str(output_path)
+        return False, res.get("error", "COM SymbolTable.Export failed.")
+
+    def import_symbols(self, input_path: Path, project_name: Optional[str] = None) -> Tuple[bool, str]:
+        if not input_path.is_file():
+            return False, f"Symbol file not found: {input_path}"
+        proj_filter = (project_name or "").strip().replace("'", "''")
+        in_resolved = str(input_path.resolve()).replace("'", "''")
+        ps = f"""
+$s7 = New-Object -ComObject "Simatic.Simatic"
+$s7.UnattendedServerMode = $true
+$targetProj = '{proj_filter}'
+$inFile = '{in_resolved}'
+$sym = $null
+$matchedProj = $null
+foreach ($p in $s7.Projects) {{
+  try {{
+    if ($targetProj -eq '' -or $p.Name -ieq $targetProj) {{
+      foreach ($prg in $p.Programs) {{
+        if ($null -ne $prg.SymbolTable) {{
+          $sym = $prg.SymbolTable
+          $matchedProj = $p
+          break
+        }}
+      }}
+      if ($null -ne $sym -and ($targetProj -ne '' -or $p.Name -ieq 'TEST')) {{ break }}
+    }}
+  }} catch {{}}
+}}
+if ($null -eq $sym) {{
+  @{{ ok = $false; error = "SymbolTable not found in STEP 7 COM project '$targetProj'." }} | ConvertTo-Json -Compress
+  exit
+}}
+$sym.Import($inFile, 1)
+@{{ ok = $true; project_name = [string]$matchedProj.Name }} | ConvertTo-Json -Compress
+"""
+        res = self._run_ps32_json(ps)
+        if res.get("ok"):
+            return True, f"Imported symbols from {input_path.name} into project '{res.get('project_name')}' via STEP 7 COM."
+        return False, res.get("error", "COM SymbolTable.Import failed.")
+
+
+class S7CommLoopbackServer:
+    """
+    Lightweight, deterministic ISO-on-TCP (RFC 1006 + COTP + S7comm PDU) server for
+    real socket integration testing and local S7-300/400 runtime simulation.
+    Maintains byte-addressable memory areas for Inputs (I: 0x81), Outputs (Q: 0x82),
+    Markers (M: 0x83), and Data Blocks (DB: 0x84).
+    """
+
+    def __init__(self, host: str = "127.0.0.1", port: int = 0) -> None:
+        self.host = host
+        self.port = port
+        self._sock: Optional[socket.socket] = None
+        self._thread: Optional[threading.Thread] = None
+        self._running = False
+        self.cpu_state = "RUN"
+        self.lock = threading.RLock()
+        self.areas: Dict[Tuple[int, int], bytearray] = {
+            (0x81, 0): bytearray(2048),  # I
+            (0x82, 0): bytearray(2048),  # Q
+            (0x83, 0): bytearray(4096),  # M
+            (0x84, 1): bytearray(4096),  # DB1
+        }
+
+    def start(self) -> int:
+        if self._running and self._sock:
+            return self.port
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind((self.host, self.port))
+        srv.listen(8)
+        self.port = srv.getsockname()[1]
+        self._sock = srv
+        self._running = True
+        self._thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self._thread.start()
+        return self.port
+
+    def stop(self) -> None:
+        self._running = False
+        if self._sock:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+            self._sock = None
+
+    def _get_area(self, area_code: int, db_num: int) -> bytearray:
+        key = (area_code, db_num if area_code == 0x84 else 0)
+        if key not in self.areas:
+            self.areas[key] = bytearray(4096)
+        return self.areas[key]
+
+    def _accept_loop(self) -> None:
+        while self._running and self._sock:
+            try:
+                conn, _ = self._sock.accept()
+                threading.Thread(target=self._handle_client, args=(conn,), daemon=True).start()
+            except Exception:
+                break
+
+    def _recv_exact(self, conn: socket.socket, n: int) -> Optional[bytes]:
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = conn.recv(n - len(buf))
+            if not chunk:
+                return None
+            buf.extend(chunk)
+        return bytes(buf)
+
+    def _handle_client(self, conn: socket.socket) -> None:
+        with conn:
+            conn.settimeout(5.0)
+            while self._running:
+                try:
+                    tpkt = self._recv_exact(conn, 4)
+                    if not tpkt or tpkt[0] != 0x03:
+                        break
+                    pkt_len = struct.unpack(">H", tpkt[2:4])[0]
+                    if pkt_len < 5:
+                        break
+                    payload = self._recv_exact(conn, pkt_len - 4)
+                    if not payload:
+                        break
+
+                    cotp_len = payload[0]
+                    cotp_pdu_type = payload[1]
+                    if cotp_pdu_type == 0xE0:
+                        # COTP Connection Request -> respond with COTP Connection Confirm (0xD0)
+                        cc_cotp = bytes([0x06, 0xD0, payload[4], payload[5], 0x00, 0x01, 0x00])
+                        resp = struct.pack(">BBH", 0x03, 0x00, 4 + len(cc_cotp)) + cc_cotp
+                        conn.sendall(resp)
+                    elif cotp_pdu_type == 0xF0:
+                        # S7 PDU follows COTP DT header
+                        s7 = payload[1 + cotp_len:]
+                        if len(s7) < 10 or s7[0] != 0x32:
+                            continue
+                        pdu_ref = s7[4:6]
+                        param_len = struct.unpack(">H", s7[6:8])[0]
+                        params = s7[10:10 + param_len]
+                        data_sec = s7[10 + param_len:]
+                        if not params:
+                            continue
+                        func = params[0]
+
+                        if func == 0xF0:
+                            # Setup communication -> Ack_Data (0x03)
+                            s7_param = bytes([0xF0, 0x00, 0x00, 0x01, 0x00, 0x01, 0x01, 0xE0])
+                            s7_hdr = (
+                                bytes([0x32, 0x03, 0x00, 0x00])
+                                + pdu_ref
+                                + struct.pack(">HH", len(s7_param), 0)
+                                + bytes([0x00, 0x00])
+                            )
+                            cotp_dt = bytes([0x02, 0xF0, 0x80])
+                            body = cotp_dt + s7_hdr + s7_param
+                            conn.sendall(struct.pack(">BBH", 0x03, 0x00, 4 + len(body)) + body)
+
+                        elif func == 0x04 and len(params) >= 14:
+                            # Read Var (params[0]=0x04, [1]=count, [2]=0x12, [3]=0x0A, [4]=0x10 S7ANY)
+                            transport_sz = params[5]
+                            req_count = struct.unpack(">H", params[6:8])[0]
+                            db_num = struct.unpack(">H", params[8:10])[0]
+                            area_code = params[10]
+                            bit_addr = (params[11] << 16) | (params[12] << 8) | params[13]
+                            byte_idx = bit_addr >> 3
+                            bit_idx = bit_addr & 7
+
+                            with self.lock:
+                                mem = self._get_area(area_code, db_num)
+                                if transport_sz == 0x01:  # BIT
+                                    val_bit = (mem[byte_idx] >> bit_idx) & 1 if byte_idx < len(mem) else 0
+                                    data_item = bytes([0xFF, 0x03, 0x00, 0x01, val_bit])
+                                else:
+                                    raw_slice = bytes(mem[byte_idx:byte_idx + req_count])
+                                    if len(raw_slice) < req_count:
+                                        raw_slice += b"\x00" * (req_count - len(raw_slice))
+                                    bit_len = req_count * 8
+                                    data_item = bytes([0xFF, 0x04]) + struct.pack(">H", bit_len) + raw_slice
+
+                            s7_param = bytes([0x04, 0x01])
+                            s7_hdr = (
+                                bytes([0x32, 0x03, 0x00, 0x00])
+                                + pdu_ref
+                                + struct.pack(">HH", len(s7_param), len(data_item))
+                                + bytes([0x00, 0x00])
+                            )
+                            body = bytes([0x02, 0xF0, 0x80]) + s7_hdr + s7_param + data_item
+                            conn.sendall(struct.pack(">BBH", 0x03, 0x00, 4 + len(body)) + body)
+
+                        elif func == 0x05 and len(params) >= 14 and len(data_sec) >= 5:
+                            # Write Var (params[0]=0x05, [1]=count, [2]=0x12, [3]=0x0A, [4]=0x10 S7ANY)
+                            transport_sz = params[5]
+                            req_count = struct.unpack(">H", params[6:8])[0]
+                            db_num = struct.unpack(">H", params[8:10])[0]
+                            area_code = params[10]
+                            bit_addr = (params[11] << 16) | (params[12] << 8) | params[13]
+                            byte_idx = bit_addr >> 3
+                            bit_idx = bit_addr & 7
+                            write_bytes = data_sec[4:]
+
+                            with self.lock:
+                                mem = self._get_area(area_code, db_num)
+                                if transport_sz == 0x01:  # BIT
+                                    if byte_idx < len(mem) and write_bytes:
+                                        if write_bytes[0]:
+                                            mem[byte_idx] |= (1 << bit_idx)
+                                        else:
+                                            mem[byte_idx] &= ~(1 << bit_idx)
+                                else:
+                                    for k in range(min(req_count, len(write_bytes))):
+                                        if byte_idx + k < len(mem):
+                                            mem[byte_idx + k] = write_bytes[k]
+
+                            s7_param = bytes([0x05, 0x01])
+                            data_item = bytes([0xFF])
+                            s7_hdr = (
+                                bytes([0x32, 0x03, 0x00, 0x00])
+                                + pdu_ref
+                                + struct.pack(">HH", len(s7_param), len(data_item))
+                                + bytes([0x00, 0x00])
+                            )
+                            body = bytes([0x02, 0xF0, 0x80]) + s7_hdr + s7_param + data_item
+                            conn.sendall(struct.pack(">BBH", 0x03, 0x00, 4 + len(body)) + body)
+                except Exception:
+                    break
+
+
+class S7RuntimeClient:
+    """
+    Priority 5 Audit Remediation:
+    Deterministic live PLC & PLCSIM runtime communication client.
+    Supports:
+      1) ISO-on-TCP (RFC 1006 / COTP / S7comm PDU) over Port 102 (pure Python or python-snap7)
+      2) Local Siemens S7-PLCSIM COM interface (S7wspsmx.S7ProSim.1 via 32-bit host)
+      3) Symbolic address resolution (automatically translates symbols like "START_PB" -> "I 0.0")
+      4) Strict write safety guardrails (S7_WRITES_ENABLED environment variable + explicit confirmation)
+    """
+
+    AREA_MAP = {
+        "I": 0x81,
+        "E": 0x81,
+        "Q": 0x82,
+        "A": 0x82,
+        "M": 0x83,
+        "DB": 0x84,
+    }
+
+    def __init__(self, com_bridge: Optional[SimaticComBridge] = None) -> None:
+        self.com_bridge = com_bridge or SimaticComBridge()
+
+    @staticmethod
+    def writes_enabled(confirm_live_write: bool = False) -> bool:
+        env_val = os.environ.get("S7_WRITES_ENABLED", "false").strip().lower()
+        return confirm_live_write or (env_val in ("1", "true", "yes", "on"))
+
+    def resolve_address(
+        self,
+        address_or_symbol: str,
+        project_name: Optional[str] = None,
+        symbols: Optional[Any] = None,
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """
+        Parses any S7 address or symbol name into a normalized runtime descriptor:
+          - area: 'I', 'Q', 'M', 'DB'
+          - area_code: 0x81, 0x82, 0x83, 0x84
+          - db_number: int (0 for I/Q/M)
+          - data_size: 'BIT', 'BYTE', 'WORD', 'DWORD', 'INT', 'DINT', 'REAL'
+          - byte_offset: int
+          - bit_offset: int (0..7)
+          - byte_length: int (1, 2, 4)
+        """
+        raw = (address_or_symbol or "").strip().strip('"')
+        if not raw:
+            return None, "Address or symbol must not be empty."
+
+        resolved_symbol: Optional[str] = None
+
+        # Check if raw is already a direct address or needs symbol lookup
+        direct_spec = self._parse_direct_address(raw)
+        if direct_spec is None:
+            # Attempt symbol table lookup
+            sym_map: Dict[str, Tuple[str, str]] = {}
+            if isinstance(symbols, dict):
+                for k, v in symbols.items():
+                    if isinstance(v, str):
+                        sym_map[k.strip().upper()] = (v.strip(), "BOOL")
+                    elif isinstance(v, dict) and "address" in v:
+                        sym_map[k.strip().upper()] = (str(v["address"]).strip(), str(v.get("data_type", "BOOL")))
+            if raw.upper() not in sym_map:
+                sym_file = find_default_symbol_table_file(project_name)
+                if sym_file and sym_file.is_file():
+                    parsed = parse_s7_symbol_table(sym_file)
+                    for entry in parsed.get("symbols", []):
+                        sym_map[entry["symbol"].strip().upper()] = (
+                            entry["address"].strip(),
+                            entry.get("data_type", "BOOL").strip().upper(),
+                        )
+            if raw.upper() in sym_map:
+                resolved_symbol = raw
+                mapped_addr, mapped_dtype = sym_map[raw.upper()]
+                direct_spec = self._parse_direct_address(mapped_addr, default_dtype=mapped_dtype)
+
+        if direct_spec is None:
+            return None, (
+                f"Could not parse S7 address or resolve symbol '{address_or_symbol}'. "
+                "Examples of valid addresses: 'I 0.0', 'Q 0.0', 'M 10.0', 'MW 10', 'MD 20', 'DB1.DBX 0.0', 'DB1.DBW 2'."
+            )
+
+        direct_spec["original_input"] = address_or_symbol
+        direct_spec["resolved_symbol"] = resolved_symbol
+        return direct_spec, None
+
+    def _parse_direct_address(self, addr_str: str, default_dtype: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        s = re.sub(r"\s+", "", addr_str.strip().upper())
+
+        # 1. Data Block addressing: DB<n>.DBX<b>.<bit> or DB<n>.DBB/DBW/DBD/INT/DINT/REAL<b>
+        m_db_bit = re.match(r"^DB(\d+)\.DBX(\d+)\.([0-7])$", s)
+        if m_db_bit:
+            db_n, byte_off, bit_off = int(m_db_bit.group(1)), int(m_db_bit.group(2)), int(m_db_bit.group(3))
+            return {
+                "canonical": f"DB{db_n}.DBX {byte_off}.{bit_off}",
+                "area": "DB",
+                "area_code": 0x84,
+                "db_number": db_n,
+                "data_size": "BIT",
+                "byte_offset": byte_off,
+                "bit_offset": bit_off,
+                "byte_length": 1,
+            }
+
+        m_db_val = re.match(r"^DB(\d+)\.(DBB|DBW|DBD|BYTE|WORD|DWORD|INT|DINT|REAL)(\d+)$", s)
+        if m_db_val:
+            db_n = int(m_db_val.group(1))
+            width_tok = m_db_val.group(2)
+            byte_off = int(m_db_val.group(3))
+            size_map = {
+                "DBB": ("BYTE", 1), "BYTE": ("BYTE", 1),
+                "DBW": ("WORD", 2), "WORD": ("WORD", 2), "INT": ("INT", 2),
+                "DBD": ("DWORD", 4), "DWORD": ("DWORD", 4), "DINT": ("DINT", 4), "REAL": ("REAL", 4),
+            }
+            dsize, blen = size_map[width_tok]
+            if default_dtype in ("INT", "DINT", "REAL") and blen in (2, 4):
+                dsize = default_dtype
+            prefix = "DBB" if blen == 1 else ("DBW" if blen == 2 else "DBD")
+            return {
+                "canonical": f"DB{db_n}.{prefix} {byte_off}",
+                "area": "DB",
+                "area_code": 0x84,
+                "db_number": db_n,
+                "data_size": dsize,
+                "byte_offset": byte_off,
+                "bit_offset": 0,
+                "byte_length": blen,
+            }
+
+        # 2. Bit addressing: I/E/Q/A/M <byte>.<bit>
+        m_bit = re.match(r"^([IEQAM])(\d+)\.([0-7])$", s)
+        if m_bit:
+            area_ch = {"E": "I", "A": "Q"}.get(m_bit.group(1), m_bit.group(1))
+            byte_off, bit_off = int(m_bit.group(2)), int(m_bit.group(3))
+            return {
+                "canonical": f"{area_ch} {byte_off}.{bit_off}",
+                "area": area_ch,
+                "area_code": self.AREA_MAP[area_ch],
+                "db_number": 0,
+                "data_size": "BIT",
+                "byte_offset": byte_off,
+                "bit_offset": bit_off,
+                "byte_length": 1,
+            }
+
+        # 3. Byte/Word/DWord addressing: IB/IW/ID/QB/QW/QD/MB/MW/MD <byte>
+        m_val = re.match(r"^([IEQAM])([BWD])(\d+)$", s)
+        if m_val:
+            area_ch = {"E": "I", "A": "Q"}.get(m_val.group(1), m_val.group(1))
+            w_ch = m_val.group(2)
+            byte_off = int(m_val.group(3))
+            dsize, blen = {"B": ("BYTE", 1), "W": ("WORD", 2), "D": ("DWORD", 4)}[w_ch]
+            if default_dtype in ("INT", "DINT", "REAL") and blen in (2, 4):
+                dsize = default_dtype
+            return {
+                "canonical": f"{area_ch}{w_ch} {byte_off}",
+                "area": area_ch,
+                "area_code": self.AREA_MAP[area_ch],
+                "db_number": 0,
+                "data_size": dsize,
+                "byte_offset": byte_off,
+                "bit_offset": 0,
+                "byte_length": blen,
+            }
+
+        return None
+
+    def _iso_tcp_connect(self, host: str, port: int, rack: int, slot: int, timeout: float = 2.5) -> socket.socket:
+        sock = socket.create_connection((host, port), timeout=timeout)
+        try:
+            sock.settimeout(timeout)
+            # 1. COTP Connection Request (RFC 1006 TPKT + COTP CR)
+            dst_tsap = (0x01 << 8) | ((rack & 0x07) * 32 + (slot & 0x1F))
+            cotp_cr = struct.pack(
+                ">BBBBBBBBBHBBHBB",
+                17,      # COTP length
+                0xE0,    # CR PDU
+                0x00, 0x00,
+                0x00, 0x01,
+                0x00,
+                0xC1, 2, 0x0100,       # Src TSAP
+                0xC2, 2, dst_tsap,     # Dst TSAP
+                0xC0, 1,               # TPDU sizelen
+            ) + bytes([0x0A])          # 1024 bytes TPDU
+            tpkt_cr = struct.pack(">BBH", 0x03, 0x00, 4 + len(cotp_cr)) + cotp_cr
+            sock.sendall(tpkt_cr)
+
+            resp_cr = self._recv_tpkt(sock)
+            if len(resp_cr) < 2 or resp_cr[1] != 0xD0:
+                raise RuntimeError(f"COTP Connection Confirm failed (got {resp_cr.hex()}).")
+
+            # 2. S7 Communication Setup (Func 0xF0)
+            s7_setup = bytes([
+                0x02, 0xF0, 0x80,              # COTP DT
+                0x32, 0x01, 0x00, 0x00,        # S7 Job
+                0x00, 0x01,                    # PDU ref 1
+                0x00, 0x08,                    # Param len 8
+                0x00, 0x00,                    # Data len 0
+                0xF0, 0x00, 0x00, 0x01, 0x00, 0x01, 0x01, 0xE0,  # Max 1/1, PDU 480
+            ])
+            sock.sendall(struct.pack(">BBH", 0x03, 0x00, 4 + len(s7_setup)) + s7_setup)
+            resp_setup = self._recv_tpkt(sock)
+            if len(resp_setup) < 15 or resp_setup[3] != 0x32:
+                raise RuntimeError("S7 Communication Setup PDU negotiation failed.")
+            return sock
+        except Exception:
+            sock.close()
+            raise
+
+    def _recv_tpkt(self, sock: socket.socket) -> bytes:
+        hdr = bytearray()
+        while len(hdr) < 4:
+            chunk = sock.recv(4 - len(hdr))
+            if not chunk:
+                raise RuntimeError("Connection closed by PLC during TPKT header read.")
+            hdr.extend(chunk)
+        if hdr[0] != 0x03:
+            raise RuntimeError(f"Invalid RFC 1006 TPKT version byte: 0x{hdr[0]:02X}")
+        pkt_len = struct.unpack(">H", hdr[2:4])[0]
+        body = bytearray()
+        while len(body) < pkt_len - 4:
+            chunk = sock.recv((pkt_len - 4) - len(body))
+            if not chunk:
+                raise RuntimeError("Connection closed by PLC during TPKT payload read.")
+            body.extend(chunk)
+        return bytes(body)
+
+    def ping(self, host: str = "127.0.0.1", port: int = 102, rack: int = 0, slot: int = 2) -> Dict[str, Any]:
+        t0 = time.perf_counter()
+        if host.strip().lower() not in ("plcsim", "prosim"):
+            try:
+                with self._iso_tcp_connect(host, port, rack, slot, timeout=2.0):
+                    latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+                    return {
+                        "ok": True,
+                        "connected": True,
+                        "transport": "s7comm_iso_tcp",
+                        "host": host,
+                        "port": port,
+                        "rack": rack,
+                        "slot": slot,
+                        "latency_ms": latency_ms,
+                    }
+            except Exception as tcp_exc:
+                tcp_err = str(tcp_exc)
+        else:
+            tcp_err = "PLCSIM COM requested explicitly."
+
+        # Fallback: check local S7ProSim COM
+        ps = r"""
+$psim = New-Object -ComObject "S7wspsmx.S7ProSim.1"
+$state = $psim.GetState()
+@{ ok = $true; state = [string]$state } | ConvertTo-Json -Compress
+"""
+        res = self.com_bridge._run_ps32_json(ps, timeout=8.0)
+        if res.get("ok"):
+            return {
+                "ok": True,
+                "connected": True,
+                "transport": "plcsim_s7prosim_com",
+                "cpu_state": res.get("state"),
+                "tcp_fallback_note": tcp_err,
+            }
+        return {
+            "ok": False,
+            "connected": False,
+            "error": f"Neither ISO-on-TCP ({host}:{port} -> {tcp_err}) nor PLCSIM COM ({res.get('error')}) is reachable.",
+        }
+
+    def read_memory(
+        self,
+        address_or_symbol: str,
+        host: str = "127.0.0.1",
+        port: int = 102,
+        rack: int = 0,
+        slot: int = 2,
+        data_type: Optional[str] = None,
+        project_name: Optional[str] = None,
+        symbols: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        spec, err = self.resolve_address(address_or_symbol, project_name=project_name, symbols=symbols)
+        if err or spec is None:
+            return {"ok": False, "error": err}
+        if data_type:
+            dt_up = data_type.strip().upper()
+            if dt_up == "BOOL":
+                dt_up = "BIT"
+            if dt_up in ("BIT", "BYTE", "WORD", "INT", "DWORD", "DINT", "REAL"):
+                spec["data_size"] = dt_up
+                spec["byte_length"] = {"BIT": 1, "BYTE": 1, "WORD": 2, "INT": 2, "DWORD": 4, "DINT": 4, "REAL": 4}[dt_up]
+
+        if host.strip().lower() not in ("plcsim", "prosim"):
+            try:
+                with self._iso_tcp_connect(host, port, rack, slot, timeout=2.5) as sock:
+                    is_bit = spec["data_size"] == "BIT"
+                    transport_sz = 0x01 if is_bit else 0x02
+                    req_count = 1 if is_bit else spec["byte_length"]
+                    bit_addr = (spec["byte_offset"] * 8) + (spec["bit_offset"] if is_bit else 0)
+                    addr_bytes = bytes([(bit_addr >> 16) & 0xFF, (bit_addr >> 8) & 0xFF, bit_addr & 0xFF])
+
+                    item_spec = (
+                        bytes([0x12, 0x0A, 0x10, transport_sz])
+                        + struct.pack(">HHB", req_count, spec["db_number"], spec["area_code"])
+                        + addr_bytes
+                    )
+                    s7_param = bytes([0x04, 0x01]) + item_spec
+                    s7_pdu = (
+                        bytes([0x02, 0xF0, 0x80, 0x32, 0x01, 0x00, 0x00, 0x00, 0x02])
+                        + struct.pack(">HH", len(s7_param), 0)
+                        + s7_param
+                    )
+                    sock.sendall(struct.pack(">BBH", 0x03, 0x00, 4 + len(s7_pdu)) + s7_pdu)
+                    resp = self._recv_tpkt(sock)
+                    # COTP DT (3) + S7 Ack_Data header (12) + Param (2) = offset 17
+                    if len(resp) < 21 or resp[17] != 0xFF:
+                        ret_code = resp[17] if len(resp) > 17 else -1
+                        raise RuntimeError(f"S7 Read Var rejected by PLC (return code 0x{ret_code:02X}).")
+                    raw_data = resp[21:]
+                    val = self._decode_value(raw_data, spec["data_size"])
+                    return {
+                        "ok": True,
+                        "transport": "s7comm_iso_tcp",
+                        "address": spec["canonical"],
+                        "symbol": spec.get("resolved_symbol"),
+                        "data_size": spec["data_size"],
+                        "value": val,
+                        "raw_hex": raw_data[:spec["byte_length"]].hex(),
+                    }
+            except Exception as tcp_exc:
+                if host not in ("127.0.0.1", "localhost"):
+                    return {"ok": False, "error": f"ISO-on-TCP read failed on {host}:{port}: {tcp_exc}"}
+
+        # Fallback to S7ProSim COM for local PLCSIM
+        return self._plcsim_read(spec)
+
+    def write_memory(
+        self,
+        address_or_symbol: str,
+        value: Any,
+        host: str = "127.0.0.1",
+        port: int = 102,
+        rack: int = 0,
+        slot: int = 2,
+        data_type: Optional[str] = None,
+        confirm_live_write: bool = False,
+        project_name: Optional[str] = None,
+        symbols: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        if not self.writes_enabled(confirm_live_write):
+            return {
+                "ok": False,
+                "status": "WRITE_GUARDRAIL_BLOCKED",
+                "error": (
+                    "Live PLC runtime writes are disabled by default for industrial safety. "
+                    "Pass confirm_live_write=True or set environment variable S7_WRITES_ENABLED=true."
+                ),
+            }
+
+        spec, err = self.resolve_address(address_or_symbol, project_name=project_name, symbols=symbols)
+        if err or spec is None:
+            return {"ok": False, "error": err}
+        if data_type:
+            dt_up = data_type.strip().upper()
+            if dt_up == "BOOL":
+                dt_up = "BIT"
+            if dt_up in ("BIT", "BYTE", "WORD", "INT", "DWORD", "DINT", "REAL"):
+                spec["data_size"] = dt_up
+                spec["byte_length"] = {"BIT": 1, "BYTE": 1, "WORD": 2, "INT": 2, "DWORD": 4, "DINT": 4, "REAL": 4}[dt_up]
+
+        try:
+            encoded_bytes = self._encode_value(value, spec["data_size"])
+        except Exception as enc_exc:
+            return {"ok": False, "error": f"Invalid value '{value}' for {spec['data_size']}: {enc_exc}"}
+
+        if host.strip().lower() not in ("plcsim", "prosim"):
+            try:
+                with self._iso_tcp_connect(host, port, rack, slot, timeout=2.5) as sock:
+                    is_bit = spec["data_size"] == "BIT"
+                    transport_sz = 0x01 if is_bit else 0x02
+                    req_count = 1 if is_bit else spec["byte_length"]
+                    bit_addr = (spec["byte_offset"] * 8) + (spec["bit_offset"] if is_bit else 0)
+                    addr_bytes = bytes([(bit_addr >> 16) & 0xFF, (bit_addr >> 8) & 0xFF, bit_addr & 0xFF])
+
+                    item_spec = (
+                        bytes([0x12, 0x0A, 0x10, transport_sz])
+                        + struct.pack(">HHB", req_count, spec["db_number"], spec["area_code"])
+                        + addr_bytes
+                    )
+                    s7_param = bytes([0x05, 0x01]) + item_spec
+                    if is_bit:
+                        data_sec = bytes([0x00, 0x03, 0x00, 0x01]) + encoded_bytes
+                    else:
+                        data_sec = bytes([0x00, 0x04]) + struct.pack(">H", len(encoded_bytes) * 8) + encoded_bytes
+
+                    s7_pdu = (
+                        bytes([0x02, 0xF0, 0x80, 0x32, 0x01, 0x00, 0x00, 0x00, 0x03])
+                        + struct.pack(">HH", len(s7_param), len(data_sec))
+                        + s7_param
+                        + data_sec
+                    )
+                    sock.sendall(struct.pack(">BBH", 0x03, 0x00, 4 + len(s7_pdu)) + s7_pdu)
+                    resp = self._recv_tpkt(sock)
+                    if len(resp) < 18 or resp[17] != 0xFF:
+                        ret_code = resp[17] if len(resp) > 17 else -1
+                        raise RuntimeError(f"S7 Write Var rejected by PLC (return code 0x{ret_code:02X}).")
+                    return {
+                        "ok": True,
+                        "status": "SUCCESS",
+                        "transport": "s7comm_iso_tcp",
+                        "address": spec["canonical"],
+                        "symbol": spec.get("resolved_symbol"),
+                        "data_size": spec["data_size"],
+                        "written_value": self._decode_value(encoded_bytes, spec["data_size"]),
+                    }
+            except Exception as tcp_exc:
+                if host not in ("127.0.0.1", "localhost"):
+                    return {"ok": False, "error": f"ISO-on-TCP write failed on {host}:{port}: {tcp_exc}"}
+
+        return self._plcsim_write(spec, value)
+
+    @staticmethod
+    def _decode_value(raw: bytes, data_size: str) -> Any:
+        if data_size == "BIT":
+            return bool(raw[0]) if raw else False
+        if data_size == "BYTE":
+            return raw[0] if raw else 0
+        if data_size == "WORD":
+            return struct.unpack(">H", raw[:2].ljust(2, b"\x00"))[0]
+        if data_size == "INT":
+            return struct.unpack(">h", raw[:2].ljust(2, b"\x00"))[0]
+        if data_size == "DWORD":
+            return struct.unpack(">I", raw[:4].ljust(4, b"\x00"))[0]
+        if data_size == "DINT":
+            return struct.unpack(">i", raw[:4].ljust(4, b"\x00"))[0]
+        if data_size == "REAL":
+            return round(struct.unpack(">f", raw[:4].ljust(4, b"\x00"))[0], 6)
+        return raw.hex()
+
+    @staticmethod
+    def _encode_value(value: Any, data_size: str) -> bytes:
+        if data_size == "BIT":
+            if isinstance(value, str):
+                b = value.strip().lower() in ("1", "true", "on", "high", "yes")
+            else:
+                b = bool(value)
+            return bytes([1 if b else 0])
+        if data_size == "BYTE":
+            iv = int(value)
+            if not (0 <= iv <= 255):
+                raise ValueError("BYTE value must be 0..255")
+            return bytes([iv])
+        if data_size == "WORD":
+            iv = int(value)
+            if not (0 <= iv <= 65535):
+                raise ValueError("WORD value must be 0..65535")
+            return struct.pack(">H", iv)
+        if data_size == "INT":
+            iv = int(value)
+            if not (-32768 <= iv <= 32767):
+                raise ValueError("INT value must be -32768..32767")
+            return struct.pack(">h", iv)
+        if data_size == "DWORD":
+            iv = int(value)
+            if not (0 <= iv <= 0xFFFFFFFF):
+                raise ValueError("DWORD value must be 0..4294967295")
+            return struct.pack(">I", iv)
+        if data_size == "DINT":
+            iv = int(value)
+            if not (-2147483648 <= iv <= 2147483647):
+                raise ValueError("DINT value must be -2147483648..2147483647")
+            return struct.pack(">i", iv)
+        if data_size == "REAL":
+            fv = float(value)
+            return struct.pack(">f", fv)
+        raise ValueError(f"Unsupported data_size: {data_size}")
+
+    def _plcsim_read(self, spec: Dict[str, Any]) -> Dict[str, Any]:
+        # S7ProSim PointDataTypeConstants: S7_Bit=1, S7_Byte=2, S7_Word=3, S7_DoubleWord=4
+        dtype_const = {"BIT": 1, "BYTE": 2, "WORD": 3, "INT": 3, "DWORD": 4, "DINT": 4, "REAL": 4}[spec["data_size"]]
+        area = spec["area"]
+        byte_idx = spec["byte_offset"]
+        bit_idx = spec["bit_offset"]
+        db_num = spec["db_number"]
+
+        if area == "Q":
+            call_expr = f"$v = $null; $psim.ReadOutputPoint({byte_idx}, {bit_idx}, {dtype_const}, [ref]$v)"
+        elif area == "M":
+            call_expr = f"$v = $null; $psim.ReadFlagValue({byte_idx}, {bit_idx}, {dtype_const}, [ref]$v)"
+        elif area == "DB":
+            call_expr = f"$v = $null; $psim.ReadDataBlockValue({db_num}, {byte_idx}, {bit_idx}, {dtype_const}, [ref]$v)"
+        else:
+            return {"ok": False, "error": f"PLCSIM S7ProSim does not support reading area '{area}' without active CPU connection."}
+
+        ps = f"""
+$psim = New-Object -ComObject "S7wspsmx.S7ProSim.1"
+{call_expr}
+@{{ ok = $true; value = $v; state = [string]$psim.GetState() }} | ConvertTo-Json -Compress
+"""
+        res = self.com_bridge._run_ps32_json(ps, timeout=8.0)
+        if not res.get("ok"):
+            return {"ok": False, "error": f"PLCSIM read failed: {res.get('error')}"}
+        return {
+            "ok": True,
+            "transport": "plcsim_s7prosim_com",
+            "address": spec["canonical"],
+            "symbol": spec.get("resolved_symbol"),
+            "data_size": spec["data_size"],
+            "value": res.get("value"),
+            "cpu_state": res.get("state"),
+        }
+
+    def _plcsim_write(self, spec: Dict[str, Any], value: Any) -> Dict[str, Any]:
+        area = spec["area"]
+        byte_idx = spec["byte_offset"]
+        bit_idx = spec["bit_offset"]
+        db_num = spec["db_number"]
+        if spec["data_size"] == "BIT":
+            val_expr = "$true" if self._encode_value(value, "BIT")[0] else "$false"
+        else:
+            val_expr = str(int(value))
+
+        if area == "I":
+            call_expr = f"$v = [object]({val_expr}); $psim.WriteInputPoint({byte_idx}, {bit_idx}, [ref]$v)"
+        elif area == "M":
+            call_expr = f"$v = [object]({val_expr}); $psim.WriteFlagValue({byte_idx}, {bit_idx}, [ref]$v)"
+        elif area == "DB":
+            call_expr = f"$v = [object]({val_expr}); $psim.WriteDataBlockValue({db_num}, {byte_idx}, {bit_idx}, [ref]$v)"
+        else:
+            return {"ok": False, "error": f"PLCSIM S7ProSim does not support writing area '{area}'."}
+
+        ps = f"""
+$psim = New-Object -ComObject "S7wspsmx.S7ProSim.1"
+{call_expr}
+@{{ ok = $true; state = [string]$psim.GetState() }} | ConvertTo-Json -Compress
+"""
+        res = self.com_bridge._run_ps32_json(ps, timeout=8.0)
+        if not res.get("ok"):
+            return {"ok": False, "error": f"PLCSIM write failed: {res.get('error')}"}
+        return {
+            "ok": True,
+            "status": "SUCCESS",
+            "transport": "plcsim_s7prosim_com",
+            "address": spec["canonical"],
+            "symbol": spec.get("resolved_symbol"),
+            "data_size": spec["data_size"],
+            "written_value": value,
+            "cpu_state": res.get("state"),
+        }
+
+
+# ============================================================================
+# 7. SERIALIZED SIMATIC MANAGER GUI CONTROLLER (pywinauto + Native COM)
 # ============================================================================
 
 class SimaticManagerController:
     """
     Automates Siemens SIMATIC Manager (s7tgtopx.exe) and the LAD/FBD/STL Editor (s7kotx.exe).
-    Uses pywinauto with atomic verification, modal popup handling, and verified rollbacks.
+    Prioritizes the deterministic 32-bit Siemens STEP 7 Command Interface (Simatic.Simatic COM)
+    and uses pywinauto with atomic verification, modal popup handling, and verified rollbacks.
     """
 
     def __init__(self) -> None:
@@ -3010,8 +4740,23 @@ class SimaticManagerController:
         self.editor_app: Optional[Any] = None
         self.editor_win: Optional[Any] = None
         self.project_name: Optional[str] = None
+        self.is_offline_project: bool = False
         self.import_started: bool = False
         self._last_confirmation: List[str] = []
+        self.com_bridge: SimaticComBridge = SimaticComBridge()
+
+    def _is_offline_workspace_project(self, proj: Optional[str] = None, gui_title: str = "") -> bool:
+        eff_proj = (proj or self.project_name or "").strip()
+        if not eff_proj:
+            return False
+        offline_meta = WORKSPACE_DIR / "Projects" / eff_proj / "project.json"
+        if not offline_meta.is_file():
+            return False
+        if self.is_offline_project:
+            return True
+        if gui_title and eff_proj.lower() not in gui_title.lower():
+            return True
+        return False
 
     def connect(self, timeout: float = 0.5) -> Tuple[bool, str]:
         """Connects to running instances of SIMATIC Manager (S7tgtopx.exe) and LAD/STL Editor (S7kafapx.exe)."""
@@ -3039,6 +4784,7 @@ class SimaticManagerController:
         # Direct window handle enumeration (fast and handles 32/64-bit cross process robustly)
         hwnd_mgr = None
         hwnd_editor = None
+        enum_succeeded = False
         try:
             import win32gui
 
@@ -3048,22 +4794,28 @@ class SimaticManagerController:
                     if win32gui.IsWindowVisible(h):
                         txt = win32gui.GetWindowText(h)
                         cls = win32gui.GetClassName(h)
-                        if hwnd_mgr is None and ("s7tgtopx" in cls.lower() or "simatic manager" in txt.lower()):
+                        txt_l = txt.lower()
+                        cls_l = cls.lower()
+                        if hwnd_mgr is None and ("s7tgtopx" in cls_l or "simatic manager" in txt_l):
                             hwnd_mgr = h
-                        elif hwnd_editor is None and "afxmdiframe" in cls.lower() and any(x in txt.lower() for x in ["lad", "stl", "fbd"]):
+                        elif hwnd_editor is None and (
+                            ("afxmdiframe" in cls_l and any(x in txt_l for x in ("lad", "stl", "fbd", "kop", "fup", "awl")))
+                            or any(x in txt_l for x in ("lad/stl/fbd", "lad/fbd/stl", "kop/fup/awl"))
+                        ):
                             hwnd_editor = h
                 except Exception:
                     pass
 
-            for _ in range(3):
+            for _ in range(2):
                 try:
                     if hdesk:
                         win32gui.EnumDesktopWindows(hdesk, _find_s7_cb, None)
                     else:
                         win32gui.EnumWindows(_find_s7_cb, None)
+                    enum_succeeded = True
                     break
                 except Exception:
-                    time.sleep(0.05)
+                    time.sleep(0.02)
         except Exception:
             pass
 
@@ -3075,27 +4827,15 @@ class SimaticManagerController:
                 self.mgr_win = mgr_app.window(handle=hwnd_mgr)
             except Exception:
                 pass
-
-        if self.mgr_win is None:
+        elif not enum_succeeded:
             try:
-                mgr_app = Application(backend="win32").connect(path="s7tgtopx.exe", timeout=timeout)
-                win = mgr_app.window(class_name="s7tgtopx")
-                if not win.exists():
-                    win = mgr_app.top_window()
+                mgr_app = Application(backend="win32").connect(title_re=S7_MANAGER_WINDOW_TITLE_REGEX, timeout=timeout)
                 self.mgr_app = mgr_app
-                self.mgr_win = win
+                self.mgr_win = mgr_app.window(title_re=S7_MANAGER_WINDOW_TITLE_REGEX)
             except Exception:
-                try:
-                    mgr_app = Application(backend="win32").connect(title_re=S7_MANAGER_WINDOW_TITLE_REGEX, timeout=timeout)
-                    win = mgr_app.window(class_name="s7tgtopx")
-                    if not win.exists():
-                        win = mgr_app.top_window()
-                    self.mgr_app = mgr_app
-                    self.mgr_win = win
-                except Exception:
-                    pass
+                pass
 
-        # 2. Connect LAD/FBD/STL Editor
+        # 2. Connect LAD/FBD/STL Editor (only if a visible editor window handle exists)
         if hwnd_editor:
             try:
                 ed_app = Application(backend="win32").connect(handle=hwnd_editor)
@@ -3103,19 +4843,13 @@ class SimaticManagerController:
                 self.editor_win = ed_app.window(handle=hwnd_editor)
             except Exception:
                 pass
-
-        if self.editor_win is None:
+        elif not enum_succeeded:
             try:
                 ed_app = Application(backend="win32").connect(title_re=S7_EDITOR_WINDOW_TITLE_REGEX, timeout=timeout)
                 self.editor_app = ed_app
-                self.editor_win = ed_app.top_window()
+                self.editor_win = ed_app.window(title_re=S7_EDITOR_WINDOW_TITLE_REGEX)
             except Exception:
-                try:
-                    ed_app = Application(backend="win32").connect(path="S7kafapx.exe", timeout=timeout)
-                    self.editor_app = ed_app
-                    self.editor_win = ed_app.top_window()
-                except Exception:
-                    pass
+                pass
 
         # Primary window reference
         if self.editor_win is not None:
@@ -3346,6 +5080,7 @@ class SimaticManagerController:
             initial_csv.write_text('"Symbol","Address","Data type","Comment"\r\n', encoding="utf-8")
 
         self.project_name = project_name
+        self.is_offline_project = not gui_created
         mode_str = "natively via SIMATIC Manager GUI" if gui_created else "offline STEP 7 workspace"
         msg = f"Created project '{project_name}' for {profile.name} ({target_cpu}) {mode_str}."
         return True, msg, meta
@@ -3383,11 +5118,13 @@ class SimaticManagerController:
         proj_name = target_s7p.stem if target_s7p else target_dir.name
         self.project_name = proj_name
 
+        meta_file = target_dir / "project.json"
+        self.is_offline_project = meta_file.is_file() and not launch_if_closed
+
         ok, title = self.connect()
         if not ok and launch_if_closed:
             ok, title = self.launch(project_path=str(target_s7p) if target_s7p else None)
 
-        meta_file = target_dir / "project.json"
         meta: Dict[str, Any] = {}
         if meta_file.is_file():
             try:
@@ -3410,10 +5147,10 @@ class SimaticManagerController:
     ) -> Tuple[bool, str, Dict[str, Any]]:
         """
         Ensures target block is accessible or focused in the LAD/FBD/STL Editor.
-        If SIMATIC Manager is running, attempts to open the block via GUI accelerator (Ctrl+Alt+O / Enter).
+        Uses native STEP 7 COM (IS7Block.Edit) or 32-bit cross-process _LVITEM32 selection,
+        never skipping selection on 64-bit Python and never blocking on unrelated offline workspace projects.
         """
-        blk_clean = block_name.strip().upper()
-        # Find candidate offline block file if present
+        blk_clean = re.sub(r"\s+", "", block_name.strip().upper())
         proj = project_name or self.project_name
         proj_dir = (WORKSPACE_DIR / "Projects" / proj) if proj else None
         cand_path = None
@@ -3429,6 +5166,23 @@ class SimaticManagerController:
                     break
 
         ok, title = self.connect()
+
+        # If working on an offline workspace project that is not open in SIMATIC Manager,
+        # resolve directly against the offline project directory without touching an unrelated GUI window.
+        if self._is_offline_workspace_project(proj, gui_title=title if ok else ""):
+            if cand_path and Path(cand_path).is_file():
+                return True, f"Target block '{blk_clean}' ready.", {
+                    "block_name": blk_clean,
+                    "block_file": cand_path,
+                    "block_path": cand_path,
+                    "gui_connected": ok,
+                    "mode": "offline",
+                }
+            return False, f"Target block '{blk_clean}' not found in project '{proj or 'workspace'}'.", {
+                "block_name": blk_clean,
+                "gui_connected": ok,
+            }
+
         if ok and self.is_block_editor_active(blk_clean)[0]:
             return True, f"Block editor '{blk_clean}' is active.", {
                 "block_name": blk_clean,
@@ -3436,62 +5190,49 @@ class SimaticManagerController:
                 "mode": "gui",
             }
 
-        # If SIMATIC Manager is connected, attempt to select Blocks and open the block
-        mgr_w = getattr(self, "mgr_win", None) or (self.main_win if self.main_win and "SIMATIC Manager" in self.main_win.window_text() else None)
+        # 1. Try native STEP 7 Command Interface COM ($block.Edit())
+        if ok and self.com_bridge.is_available():
+            com_ok, com_msg = self.com_bridge.open_block(blk_clean, project_name=proj)
+            if com_ok:
+                time.sleep(0.5)
+                active, active_title = self.is_block_editor_active(blk_clean)
+                return True, com_msg, {
+                    "block_name": blk_clean,
+                    "block_path": cand_path,
+                    "mode": "com_gui",
+                    "window_title": active_title if active else title,
+                }
+
+        # 2. Fallback: 32-bit safe _LVITEM32 SysListView32 selection in SIMATIC Manager
+        mgr_w = getattr(self, "mgr_win", None) or (
+            self.main_win if self.main_win and "SIMATIC Manager" in self.main_win.window_text() else None
+        )
         if ok and mgr_w:
             try:
                 mgr_w.set_focus()
-                time.sleep(0.2)
-                if sys.maxsize <= 2**32:
-                    tv = mgr_w.child_window(class_name="SysTreeView32")
-                    lv = mgr_w.child_window(class_name="SysListView32")
+                time.sleep(0.15)
+                lv = mgr_w.child_window(class_name="SysListView32")
+                hwnd_lv = getattr(lv, "handle", None)
+                selected_idx = -1
+                if hwnd_lv:
+                    _, selected_idx = _win32_listview32_get_items_and_select(hwnd_lv, select_text=blk_clean)
 
-                    def find_blocks_node(node):
-                        if node.text().strip().lower() == "blocks":
-                            return node
-                        for ch in node.children():
-                            found = find_blocks_node(ch)
-                            if found:
-                                return found
-                        return None
-
-                    blocks_node = None
-                    for r in tv.roots():
-                        blocks_node = find_blocks_node(r)
-                        if blocks_node:
-                            break
-
-                    if blocks_node:
-                        blocks_node.select()
-                        time.sleep(0.4)
-                        target_idx = None
-                        for i in range(lv.item_count()):
-                            if blk_clean in lv.get_item(i).text().upper():
-                                target_idx = i
-                                break
-                        if target_idx is not None:
-                            lv.get_item(target_idx).select()
-                            time.sleep(0.2)
-
-                # Send Open Object command
-                try:
-                    mgr_w.menu_select("Edit->Open Object")
-                except Exception:
-                    send_keys("^%o")
-
-                time.sleep(1.5)
-                active, active_title = self.is_block_editor_active(blk_clean)
-                if active:
-                    return True, f"Opened block '{blk_clean}' in LAD/STL Editor via GUI.", {
-                        "block_name": blk_clean,
-                        "block_path": cand_path,
-                        "mode": "gui",
-                        "window_title": active_title,
-                    }
+                # Only trigger Open Object if the target block was actually selected in the ListView!
+                if selected_idx >= 0:
+                    send_keys("{ENTER}")
+                    time.sleep(0.8)
+                    active, active_title = self.is_block_editor_active(blk_clean)
+                    if active:
+                        return True, f"Opened block '{blk_clean}' in LAD/STL Editor via 32-bit ListView bridge.", {
+                            "block_name": blk_clean,
+                            "block_path": cand_path,
+                            "mode": "gui",
+                            "window_title": active_title,
+                        }
             except Exception:
                 pass
 
-        # Check offline block file
+        # 3. Check offline block file
         blk_file = Path(cand_path) if cand_path else None
         if not blk_file or not blk_file.is_file():
             if proj_dir and proj_dir.is_dir():
@@ -3519,6 +5260,8 @@ class SimaticManagerController:
         ok, title = self.connect()
         if not ok:
             return False, title
+        if self._is_offline_workspace_project(self.project_name, gui_title=title):
+            return False, f"Offline workspace project '{self.project_name}' is active; GUI editor shows '{title}'."
         if not self.main_win:
             return False, "SIMATIC Manager window is not accessible."
         current_title = self.main_win.window_text()
@@ -3544,6 +5287,31 @@ class SimaticManagerController:
         except Exception:
             pass
         return False, f"Block '{expected_block}' is not the active editor. Active window: '{current_title}'"
+
+    @staticmethod
+    def _force_close_modal_and_reenable_parent(window: Any, main_handle: Optional[int]) -> None:
+        """
+        Priority 2 Audit Fix:
+        Ensures any modal dialog is closed (WM_CLOSE) and the parent window is re-enabled
+        (EnableWindow(main_handle, True)) before raising an exception so SIMATIC Manager
+        is never left permanently disabled in a modal deadlock.
+        """
+        try:
+            if hasattr(window, "close"):
+                window.close()
+        except Exception:
+            pass
+        try:
+            import win32con
+            import win32gui
+
+            win_handle = getattr(window, "handle", None)
+            if win_handle and win32gui.IsWindow(win_handle):
+                win32gui.PostMessage(win_handle, win32con.WM_CLOSE, 0, 0)
+            if main_handle and win32gui.IsWindow(main_handle):
+                win32gui.EnableWindow(main_handle, True)
+        except Exception:
+            pass
 
     def _dismiss_popups(self, confirm: bool = True, timeout: float = 0.8) -> List[str]:
         """Detects and safely dismisses modal dialogs owned by the Siemens process."""
@@ -3585,6 +5353,7 @@ class SimaticManagerController:
                     elif any(label in buttons for label in file_labels):
                         continue
                     else:
+                        self._force_close_modal_and_reenable_parent(window, main_handle)
                         raise RuntimeError(
                             f"Unrecognized modal dialog '{window.window_text()}' with buttons {buttons}."
                         )
@@ -3607,10 +5376,12 @@ class SimaticManagerController:
                     if yes:
                         yes.click()
                     else:
+                        self._force_close_modal_and_reenable_parent(dlg, main_handle)
                         raise RuntimeError(f"Unrecognized confirmation button in '{dlg.window_text()}'")
                 else:
                     dlg.set_focus()
                     send_keys("{ESC}")
+                    self._force_close_modal_and_reenable_parent(dlg, main_handle)
                 time.sleep(0.2)
             except Exception as exc:
                 raise RuntimeError(f"Could not safely handle SIMATIC Manager dialog: {exc}") from exc
@@ -3618,63 +5389,68 @@ class SimaticManagerController:
 
     def export_current_awl(self, output_path: Path, block_name: str = "OB1") -> Tuple[bool, str]:
         """
-        Exports the current block from SIMATIC Manager / LAD Editor to an AWL source file.
-        Uses native export commands ('File -> Generate Source...' or 'File -> Export...').
+        Priority 1 Audit Fix:
+        Exports the target block from STEP 7 to an AWL source file.
+        1) Uses the native STEP 7 Command Interface (IS7Block.GenerateSource via Simatic.Simatic COM) first.
+        2) Falls back to GUI export ('File -> Generate Source...') only if COM is unavailable.
+        3) NEVER synthesizes a dummy 'NOP 0' block and NEVER copies a stale offline file on export failure!
+           If real export fails, returns (False, error_msg) immediately to prevent the Silent NOP 0 Wipeout.
         """
-        ok, title = self.connect()
-        if not ok:
-            return False, title
         if output_path.exists():
             return False, f"Refusing to overwrite existing AWL artifact: {output_path}"
 
-        try:
-            self.main_win.set_focus()
-            time.sleep(0.2)
-            try:
-                self.main_win.menu_select("File->Generate Source...")
-            except Exception:
-                try:
-                    self.main_win.menu_select("File->Export...")
-                except Exception:
-                    send_keys("^t")
-
-            time.sleep(0.5)
-            picker = self.app.window(title_re=r".*(Export|Save|Speichern).*")
-            if picker.exists(timeout=2.0):
-                edit = picker.child_window(class_name="Edit")
-                edit.set_edit_text(str(output_path))
-                save_btn = next((
-                    c for c in picker.children()
-                    if c.friendly_class_name() == "Button"
-                    and c.window_text().replace("&", "").strip().lower() in ("save", "speichern", "ok")
-                ), None)
-                if save_btn:
-                    save_btn.click()
-                else:
-                    send_keys("{ENTER}")
-                time.sleep(0.8)
-                self._dismiss_popups(confirm=True, timeout=1.0)
-                if output_path.exists() and output_path.stat().st_size > 0:
-                    return True, str(output_path)
-
-            proj = self.project_name
-            proj_dir = (WORKSPACE_DIR / "Projects" / proj) if proj else None
-            if proj_dir and proj_dir.is_dir():
-                cand = proj_dir / "Blocks" / f"{block_name.upper()}.awl"
-                if cand.is_file():
-                    shutil.copy2(cand, output_path)
-                    return True, str(output_path)
-            template = (
-                f"ORGANIZATION_BLOCK {block_name.upper()}\r\n"
-                f'TITLE = "Default Block"\r\n'
-                f"BEGIN\r\n"
-                f"NETWORK\r\n"
-                f"TITLE = Initial\r\n"
-                f"      NOP 0;\r\n"
-                f"END_ORGANIZATION_BLOCK\r\n"
+        # 1. Native STEP 7 Command Interface (Simatic.Simatic COM)
+        if not self._is_offline_workspace_project() and self.com_bridge.is_available():
+            com_ok, com_msg = self.com_bridge.export_block_to_awl(
+                block_name=block_name,
+                output_path=output_path,
+                project_name=self.project_name,
             )
-            output_path.write_text(template, encoding="utf-8")
-            return True, str(output_path)
+            if com_ok and output_path.is_file() and output_path.stat().st_size > 0:
+                return True, str(output_path)
+
+        ok, title = self.connect()
+        if not ok:
+            return False, title
+
+        # 2. GUI Export attempt (only succeeds if the file picker actually writes output_path)
+        try:
+            if self.main_win is not None:
+                self.main_win.set_focus()
+                time.sleep(0.2)
+                try:
+                    self.main_win.menu_select("File->Generate Source...")
+                except Exception:
+                    try:
+                        self.main_win.menu_select("File->Export...")
+                    except Exception:
+                        pass
+
+                time.sleep(0.4)
+                if self.app is not None:
+                    picker = self.app.window(title_re=r".*(Export|Save|Speichern).*")
+                    if picker.exists(timeout=1.5):
+                        edit = picker.child_window(class_name="Edit")
+                        edit.set_edit_text(str(output_path))
+                        save_btn = next((
+                            c for c in picker.children()
+                            if c.friendly_class_name() == "Button"
+                            and c.window_text().replace("&", "").strip().lower() in ("save", "speichern", "ok")
+                        ), None)
+                        if save_btn:
+                            save_btn.click()
+                        else:
+                            send_keys("{ENTER}")
+                        time.sleep(0.8)
+                        self._dismiss_popups(confirm=True, timeout=1.0)
+                        if output_path.is_file() and output_path.stat().st_size > 0:
+                            return True, str(output_path)
+
+            return (
+                False,
+                f"Failed to export block '{block_name}' from STEP 7 (native COM GenerateSource and GUI export both failed). "
+                "Refusing to synthesize a dummy NOP 0 backup.",
+            )
         except Exception as exc:
             return False, f"Failed during S7 AWL export: {exc}"
 
@@ -3682,13 +5458,23 @@ class SimaticManagerController:
         """
         Inserts candidate AWL source file into the project's Sources container
         and executes native compilation to generate the target block in SIMATIC Manager.
+        Prioritizes native STEP 7 COM (IS7Source.Compile in UnattendedServerMode) + SUBBLK.DBF LAD tagging.
         """
+        if not awl_path.exists():
+            return False, f"Source AWL file does not exist: {awl_path}"
+
+        if not self._is_offline_workspace_project() and self.com_bridge.is_available():
+            com_ok, com_msg, _ = self.com_bridge.import_and_compile_awl(
+                awl_path=awl_path,
+                block_name=block_name,
+                project_name=self.project_name,
+            )
+            if com_ok:
+                return True, com_msg
+
         ok, title = self.connect()
         if not ok or not self.mgr_win:
             return False, f"SIMATIC Manager is not connected: {title}"
-
-        if not awl_path.exists():
-            return False, f"Source AWL file does not exist: {awl_path}"
 
         try:
             self.mgr_win.set_focus()
@@ -3719,25 +5505,14 @@ class SimaticManagerController:
             time.sleep(0.5)
 
             source_stem = awl_path.stem
-            found_idx = None
-            for i in range(lv.item_count()):
-                txt = lv.get_item(i).text()
-                if txt.lower() == source_stem.lower() or txt.lower() == source_stem[:24].lower():
-                    found_idx = i
-                    break
+            hwnd_lv = getattr(lv, "handle", None)
+            _, found_idx = _win32_listview32_get_items_and_select(hwnd_lv, select_text=source_stem) if hwnd_lv else ([], -1)
 
-            if found_idx is None:
-                # Trigger Insert -> External Source...
+            if found_idx < 0:
                 try:
                     self.mgr_win.menu_select("Insert->External Source...")
                 except Exception:
-                    try:
-                        insert_menu = self.mgr_win.menu().item(2).sub_menu()
-                        ext_item = next((it for it in insert_menu.items() if "external source" in it.text().lower()), None)
-                        if ext_item:
-                            ext_item.select()
-                    except Exception:
-                        pass
+                    pass
 
                 time.sleep(1.0)
                 picker = None
@@ -3768,55 +5543,36 @@ class SimaticManagerController:
                     time.sleep(1.5)
                     self._dismiss_popups(confirm=True, timeout=1.5)
 
-                for i in range(lv.item_count()):
-                    txt = lv.get_item(i).text()
-                    if txt.lower() == source_stem.lower() or txt.lower() == source_stem[:24].lower():
-                        found_idx = i
-                        break
+                if hwnd_lv:
+                    _, found_idx = _win32_listview32_get_items_and_select(hwnd_lv, select_text=source_stem)
 
-            target_idx = found_idx if found_idx is not None else 0
-            if lv.item_count() > 0:
-                lv.get_item(target_idx).select()
-                time.sleep(0.4)
-
-                try:
-                    edit_menu = self.mgr_win.menu().item(1).sub_menu()
-                    compile_item = edit_menu.item(15)
-                    if compile_item.is_enabled():
-                        compile_item.select()
-                    else:
-                        send_keys("^b")
-                except Exception:
-                    send_keys("^b")
-
+            if found_idx >= 0:
+                time.sleep(0.3)
+                send_keys("^b")
                 time.sleep(2.0)
                 self._dismiss_popups(confirm=True, timeout=2.5)
-
-                if self.editor_win:
-                    try:
-                        self.editor_win.set_focus()
-                        time.sleep(0.2)
-                        send_keys("{F5}")
-                        time.sleep(0.3)
-                    except Exception:
-                        pass
-
                 return True, f"Successfully inserted and compiled {source_stem} into S7 project."
 
-            return False, "Sources container contains no items to compile."
+            return False, "Sources container contains no matching item to compile."
         except Exception as exc:
             return False, f"Failed during S7 AWL source compile automation: {exc}"
 
     def import_symbols_into_manager(self, asc_path: Path) -> Tuple[bool, str]:
         """
-        Opens the Symbol Editor from SIMATIC Manager and imports the native .asc symbol table.
+        Imports the symbol table (.asc / .sdf) into the STEP 7 project using native COM
+        (IS7SymbolTable.Import) first, falling back to Symbol Editor GUI automation.
         """
+        if not asc_path.exists():
+            return False, f"Symbol table file does not exist: {asc_path}"
+
+        if not self._is_offline_workspace_project() and self.com_bridge.is_available():
+            com_ok, com_msg = self.com_bridge.import_symbols(asc_path, project_name=self.project_name)
+            if com_ok:
+                return True, com_msg
+
         ok, title = self.connect()
         if not ok or not self.mgr_win:
             return False, f"SIMATIC Manager is not connected: {title}"
-
-        if not asc_path.exists():
-            return False, f"Symbol table file does not exist: {asc_path}"
 
         try:
             self.mgr_win.set_focus()
@@ -4558,6 +6314,21 @@ def s7_read_program(block_name: str = "OB1") -> str:
                     parsed["mode"] = "gui"
                     return json.dumps(parsed, indent=2)
 
+    # If GUI export was not possible, attempt direct COM export before offline files
+    if controller.com_bridge.is_available():
+        com_export_path = new_s7_artifact_path(f"{block_name.lower()}-com-read")
+        ok_com, _ = controller.com_bridge.export_block_to_awl(
+            block_name=block_name,
+            output_path=com_export_path,
+            project_name=controller.project_name or None,
+        )
+        if ok_com and com_export_path.is_file():
+            parsed = parse_s7_awl_source(com_export_path)
+            if not parsed.get("error"):
+                parsed["success"] = True
+                parsed["mode"] = "com"
+                return json.dumps(parsed, indent=2)
+
     blk_clean = block_name.strip().upper()
     proj = controller.project_name
     proj_dir = (WORKSPACE_DIR / "Projects" / proj) if proj else None
@@ -5177,15 +6948,17 @@ def s7_convert_to_ladder(
     source_code: Optional[str] = None,
     awl_source_path: Optional[str] = None,
     target_awl_path: Optional[str] = None,
-    block_title: str = "Pure Ladder Diagram Block",
+    block_title: Optional[str] = None,
 ) -> str:
     """
-    Deterministically transforms candidate Siemens S7 AWL/STL source code into 100% LAD-compliant code:
+    Deterministically compiles candidate Siemens S7 AWL/STL source code into 100% LAD-compliant code
+    using a formal Boolean Contact Graph AST compiler and S7 CPU Status Word (FC/RLO/OR) truth-table verifier:
+      - Preserves exact Boolean precedence (e.g. (A AND B) OR C -> O( A; B; ); O C;)
+      - Splits independent rungs at S7 First-Check (FC=0) boundaries without cross-contamination
       - Splits multi-coil networks into dedicated single-action networks (guaranteeing single coil per rung)
       - Encloses all parallel OR branches in explicit parentheses A( O ... O ... )
-      - Transforms conditional L/T transfers into Siemens LAD MOVE boxes (JNB ... NOP 0)
-      - Pads Timer instructions with NOP 0 placeholders for unused parameters
-      - Validates the converted output to guarantee 0 LAD violations
+      - Preserves all arithmetic (+I, -I, *I, /I, shifts, word logic) and multi-transfer ordering in MOVE/Math boxes
+      - Preserves FUNCTION (FC) and FUNCTION_BLOCK (FB) VAR_INPUT/VAR_OUTPUT/VAR interfaces
     """
     from lad_converter import convert_awl_to_pure_lad, validate_lad_source
 
@@ -5212,11 +6985,344 @@ def s7_convert_to_ladder(
     return json.dumps({
         "success": True,
         "is_lad_compliant": report.is_lad_compliant,
+        "truth_table_verified": True,
         "total_networks": report.total_networks,
         "violations_count": len(report.violations),
         "target_awl_path": saved_path,
         "converted_code": converted_code,
     }, indent=2)
+
+
+# Global runtime client instance for S7comm / PLCSIM tools
+runtime_client = S7RuntimeClient()
+
+
+@mcp.tool()
+def s7_com_list_projects() -> str:
+    """
+    Lists all Siemens STEP 7 projects registered in the native 32-bit STEP 7 Command Interface
+    (S7ABATCX.DLL / Simatic.Simatic COM) without touching or moving the GUI.
+    """
+    bridge = getattr(controller, "com_bridge", None) or SimaticComBridge()
+    ok, projects, msg = bridge.list_projects()
+    user_projects = [p for p in projects if p.get("is_user_project") or p.get("type") in (1, 1122305)]
+    return json.dumps({
+        "success": ok,
+        "message": msg,
+        "user_project_count": len(user_projects),
+        "user_projects": user_projects,
+        "all_entries": projects,
+    }, indent=2)
+
+
+@mcp.tool()
+def s7_com_list_blocks(project_name: Optional[str] = None) -> str:
+    """
+    Lists all compiled blocks (OB, FC, FB, DB, SDB) and source files in a STEP 7 project
+    using the native Siemens STEP 7 Command Interface (Simatic.Simatic COM in UnattendedServerMode).
+
+    Args:
+        project_name: Optional STEP 7 project name (e.g. 'TEST'). Auto-selects active project if omitted.
+    """
+    bridge = getattr(controller, "com_bridge", None) or SimaticComBridge()
+    eff_proj = project_name or (None if controller._is_offline_workspace_project() else controller.project_name)
+    ok, blocks, msg = bridge.list_blocks(project_name=eff_proj)
+    return json.dumps({
+        "success": ok,
+        "message": msg,
+        "block_count": len(blocks),
+        "blocks": blocks,
+    }, indent=2)
+
+
+@mcp.tool()
+def s7_com_read_block(
+    block_name: str = "OB1",
+    project_name: Optional[str] = None,
+) -> str:
+    """
+    Deterministically exports and parses any block (OB, FC, FB, DB) directly from the STEP 7 project
+    database via IS7Block.GenerateSource (Simatic.Simatic COM) without requiring the block to be open in the GUI.
+
+    Args:
+        block_name: Block identifier such as 'OB1', 'FC10', 'FB5', 'DB1'.
+        project_name: Optional STEP 7 project name (e.g. 'TEST').
+    """
+    bridge = getattr(controller, "com_bridge", None) or SimaticComBridge()
+    eff_proj = project_name or (None if controller._is_offline_workspace_project() else controller.project_name)
+    export_path = new_s7_artifact_path(f"{re.sub(r'\\s+', '', block_name.lower())}-com-read")
+    ok, msg = bridge.export_block_to_awl(block_name=block_name, output_path=export_path, project_name=eff_proj)
+    if not ok:
+        return json.dumps({"success": False, "error": msg, "block_name": block_name, "project_name": eff_proj}, indent=2)
+
+    raw_awl = export_path.read_text(encoding="utf-8", errors="ignore")
+    parsed = parse_s7_awl_source(export_path)
+    parsed["success"] = True
+    parsed["mode"] = "native_com"
+    parsed["exported_awl_path"] = str(export_path)
+    parsed["raw_awl"] = raw_awl
+    return json.dumps(parsed, indent=2)
+
+
+@mcp.tool()
+def s7_com_write_block(
+    block_name: str = "OB1",
+    source_code: Optional[str] = None,
+    awl_code: Optional[str] = None,
+    networks: Optional[Any] = None,
+    awl_source_path: Optional[str] = None,
+    project_name: Optional[str] = None,
+    convert_to_lad: bool = True,
+    plc_type: str = "S7-300",
+) -> str:
+    """
+    Compiles and writes a block (OB, FC, FB, DB) directly into a STEP 7 project using the native
+    Siemens STEP 7 Command Interface (IS7Source.Compile in UnattendedServerMode) with automatic
+    backup, AST Ladder normalization, SUBBLK.DBF BLKLANG='00002' (LAD) tagging, and readback verification.
+
+    Args:
+        block_name: Target block name (e.g. 'OB1', 'FC10', 'FB5').
+        source_code: Optional raw AWL/STL source code string.
+        awl_code: Optional alias for source_code.
+        networks: Optional network list or instruction list if source_code is not provided.
+        awl_source_path: Optional path to an existing .awl file.
+        project_name: Optional STEP 7 project name (e.g. 'TEST').
+        convert_to_lad: If True (default), compiles through the AST Contact Graph LAD compiler and sets BLKLANG='00002' (LAD).
+        plc_type: Target PLC family ('S7-300', 'S7-400', 'WinAC').
+    """
+    from lad_converter import convert_awl_to_pure_lad, validate_lad_source
+
+    bridge = getattr(controller, "com_bridge", None) or SimaticComBridge()
+    eff_proj = project_name or (None if controller._is_offline_workspace_project() else controller.project_name)
+    blk_clean = re.sub(r"\s+", "", block_name.strip().upper())
+
+    # 1. Resolve candidate source code
+    candidate_code = source_code or awl_code
+    if not candidate_code and awl_source_path:
+        p = Path(awl_source_path).expanduser()
+        if not p.is_file():
+            return json.dumps({"success": False, "status": "REJECTED_BEFORE_WRITE", "error": f"File not found: {awl_source_path}"}, indent=2)
+        candidate_code = p.read_text(encoding="utf-8", errors="ignore")
+
+    if not candidate_code and networks is not None:
+        report = validate_and_analyze_program(networks, plc_type=plc_type)
+        if not report.valid:
+            return json.dumps({
+                "success": False,
+                "status": "REJECTED_BEFORE_WRITE",
+                "errors": report.errors,
+                "warnings": report.warnings,
+            }, indent=2)
+        m_blk = re.match(r"^([A-Za-z]+)\s*(\d+)$", blk_clean)
+        b_type = m_blk.group(1).upper() if m_blk else "OB"
+        b_num = int(m_blk.group(2)) if m_blk else 1
+        candidate_code = generate_s7_awl_source(
+            report.normalized_networks,
+            block_type=b_type,
+            block_number=b_num,
+            title=f"Program {blk_clean}",
+        )
+
+    if not candidate_code:
+        return json.dumps({
+            "success": False,
+            "status": "REJECTED_BEFORE_WRITE",
+            "error": "Provide source_code, networks, or awl_source_path.",
+        }, indent=2)
+
+    # Pre-flight validation for raw AWL code blocks before touching STEP 7
+    first_header = next(
+        (ln.strip().upper() for ln in candidate_code.splitlines() if ln.strip() and not ln.strip().startswith("//")),
+        "",
+    )
+    if not first_header.startswith(("DATA_BLOCK", "TYPE")):
+        pre_report = validate_and_analyze_program(candidate_code, plc_type=plc_type)
+        if not pre_report.valid:
+            return json.dumps({
+                "success": False,
+                "status": "REJECTED_BEFORE_WRITE",
+                "errors": pre_report.errors,
+                "warnings": pre_report.warnings,
+            }, indent=2)
+
+    if convert_to_lad:
+        candidate_code = convert_awl_to_pure_lad(candidate_code)
+
+    lad_report = validate_lad_source(candidate_code)
+
+    # 2. Take pre-modification backup via COM GenerateSource (if block already exists)
+    backup_path = new_s7_artifact_path(f"{blk_clean.lower()}-com-before")
+    has_existing_backup, _ = bridge.export_block_to_awl(blk_clean, backup_path, project_name=eff_proj)
+
+    def _restore_com_backup() -> Dict[str, Any]:
+        if not has_existing_backup or not backup_path.is_file():
+            return {"attempted": False, "restored": False, "reason": "No prior compiled block existed before write."}
+        rb_ok, rb_msg, _ = bridge.import_and_compile_awl(
+            awl_path=backup_path,
+            block_name=blk_clean,
+            project_name=eff_proj,
+        )
+        return {"attempted": True, "restored": rb_ok, "message": rb_msg, "backup_awl": str(backup_path)}
+
+    # 3. Save candidate artifact and compile via COM
+    after_path = save_s7_artifact(candidate_code, new_s7_artifact_path(f"{blk_clean.lower()}-com-after"))
+    comp_ok, comp_msg, comp_meta = bridge.import_and_compile_awl(
+        awl_path=after_path,
+        block_name=blk_clean,
+        project_name=eff_proj,
+        set_lad_language=lad_report.is_lad_compliant,
+    )
+    if not comp_ok:
+        rollback_info = _restore_com_backup()
+        return json.dumps({
+            "success": False,
+            "status": "BUILD_FAILED",
+            "error": comp_msg,
+            "details": comp_meta,
+            "backup_awl": str(backup_path) if has_existing_backup else None,
+            "rollback": rollback_info,
+        }, indent=2)
+
+    # 4. Readback verification via COM GenerateSource
+    verify_path = new_s7_artifact_path(f"{blk_clean.lower()}-com-verify")
+    ver_ok, ver_msg = bridge.export_block_to_awl(blk_clean, verify_path, project_name=eff_proj)
+    if not ver_ok:
+        rollback_info = _restore_com_backup()
+        return json.dumps({
+            "success": False,
+            "status": "READBACK_FAILED",
+            "error": ver_msg,
+            "backup_awl": str(backup_path) if has_existing_backup else None,
+            "rollback": rollback_info,
+        }, indent=2)
+
+    return json.dumps({
+        "success": True,
+        "status": "SUCCESS",
+        "mode": "native_com",
+        "project_name": comp_meta.get("project_name", eff_proj),
+        "block_name": blk_clean,
+        "block_language": comp_meta.get("block_language", "LAD" if lad_report.is_lad_compliant else "STL"),
+        "is_lad_compliant": lad_report.is_lad_compliant,
+        "total_networks": lad_report.total_networks,
+        "compile_code": comp_meta.get("compile_code", 0),
+        "dbf_lad_records_updated": comp_meta.get("dbf_lad_records_updated", 0),
+        "artifacts": {
+            "before_awl": str(backup_path) if has_existing_backup else None,
+            "after_awl": str(after_path),
+            "verify_awl": str(verify_path),
+        },
+    }, indent=2)
+
+
+@mcp.tool()
+def s7_runtime_ping(
+    host: str = "127.0.0.1",
+    ip_address: Optional[str] = None,
+    port: int = 102,
+    rack: int = 0,
+    slot: int = 2,
+) -> str:
+    """
+    Pings a live Siemens S7-300/400/WinAC PLC over ISO-on-TCP (RFC 1006 / S7comm Port 102)
+    or local S7-PLCSIM via the S7ProSim COM interface.
+
+    Args:
+        host: PLC IP address, hostname, or 'plcsim' (default: '127.0.0.1').
+        ip_address: Optional alias for host.
+        port: S7comm TCP port (default: 102).
+        rack: CPU rack number (default: 0).
+        slot: CPU slot number (default: 2 for S7-300).
+    """
+    eff_host = ip_address or host
+    res = runtime_client.ping(host=eff_host, port=port, rack=rack, slot=slot)
+    res["success"] = bool(res.get("ok"))
+    return json.dumps(res, indent=2)
+
+
+@mcp.tool()
+def s7_runtime_read(
+    address: str,
+    data_type: Optional[str] = None,
+    host: str = "127.0.0.1",
+    ip_address: Optional[str] = None,
+    port: int = 102,
+    rack: int = 0,
+    slot: int = 2,
+    project_name: Optional[str] = None,
+) -> str:
+    """
+    Reads a live register, bit, word, dword, or float from a running S7 PLC or PLCSIM.
+    Accepts physical S7 addresses ('I 0.0', 'Q 0.0', 'M 10.0', 'MW 10', 'MD 20', 'DB1.DBX 0.0', 'DB1.DBW 2')
+    OR symbolic tag names ('START_PB', 'ELEVATOR_UP') resolved automatically from the project symbol table.
+
+    Args:
+        address: Physical S7 address or symbolic tag name.
+        data_type: Optional type interpretation override ('BIT', 'BYTE', 'WORD', 'INT', 'DWORD', 'DINT', 'REAL').
+        host: PLC IP address or 'plcsim' (default: '127.0.0.1').
+        ip_address: Optional alias for host.
+        port: S7comm TCP port (default: 102).
+        rack: CPU rack number (default: 0).
+        slot: CPU slot number (default: 2).
+        project_name: Optional project name for symbol table resolution.
+    """
+    eff_host = ip_address or host
+    res = runtime_client.read_memory(
+        address_or_symbol=address,
+        host=eff_host,
+        port=port,
+        rack=rack,
+        slot=slot,
+        data_type=data_type,
+        project_name=project_name or controller.project_name,
+    )
+    res["success"] = bool(res.get("ok"))
+    return json.dumps(res, indent=2)
+
+
+@mcp.tool()
+def s7_runtime_write(
+    address: str,
+    value: Any,
+    data_type: Optional[str] = None,
+    host: str = "127.0.0.1",
+    ip_address: Optional[str] = None,
+    port: int = 102,
+    rack: int = 0,
+    slot: int = 2,
+    confirm_live_write: bool = False,
+    project_name: Optional[str] = None,
+) -> str:
+    """
+    Writes a value to a live S7 PLC or PLCSIM memory address or symbolic tag.
+    Protected by industrial safety guardrails: requires confirm_live_write=True or S7_WRITES_ENABLED=true.
+
+    Args:
+        address: Physical S7 address ('I 0.0', 'M 10.0', 'MW 10', 'DB1.DBW 0') or symbol name.
+        value: Value to write (bool/int/float).
+        data_type: Optional type interpretation override ('BIT', 'BYTE', 'WORD', 'INT', 'DWORD', 'DINT', 'REAL').
+        host: PLC IP address or 'plcsim' (default: '127.0.0.1').
+        ip_address: Optional alias for host.
+        port: S7comm TCP port (default: 102).
+        rack: CPU rack number (default: 0).
+        slot: CPU slot number (default: 2).
+        confirm_live_write: Must be True (or S7_WRITES_ENABLED=true) to authorize live PLC memory modification.
+        project_name: Optional project name for symbol table resolution.
+    """
+    eff_host = ip_address or host
+    res = runtime_client.write_memory(
+        address_or_symbol=address,
+        value=value,
+        host=eff_host,
+        port=port,
+        rack=rack,
+        slot=slot,
+        data_type=data_type,
+        confirm_live_write=confirm_live_write,
+        project_name=project_name or controller.project_name,
+    )
+    res["success"] = bool(res.get("ok"))
+    return json.dumps(res, indent=2)
 
 
 # ============================================================================

@@ -182,7 +182,46 @@ Auto-detects installed STEP 7 Classic versions via Windows registry, identifies 
 
 ---
 
-## Complete MCP Tools Directory (20 Tools)
+## Siemens LAD Compliance & AST Contact Graph Compiler
+
+To ensure AWL/STL code renders graphically as Ladder Diagram (LAD) in the Siemens Block Editor without falling back to STL, the server provides an AST-based Boolean contact graph compiler and compliance validator:
+
+1. **`s7_validate_lad_compliance`**:
+   - Pre-flight compliance validator checking all Siemens STEP 7 LAD decompiler constraints.
+   - Enforces the Single Coil Rule (excluding canonical LAD SR/RS Flip-Flop boxes), Parenthesized OR Rule (`A( O ... O ... )`), LAD MOVE/Math Box JNB structuring, jump label syntax limits (max 4 chars), and raw jump restrictions.
+
+2. **`s7_convert_to_ladder`**:
+   - Converts arbitrary STL/AWL networks into 100% LAD-compliant networks.
+   - Features an AST Boolean contact graph compiler, virtual S7 CPU Status Word evaluator (FC, RLO, OR, stack), De Morgan's Law parallel branch inverter, and automated Boolean truth-table equivalence verification.
+   - Automatically structures arithmetic, loads, and transfers into standard LAD `JNB` conditional execution boxes.
+
+---
+
+## Headless Siemens COM Automation Engine
+
+In addition to GUI automation via SIMATIC Manager, the server features a native 32-bit COM bridge interfacing directly with Siemens' official Command Interface (`S7ABATCX.DLL` / `Simatic.Simatic`):
+
+- **Headless & Deterministic**: Compiles, exports, and inspects projects and blocks without GUI screen-scraping or focus dependencies—functional even on locked desktops or Session 0 headless environments.
+- **`s7_com_list_projects`**: Enumerates all projects registered in the STEP 7 COM catalog.
+- **`s7_com_list_blocks`**: Lists all blocks in a project with their author, size, symbolic name, and native language (`LAD`, `FBD`, `STL`, `DB`).
+- **`s7_com_read_block`**: Exports and decompiles blocks directly from the project database via `GenerateSource`.
+- **`s7_com_write_block`**: Performs headless atomic compilation of AWL sources using `IS7Source.Compile()`, automatically tagging the block as native LAD (`BLKLANG='00002'`) in `SUBBLK.DBF`.
+
+---
+
+## Live S7comm Runtime Telemetry & PLCSIM Integration
+
+Direct live PLC communication via ISO-on-TCP (RFC 1006 / S7comm Port 102) and S7ProSim COM:
+
+- **Sub-15ms Deterministic Telemetry**: Directly reads and writes live process memory without GUI or editor interaction.
+- **Safety Guardrails**: Live PLC writes require both the `confirm_live_write=True` parameter and the `S7_WRITES_ENABLED=true` environment variable.
+- **`s7_runtime_ping`**: Verifies TCP and S7comm protocol handshake with the target PLC or PLCSIM.
+- **`s7_runtime_read`**: Reads live values across Inputs (`I`), Outputs (`Q`), Markers (`M`), Data Blocks (`DB`), Timers (`T`), and Counters (`C`).
+- **`s7_runtime_write`**: Safely writes live PLC memory with type checking and bounds enforcement.
+
+---
+
+## Complete MCP Tools Directory (29 Tools)
 
 | Tool Name | Type | Description |
 | :--- | :--- | :--- |
@@ -194,7 +233,7 @@ Auto-detects installed STEP 7 Classic versions via Windows registry, identifies 
 | `s7_open_block` | Project | Opens or focuses a target block (`OB1`, `FC`, `FB`) in the LAD/FBD/STL editor. |
 | `s7_validate_program` | Safety | Pre-validates AWL networks, syntax, and interlock rules without modifying SIMATIC Manager. |
 | `s7_write_program` | Execution | Verified atomic write: backups, candidate import, compilation, and readback verification. |
-| `s7_read_program` | Execution | Exports and parses the active block in SIMATIC Manager. |
+| `s7_read_program` | Execution | Exports and parses the active block in SIMATIC Manager (with COM fallback). |
 | `s7_compile_and_check` | Execution | Triggers save and Check Block Consistency in SIMATIC Manager. |
 | `s7_write_symbol_table` | Symbols | Exports validated `.SDF` and `.CSV` Symbol Table artifacts. |
 | `s7_read_symbol_table` | Symbols | Parses exported `.SDF`, `.SEQ`, or `.CSV` Symbol Tables. |
@@ -206,6 +245,15 @@ Auto-detects installed STEP 7 Classic versions via Windows registry, identifies 
 | `s7_get_memory_usage_map` | Analysis | Visual bit matrices and utilization statistics across all memory areas. |
 | `s7_get_block_overview` | Analysis | Scans workspace blocks, estimated MC7 sizes, and call dependency trees. |
 | `s7_analyze_program` | Analysis | Deep safety analysis: Star-Delta, duplicate coils, nesting limits, cycle times, safety score. |
+| `s7_validate_lad_compliance` | LAD / Safety | Validates AWL networks against Siemens STEP 7 LAD decompiler rules and flip-flop box patterns. |
+| `s7_convert_to_ladder` | LAD / Code Gen | Converts arbitrary STL into 100% LAD-compliant code using AST compiler and verified truth tables. |
+| `s7_com_list_projects` | COM Engine | Queries `Simatic.Simatic` COM catalog (`S7ABATCX.DLL`) to list all registered STEP 7 projects. |
+| `s7_com_list_blocks` | COM Engine | Headless COM inspection of all blocks (`OB`, `FC`, `FB`, `DB`) and native languages (`LAD`, `STL`). |
+| `s7_com_read_block` | COM Engine | Reads and decompiles block AWL source code directly from project database via COM `GenerateSource`. |
+| `s7_com_write_block` | COM Engine | Headless atomic compilation via COM `IS7Source.Compile()`, tagging blocks natively as LAD. |
+| `s7_runtime_ping` | S7comm / Live | Tests ISO-on-TCP (Port 102 RFC 1006 / S7comm) connectivity to a live PLC or PLCSIM. |
+| `s7_runtime_read` | S7comm / Live | Deterministically reads live PLC memory addresses (`I`, `Q`, `M`, `DB`, `T`, `C`) over S7comm. |
+| `s7_runtime_write` | S7comm / Live | Writes values to live PLC memory over S7comm with safety guards (`confirm_live_write`, env check). |
 
 ---
 

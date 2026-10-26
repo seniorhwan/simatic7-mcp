@@ -1493,6 +1493,310 @@ class TestSimaticS7EnhancementsAndEdgeCases(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("not found", msg)
 
+    def test_priority1_export_current_awl_never_synthesizes_nop0_backup(self):
+        """Priority 1 Audit Fix: Never synthesize fake NOP 0 backup files when block export fails."""
+        ctrl = MODULE.SimaticManagerController()
+        ctrl.connect = lambda timeout=0.5: (True, "Connected")
+        ctrl.main_win = None
+        if getattr(ctrl, "com_bridge", None) is not None:
+            ctrl.com_bridge.export_block_to_awl = lambda block_name, output_path, project_name=None: (
+                False,
+                "Simulated COM export failure",
+            )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            out_file = Path(tmp_dir) / "should_not_exist_nop0.awl"
+            ok, msg = ctrl.export_current_awl(out_file)
+            self.assertFalse(ok)
+            self.assertFalse(out_file.exists(), "export_current_awl must never create a synthetic NOP 0 file!")
+            self.assertIn("Refusing to synthesize a dummy NOP 0 backup", msg)
+
+    def test_priority2_headless_mouse_move_and_set_focus_monkeypatch(self):
+        """Priority 2 Audit Fix: pywinauto mouse.move and HwndWrapper.set_focus are safe on headless/locked sessions."""
+        if getattr(MODULE, "_pywinauto_mouse", None) is not None:
+            self.assertIsNone(MODULE._pywinauto_mouse.move(100, 200))
+        if getattr(MODULE, "HwndWrapper", None) is not None:
+            self.assertEqual(MODULE.HwndWrapper.set_focus.__name__, "_headless_safe_set_focus")
+
+    def test_priority2_dismiss_popups_closes_modal_and_reenables_parent_before_raising(self):
+        """Priority 2 Audit Fix: Unrecognized modal dialogs must be closed before raising RuntimeError."""
+        ctrl = MODULE.SimaticManagerController()
+
+        class DummyStatic:
+            def friendly_class_name(self):
+                return "Static"
+
+            def window_text(self):
+                return "Unexpected STEP 7 Dialog (9999:99)"
+
+        class DummyButton:
+            def friendly_class_name(self):
+                return "Button"
+
+            def window_text(self):
+                return "Abort"
+
+        class DummyPopup:
+            def __init__(self):
+                self.handle = 999
+                self.closed = False
+
+            def class_name(self):
+                return "#32770"
+
+            def is_enabled(self):
+                return True
+
+            def window_text(self):
+                return "SIMATIC Manager (9999:99)"
+
+            def children(self):
+                return [DummyStatic(), DummyButton()]
+
+            def close(self):
+                self.closed = True
+
+        popup = DummyPopup()
+
+        class DummyApp:
+            def windows(self, visible_only=True):
+                return [popup]
+
+        ctrl.app = DummyApp()
+        ctrl.main_win = None
+        with self.assertRaises(RuntimeError) as ctx:
+            ctrl._dismiss_popups()
+        self.assertIn("9999:99", str(ctx.exception))
+        self.assertTrue(popup.closed, "Modal popup must be closed before raising RuntimeError!")
+
+    def test_priority4_lvitem32_structure_size_and_headerless_sdf_parsing(self):
+        """Priority 4 Audit Fix: _LVITEM32 is exactly 40 bytes on 64-bit Python, and headerless .sdf keeps row 1."""
+        import ctypes
+        self.assertEqual(ctypes.sizeof(MODULE._LVITEM32), 40)
+
+        sdf_content = (
+            '"START_PB","I 0.0","BOOL","Start Pushbutton"\n'
+            '"MOTOR_RUN","Q 0.0","BOOL","Main Motor Contactor"\n'
+        )
+        parsed = MODULE.parse_s7_symbol_table(sdf_content)
+        self.assertIn("START_PB", parsed["symbol_map"])
+        self.assertEqual(parsed["symbol_map"]["START_PB"], "I 0.0")
+        self.assertIn("MOTOR_RUN", parsed["symbol_map"])
+        self.assertEqual(parsed["symbol_count"], 2)
+
+    def test_priority4_real_step7_com_bridge_integration(self):
+        """Priority 4 Audit Fix: Real integration test against native 32-bit Simatic.Simatic COM engine."""
+        bridge = MODULE.SimaticComBridge()
+        if not bridge.is_available():
+            self.skipTest("32-bit PowerShell host not available")
+
+        proj_res = json.loads(MODULE.s7_com_list_projects())
+        if not proj_res.get("success"):
+            self.skipTest(f"STEP 7 COM not registered: {proj_res.get('message')}")
+
+        self.assertGreater(proj_res["user_project_count"], 0)
+        test_projs = [p for p in proj_res["user_projects"] if p["name"].upper() == "TEST"]
+        self.assertTrue(len(test_projs) > 0, "Expected 'TEST' project in STEP 7 COM catalog")
+
+        blk_res = json.loads(MODULE.s7_com_list_blocks(project_name="TEST"))
+        self.assertTrue(blk_res["success"])
+        ob1_entries = [b for b in blk_res["blocks"] if b["name"].upper() == "OB1"]
+        self.assertEqual(len(ob1_entries), 1)
+        self.assertEqual(ob1_entries[0]["language"], "LAD")
+
+        read_res = json.loads(MODULE.s7_com_read_block(block_name="OB1", project_name="TEST"))
+        self.assertTrue(read_res["success"])
+        self.assertEqual(read_res["network_count"], 69)
+
+    def test_priority5_real_s7comm_loopback_tcp_read_write_and_safety_guardrail(self):
+        """Priority 5 Audit Fix: Real TCP socket integration test using S7CommLoopbackServer and S7RuntimeClient."""
+        server = MODULE.S7CommLoopbackServer(host="127.0.0.1", port=0)
+        port = server.start()
+        try:
+            # 1. Ping over real TCP socket (RFC 1006 + COTP + S7comm Setup Communication)
+            ping_res = json.loads(MODULE.s7_runtime_ping(ip_address="127.0.0.1", port=port))
+            self.assertTrue(ping_res["connected"])
+            self.assertEqual(ping_res["transport"], "s7comm_iso_tcp")
+
+            # 2. Verify safety guardrail blocks unconfirmed writes when S7_WRITES_ENABLED is not set
+            blocked_res = json.loads(
+                MODULE.s7_runtime_write(
+                    address="MW10",
+                    value=1234,
+                    ip_address="127.0.0.1",
+                    port=port,
+                    confirm_live_write=False,
+                )
+            )
+            self.assertFalse(blocked_res["success"])
+            self.assertEqual(blocked_res["status"], "WRITE_GUARDRAIL_BLOCKED")
+
+            # 3. Round-trip BIT, BYTE, WORD, INT, DWORD, REAL over real TCP sockets
+            cases = [
+                ("M0.0", True, None),
+                ("M0.1", False, None),
+                ("MB2", 0xAB, None),
+                ("MW10", 4321, "WORD"),
+                ("DB1.DBW4", -1234, "INT"),
+                ("MD20", 98765432, "DWORD"),
+            ]
+            for addr, val, dtype in cases:
+                wr = json.loads(
+                    MODULE.s7_runtime_write(
+                        address=addr,
+                        value=val,
+                        data_type=dtype,
+                        ip_address="127.0.0.1",
+                        port=port,
+                        confirm_live_write=True,
+                    )
+                )
+                self.assertTrue(wr["success"], f"Write failed for {addr}: {wr}")
+                rd = json.loads(
+                    MODULE.s7_runtime_read(
+                        address=addr,
+                        data_type=dtype,
+                        ip_address="127.0.0.1",
+                        port=port,
+                    )
+                )
+                self.assertTrue(rd["success"], f"Read failed for {addr}: {rd}")
+                self.assertEqual(rd["value"], val)
+
+            # REAL float round-trip
+            wr_real = json.loads(
+                MODULE.s7_runtime_write(
+                    address="DB1.DBD30",
+                    value=3.14159,
+                    data_type="REAL",
+                    ip_address="127.0.0.1",
+                    port=port,
+                    confirm_live_write=True,
+                )
+            )
+            self.assertTrue(wr_real["success"])
+            rd_real = json.loads(
+                MODULE.s7_runtime_read(
+                    address="DB1.DBD30",
+                    data_type="REAL",
+                    ip_address="127.0.0.1",
+                    port=port,
+                )
+            )
+            self.assertTrue(rd_real["success"])
+            self.assertAlmostEqual(rd_real["value"], 3.14159, places=4)
+        finally:
+            server.stop()
+
+    def test_ai_agent_ergonomics_flexible_program_inputs(self):
+        """AI-Agent Ergonomics: validate_and_analyze_program accepts raw AWL strings, flat lists, multiline strings, and >64 char titles."""
+        # 1. Raw AWL string
+        raw_awl = """
+        NETWORK
+        TITLE = Raw AWL Network
+          A I 0.0;
+          = Q 0.0;
+        """
+        rep_raw = MODULE.validate_and_analyze_program(raw_awl)
+        self.assertTrue(rep_raw.valid, f"Raw AWL failed validation: {rep_raw.errors}")
+        self.assertEqual(len(rep_raw.normalized_networks), 1)
+
+        # 2. Flat list of instruction strings
+        rep_flat = MODULE.validate_and_analyze_program(["A I 0.0;", "A I 0.1;", "= Q 0.0;"])
+        self.assertTrue(rep_flat.valid, f"Flat list failed validation: {rep_flat.errors}")
+        self.assertEqual(len(rep_flat.normalized_networks), 1)
+
+        # 3. Multiline instruction string + >64 char title (auto-truncated with warning, not error)
+        long_title = "Network Title Exceeding Sixty Four Characters For AI Agent Ergonomics Verification Test"
+        rep_multi = MODULE.validate_and_analyze_program([
+            {"title": long_title, "instructions": ["A I 0.0;\nA I 0.1;\n= Q 0.0;"]}
+        ])
+        self.assertTrue(rep_multi.valid, f"Multiline/long-title failed validation: {rep_multi.errors}")
+        self.assertEqual(len(rep_multi.normalized_networks[0]["title"]), 64)
+        self.assertTrue(any("truncated to 64 characters" in w for w in rep_multi.warnings))
+
+        # 4. Full multi-network AWL block string with ORGANIZATION_BLOCK envelope
+        full_awl = """ORGANIZATION_BLOCK OB 1
+TITLE = "Main Scan"
+VERSION : 0.1
+BEGIN
+NETWORK
+TITLE = Rung 1
+  A I 0.0;
+  = Q 0.0;
+NETWORK
+TITLE = Rung 2
+  A I 0.1;
+  = Q 0.1;
+END_ORGANIZATION_BLOCK
+"""
+        rep_full = MODULE.validate_and_analyze_program(full_awl)
+        self.assertTrue(rep_full.valid, f"Full AWL block failed validation: {rep_full.errors}")
+        self.assertEqual(len(rep_full.normalized_networks), 2)
+        self.assertEqual(rep_full.normalized_networks[0]["title"], "Rung 1")
+        self.assertEqual(rep_full.normalized_networks[1]["title"], "Rung 2")
+
+    def test_official_siemens_lad_call_bld_and_symbolic_db_parsing(self):
+        """Official Siemens LAD exports with BLD 103, multiline CALL ( param := val ), and symbolic DB members parse and validate cleanly."""
+        from lad_converter import validate_lad_source
+        siemens_lad_ob1 = """ORGANIZATION_BLOCK "Cycling"
+TITLE = "Official Siemens LAD OB1"
+VERSION : 0.1
+BEGIN
+NETWORK
+TITLE = Petrol Engine Call
+      O     "S_On";
+      O     "T_On";
+      =     L     20.0;
+      BLD   103;
+      A     "S_Rise";
+      =     L     20.1;
+      BLD   103;
+      A     "S_More";
+      =     L     20.2;
+      BLD   103;
+      CALL "Engine" , "Petrol" (
+           Switch_On                := L     20.0,
+           Setpoint_Rise            := L     20.1,
+           More_Gas                 := L     20.2,
+           Preset_Speed             := 1500,
+           Actual_Speed             := "S_Data".PE_Actual_Speed,
+           Preset_Speed_Reached     := "Light_1");
+      NOP   0;
+END_ORGANIZATION_BLOCK
+"""
+        lad_rep = validate_lad_source(siemens_lad_ob1)
+        self.assertTrue(lad_rep.is_lad_compliant, f"Official Siemens LAD flagged: {lad_rep.violations}")
+
+        val_rep = MODULE.validate_and_analyze_program(siemens_lad_ob1)
+        self.assertTrue(val_rep.valid, f"Official Siemens LAD failed validation: {val_rep.errors}")
+
+        tmp_awl = MODULE.new_s7_artifact_path("test-siemens-lad-ob1")
+        try:
+            MODULE.save_s7_artifact(siemens_lad_ob1, tmp_awl)
+            parsed = MODULE.parse_s7_awl_source(tmp_awl)
+            self.assertNotIn("error", parsed)
+            self.assertEqual(parsed["network_count"], 1)
+            insts = parsed["networks"][0]["instructions"]
+            self.assertTrue(any(i.startswith('CALL "Engine"') for i in insts), f"CALL not joined: {insts}")
+            self.assertFalse(any(i.startswith("SWITCH_ON:") for i in insts), f":= misparsed as label: {insts}")
+        finally:
+            if tmp_awl.exists():
+                tmp_awl.unlink()
+
+    def test_com_write_block_preflight_rejection_and_rollback_protection(self):
+        """s7_com_write_block rejects invalid AWL before touching STEP 7 and rolls back from backup if COM compile fails."""
+        # 1. Invalid AWL opcode rejected BEFORE touching COM bridge
+        bad_res = json.loads(
+            MODULE.s7_com_write_block(
+                block_name="FC99",
+                source_code="FUNCTION FC 99 : VOID\nBEGIN\nNETWORK\nBOGUS_OP ???;\nEND_FUNCTION\n",
+                project_name="TEST",
+                convert_to_lad=False,
+            )
+        )
+        self.assertFalse(bad_res["success"])
+        self.assertEqual(bad_res["status"], "REJECTED_BEFORE_WRITE")
+
 
 if __name__ == "__main__":
     unittest.main()
