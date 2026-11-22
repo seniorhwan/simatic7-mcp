@@ -66,14 +66,21 @@ Running via Antigravity or VS Code MCP Configuration:
 
 from __future__ import annotations
 
+import argparse
+import base64
 import csv
+import ctypes
 import datetime
+import difflib
 import fnmatch
+import hashlib
 import io
 import json
 import os
 import re
 import shutil
+import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -82,7 +89,42 @@ import uuid
 from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
+
+from simatic_s7_mcp import (
+    AccessMode,
+    AuditLogger,
+    EnhancedS7LoopbackServer,
+    FailureCategory,
+    PersistentComWorker,
+    S7ConnectionPool,
+    S7_HARDWARE_CATALOG,
+    STEP7_BLKLANG_CODES,
+    StationHardwareConfig,
+    VirtualS7PLC,
+    WatchTableMonitor,
+    build_catalog_resource_text,
+    build_iec_reference_resource_text,
+    build_prompt_convert_and_verify_lad,
+    build_prompt_new_project_wizard,
+    build_prompt_plcsim_automated_test,
+    build_prompt_safe_commissioning,
+    compile_scl_via_cli,
+    compute_content_hash,
+    convert_awl_to_pure_fbd,
+    generate_client_config,
+    generate_data_block_source,
+    generate_udt_source,
+    make_tool_annotations,
+    parse_station_cfg,
+    resolve_access_mode,
+    resolve_catalog_module,
+    run_doctor,
+    search_hardware_catalog,
+    validate_and_generate_graph_sfc,
+    validate_fbd_source,
+    validate_scl_source,
+)
 
 # Ensure standard I/O encoding is UTF-8 for MCP stdio transport
 if sys.platform == "win32":
@@ -93,10 +135,51 @@ if sys.platform == "win32":
 
 try:
     from mcp.server.fastmcp import FastMCP
-except ImportError as exc:
-    raise SystemExit(
-        "Missing 'mcp' package. Install it with: pip install \"mcp[cli]\" pywinauto pywin32"
-    ) from exc
+    MCP_SDK_AVAILABLE = True
+except ImportError:
+    MCP_SDK_AVAILABLE = False
+
+    class FastMCP:  # type: ignore[no-redef]
+        """Lightweight FastMCP fallback shim for CLI diagnostics, config export, and unit tests when 'mcp' is not installed."""
+
+        def __init__(self, name: str, instructions: str = "", **kwargs: Any) -> None:
+            self.name = name
+            self.instructions = instructions
+            self._tools: Dict[str, Dict[str, Any]] = {}
+            self._resources: Dict[str, Callable[..., Any]] = {}
+            self._prompts: Dict[str, Callable[..., Any]] = {}
+
+        def tool(self, *args: Any, **kwargs: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+            def _decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
+                self._tools[kwargs.get("name") or fn.__name__] = {
+                    "fn": fn,
+                    "annotations": kwargs.get("annotations"),
+                }
+                return fn
+            if args and callable(args[0]):
+                return _decorator(args[0])
+            return _decorator
+
+        def resource(self, uri: str, **kwargs: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+            def _decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
+                self._resources[uri] = fn
+                return fn
+            return _decorator
+
+        def prompt(self, *args: Any, **kwargs: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+            def _decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
+                self._prompts[kwargs.get("name") or fn.__name__] = fn
+                return fn
+            if args and callable(args[0]):
+                return _decorator(args[0])
+            return _decorator
+
+        def run(self, *args: Any, **kwargs: Any) -> None:
+            raise SystemExit(
+                "Missing 'mcp' package required to run stdio MCP server. "
+                "Install it with: pip install \"mcp[cli]\" pywinauto pywin32"
+            )
+
 
 # Optional Windows GUI automation imports (handled gracefully if offline)
 try:
@@ -3204,10 +3287,7 @@ def detect_simatic_environment() -> Dict[str, Any]:
 # 6B. 32-BIT CROSS-PROCESS LISTVIEW HELPER, NATIVE SIEMENS COM BRIDGE & S7COMM RUNTIME
 # ============================================================================
 
-import base64
-import ctypes
-import socket
-import struct
+# (base64, ctypes, socket, struct imported at module top-level)
 
 
 class _LVITEM32(ctypes.Structure):
@@ -3421,12 +3501,12 @@ def _update_step7_subblk_language(project_dir: Path, block_name: str, lang_code:
 
 class SimaticComBridge:
     """
-    Priority 4 Audit Remediation:
-    Bridges 64-bit Python to the native 32-bit Siemens STEP 7 Command Interface
-    (S7ABATCX.DLL / ProgID 'Simatic.Simatic' / CLSID {9A853ACF-BA8E-11D1-BAD8-0060086A411D})
-    via 32-bit WindowsPowerShell (SysWOW64) in UnattendedServerMode.
-    Operates deterministically on STEP 7 projects, programs, blocks, sources, and symbol tables
-    without GUI screen-scraping, mouse movement, or modal dialog deadlocks.
+    Production-grade 32-bit Siemens STEP 7 Command Interface (Simatic.Simatic COM)
+    and S7-PLCSIM (S7wspsmx.S7ProSim.1) bridge backed by a persistent out-of-process
+    32-bit worker daemon (native C++ s7_com_bridge.exe or persistent SysWOW64 PowerShell).
+
+    Eliminates ~1.9s per-call process spawn overhead, removes hardcoded project biases,
+    and avoids destructive pre-compile block deletion.
     """
 
     PS32_Candidates = (
@@ -3434,14 +3514,22 @@ class SimaticComBridge:
         Path(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
     )
 
-    def __init__(self) -> None:
+    def __init__(self, worker: Optional[PersistentComWorker] = None) -> None:
         self.ps32_exe: Optional[Path] = next((p for p in self.PS32_Candidates if p.is_file()), None)
+        native_exe = Path(__file__).resolve().parent / "native" / "s7_com_bridge.exe"
+        self.worker: PersistentComWorker = worker or PersistentComWorker(
+            native_exe_path=native_exe if native_exe.is_file() else None,
+        )
 
     def is_available(self) -> bool:
-        return sys.platform == "win32" and self.ps32_exe is not None
+        return self.worker.is_available()
+
+    def close(self) -> None:
+        self.worker.close()
 
     def _run_ps32_json(self, ps_script: str, timeout: float = 25.0) -> Dict[str, Any]:
-        if not self.is_available() or not self.ps32_exe:
+        """Backwards-compatible ad-hoc 32-bit PowerShell fallback when custom scripts are needed."""
+        if not (sys.platform == "win32" and self.ps32_exe is not None):
             return {"ok": False, "error": "32-bit PowerShell host is not available on this system."}
 
         out_json_file = WORKSPACE_DIR / f".ps32-com-{uuid.uuid4().hex}.json"
@@ -3464,18 +3552,9 @@ class SimaticComBridge:
         )
         encoded = base64.b64encode(wrapped_script.encode("utf-16le")).decode("ascii")
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if sys.platform == "win32" else 0
-        proc: Optional[subprocess.Popen] = None
         try:
             proc = subprocess.Popen(
-                [
-                    str(self.ps32_exe),
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-EncodedCommand",
-                    encoded,
-                ],
+                [str(self.ps32_exe), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -3486,34 +3565,15 @@ class SimaticComBridge:
             except subprocess.TimeoutExpired:
                 subprocess.run(
                     ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    creationflags=creationflags,
-                )
-                subprocess.run(
-                    [
-                        str(self.ps32_exe),
-                        "-NoProfile",
-                        "-NonInteractive",
-                        "-Command",
-                        "Get-Process S7kafapx -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -eq 0 } | Stop-Process -Force -ErrorAction SilentlyContinue",
-                    ],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                     creationflags=creationflags,
                 )
                 return {"ok": False, "error": f"32-bit COM operation timed out after {timeout}s."}
-
             if not out_json_file.is_file():
                 return {"ok": False, "error": f"32-bit COM host exited with code {proc.returncode} without producing JSON."}
             raw_text = out_json_file.read_text(encoding="utf-8-sig", errors="replace").strip()
-            if not raw_text:
-                return {"ok": False, "error": f"32-bit COM host exited with code {proc.returncode} (empty output)."}
             lines = [ln.strip() for ln in raw_text.splitlines() if ln.strip().startswith("{")]
-            json_line = lines[-1] if lines else raw_text
-            return json.loads(json_line)
+            return json.loads(lines[-1] if lines else raw_text)
         except Exception as exc:
             return {"ok": False, "error": f"32-bit COM bridge execution failed: {exc}"}
         finally:
@@ -3524,25 +3584,7 @@ class SimaticComBridge:
                 pass
 
     def list_projects(self) -> Tuple[bool, List[Dict[str, Any]], str]:
-        ps = r"""
-$s7 = New-Object -ComObject "Simatic.Simatic"
-$s7.UnattendedServerMode = $true
-$projs = @()
-foreach ($p in $s7.Projects) {
-  try {
-    $pType = [int]$p.Type
-    $logPath = [string]$p.LogPath
-    $projs += @{
-      name = [string]$p.Name
-      type = $pType
-      is_user_project = [bool]($pType -eq 1122305 -or $pType -eq 1)
-      project_dir = $logPath
-    }
-  } catch {}
-}
-@{ ok = $true; projects = $projs } | ConvertTo-Json -Compress -Depth 5
-"""
-        res = self._run_ps32_json(ps)
+        res = self.worker.call("list_projects")
         if not res.get("ok"):
             return False, [], res.get("error", "Failed to enumerate STEP 7 COM projects.")
         projs = res.get("projects") or []
@@ -3550,75 +3592,34 @@ foreach ($p in $s7.Projects) {
             projs = [projs]
         return True, projs, f"Found {len(projs)} STEP 7 COM entries."
 
+    def create_project(
+        self,
+        project_name: str,
+        project_path: Optional[str] = None,
+        station_name: str = "SIMATIC 300(1)",
+        station_type: str = "S7-300",
+    ) -> Tuple[bool, str, Dict[str, Any]]:
+        res = self.worker.call(
+            "create_project",
+            {
+                "project_name": project_name,
+                "project_path": project_path or "",
+                "station_name": station_name,
+                "station_type": station_type,
+            },
+        )
+        if not res.get("ok"):
+            return False, res.get("error", "COM create_project failed."), res
+        return True, f"Created STEP 7 project '{res.get('project_name', project_name)}' via COM.", res
+
+    def browse_project_tree(self, project_name: Optional[str] = None) -> Tuple[bool, Dict[str, Any], str]:
+        res = self.worker.call("browse_project_tree", {"project_name": (project_name or "").strip()})
+        if not res.get("ok"):
+            return False, res, res.get("error", "COM browse_project_tree failed.")
+        return True, res, f"Browsed project tree for '{res.get('project_name')}'."
+
     def list_blocks(self, project_name: Optional[str] = None) -> Tuple[bool, List[Dict[str, Any]], str]:
-        proj_filter = (project_name or "").strip().replace("'", "''")
-        ps = f"""
-$s7 = New-Object -ComObject "Simatic.Simatic"
-$s7.UnattendedServerMode = $true
-$targetName = '{proj_filter}'
-$proj = $null
-$prg = $null
-foreach ($p in $s7.Projects) {{
-  try {{
-    if ($targetName -eq '' -or $p.Name -ieq $targetName) {{
-      foreach ($candidatePrg in $p.Programs) {{
-        foreach ($c in $candidatePrg.Next) {{
-          if ($c.ConcreteType -eq 1138689 -or $c.Name -ieq 'Blocks' -or $c.Name -ieq 'Bausteine') {{
-            $proj = $p
-            $prg = $candidatePrg
-            break
-          }}
-        }}
-        if ($null -ne $prg) {{ break }}
-      }}
-      if ($null -ne $prg) {{
-        if ($targetName -ne '' -and $p.Name -ieq $targetName) {{ break }}
-        if ($p.Name -ieq 'TEST') {{ break }}
-      }}
-    }}
-  }} catch {{}}
-}}
-if ($null -eq $proj -or $null -eq $prg) {{
-  @{{ ok = $false; error = "Project not found in STEP 7 COM catalog: $targetName" }} | ConvertTo-Json -Compress
-  exit
-}}
-$blocks = @()
-$sources = @()
-foreach ($c in $prg.Next) {{
-  if ($c.ConcreteType -eq 1138689 -or $c.Name -ieq 'Blocks' -or $c.Name -ieq 'Bausteine') {{
-    foreach ($b in $c.Next) {{
-      try {{
-        $blocks += @{{
-          name = [string]$b.Name
-          concrete_type = [int]$b.ConcreteType
-          language = [string]$b.Language
-          author = [string]$b.Creator
-          symbolic_name = [string]$b.SymbolicName
-          size = [int]$b.Size
-        }}
-      }} catch {{}}
-    }}
-  }} elseif ($c.ConcreteType -eq 1122308 -or $c.Name -ieq 'Sources' -or $c.Name -ieq 'Quellen') {{
-    foreach ($src in $c.Next) {{
-      try {{
-        $sources += @{{
-          name = [string]$src.Name
-          file_path = [string]$src.FilePath
-        }}
-      }} catch {{}}
-    }}
-  }}
-}}
-@{{
-  ok = $true
-  project_name = [string]$proj.Name
-  project_dir = [string]$proj.LogPath
-  program_name = [string]$prg.Name
-  blocks = $blocks
-  sources = $sources
-}} | ConvertTo-Json -Compress -Depth 6
-"""
-        res = self._run_ps32_json(ps)
+        res = self.worker.call("list_blocks", {"project_name": (project_name or "").strip()})
         if not res.get("ok"):
             return False, [], res.get("error", "Failed to list blocks via STEP 7 COM.")
         blocks = res.get("blocks") or []
@@ -3636,70 +3637,26 @@ foreach ($c in $prg.Next) {{
         output_path: Union[str, Path],
         project_name: Optional[str] = None,
     ) -> Tuple[bool, str]:
-        """
-        Exports a compiled block (OB, FC, FB, DB) directly from the STEP 7 project database
-        to an AWL file using IS7Block.GenerateSource(output_path, 0).
-        """
         output_path = Path(output_path)
         blk_clean = re.sub(r"\s+", "", block_name.strip().upper())
-        proj_filter = (project_name or "").strip().replace("'", "''")
-        out_resolved = str(output_path.resolve()).replace("'", "''")
         output_path.parent.mkdir(parents=True, exist_ok=True)
         if output_path.exists():
             try:
                 output_path.unlink()
             except Exception:
                 pass
-
-        ps = f"""
-$s7 = New-Object -ComObject "Simatic.Simatic"
-$s7.UnattendedServerMode = $true
-$targetProj = '{proj_filter}'
-$blkName = '{blk_clean}'
-$outFile = '{out_resolved}'
-$foundBlock = $null
-$matchedProj = $null
-
-foreach ($p in $s7.Projects) {{
-  try {{
-    if ($targetProj -eq '' -or $p.Name -ieq $targetProj) {{
-      foreach ($prg in $p.Programs) {{
-        foreach ($c in $prg.Next) {{
-          if ($c.ConcreteType -eq 1138689 -or $c.Name -ieq 'Blocks' -or $c.Name -ieq 'Bausteine') {{
-            foreach ($b in $c.Next) {{
-              if (($b.Name -replace '\\s+','') -ieq $blkName) {{
-                $foundBlock = $b
-                $matchedProj = $p
-                break
-              }}
-            }}
-          }}
-          if ($null -ne $foundBlock) {{ break }}
-        }}
-        if ($null -ne $foundBlock) {{ break }}
-      }}
-      if ($null -ne $foundBlock -and ($targetProj -ne '' -or $p.Name -ieq 'TEST')) {{ break }}
-    }}
-  }} catch {{}}
-}}
-
-if ($null -eq $foundBlock) {{
-  @{{ ok = $false; error = "Block '$blkName' not found in STEP 7 COM project '$targetProj'." }} | ConvertTo-Json -Compress
-  exit
-}}
-
-$foundBlock.GenerateSource($outFile, 0)
-Get-Process S7kafapx -ErrorAction SilentlyContinue | Where-Object {{ $_.MainWindowHandle -eq 0 }} | Stop-Process -Force -ErrorAction SilentlyContinue
-$exists = Test-Path -LiteralPath $outFile
-@{{
-  ok = [bool]$exists
-  project_name = [string]$matchedProj.Name
-  block_name = [string]$foundBlock.Name
-  output_path = $outFile
-}} | ConvertTo-Json -Compress
-"""
-        res = self._run_ps32_json(ps)
+        res = self.worker.call(
+            "export_block",
+            {
+                "project_name": (project_name or "").strip(),
+                "block_name": blk_clean,
+                "output_path": str(output_path.resolve()),
+            },
+        )
         if res.get("ok") and output_path.is_file() and output_path.stat().st_size > 0:
+            return True, str(output_path)
+        if res.get("ok") and res.get("source_text"):
+            output_path.write_text(str(res["source_text"]), encoding="utf-8")
             return True, str(output_path)
         return False, res.get("error", f"COM GenerateSource did not create {output_path}")
 
@@ -3709,134 +3666,31 @@ $exists = Test-Path -LiteralPath $outFile
         block_name: str = "OB1",
         project_name: Optional[str] = None,
         set_lad_language: Optional[bool] = None,
+        target_language: Optional[str] = None,
     ) -> Tuple[bool, str, Dict[str, Any]]:
-        """
-        Imports an external AWL source file into the STEP 7 project's Sources container
-        and compiles it via IS7Source.Compile() in UnattendedServerMode.
-        If the AWL source is LAD-compliant (or set_lad_language=True), updates BLKLANG='00002'
-        in SUBBLK.DBF so STEP 7 marks the compiled block natively as LAD.
-        """
         awl_path = Path(awl_path)
         if not awl_path.is_file():
             return False, f"AWL source file does not exist: {awl_path}", {}
 
         blk_clean = re.sub(r"\s+", "", block_name.strip().upper())
-        proj_filter = (project_name or "").strip().replace("'", "''")
-        awl_resolved = str(awl_path.resolve()).replace("'", "''")
-        src_obj_name = f"MCP_{blk_clean}_SRC"
-
-        ps = f"""
-Get-Process S7kafapx -ErrorAction SilentlyContinue | Where-Object {{ $_.MainWindowHandle -eq 0 }} | Stop-Process -Force -ErrorAction SilentlyContinue
-$s7 = New-Object -ComObject "Simatic.Simatic"
-$s7.UnattendedServerMode = $true
-$targetProj = '{proj_filter}'
-$blkName = '{blk_clean}'
-$srcPath = '{awl_resolved}'
-$srcName = '{src_obj_name}'
-$proj = $null
-$prg = $null
-$srcContainer = $null
-$blkContainer = $null
-
-foreach ($p in $s7.Projects) {{
-  try {{
-    if ($targetProj -eq '' -or $p.Name -ieq $targetProj) {{
-      foreach ($candidatePrg in $p.Programs) {{
-        foreach ($c in $candidatePrg.Next) {{
-          if ($c.ConcreteType -eq 1122308 -or $c.Name -ieq 'Sources' -or $c.Name -ieq 'Quellen') {{
-            $proj = $p
-            $prg = $candidatePrg
-            $srcContainer = $c
-          }} elseif ($c.ConcreteType -eq 1138689 -or $c.Name -ieq 'Blocks' -or $c.Name -ieq 'Bausteine') {{
-            $blkContainer = $c
-          }}
-        }}
-        if ($null -ne $srcContainer) {{ break }}
-      }}
-      if ($null -ne $srcContainer) {{
-        if ($targetProj -ne '' -and $p.Name -ieq $targetProj) {{ break }}
-        if ($p.Name -ieq 'TEST') {{ break }}
-      }}
-    }}
-  }} catch {{}}
-}}
-
-if ($null -eq $proj -or $null -eq $srcContainer) {{
-  @{{ ok = $false; error = "Target STEP 7 project '$targetProj' or Sources container not found in COM." }} | ConvertTo-Json -Compress
-  exit
-}}
-
-$targetItem = $null
-$fallbackItem = $null
-foreach ($it in $srcContainer.Next) {{
-  if ($null -eq $fallbackItem) {{ $fallbackItem = $it }}
-  if ($it.Name -ieq $srcName) {{
-    $targetItem = $it
-    break
-  }}
-}}
-
-if ($null -eq $targetItem) {{
-  try {{
-    $targetItem = $srcContainer.Next.Add($srcName, 65, $srcPath)
-  }} catch {{
-    try {{
-      $targetItem = $srcContainer.Next.Add($srcName, 1122309, $srcPath)
-    }} catch {{
-      $targetItem = $fallbackItem
-    }}
-  }}
-}}
-
-if ($null -eq $targetItem) {{
-  @{{ ok = $false; error = "Unable to create or locate an IS7Source item in project '$($proj.Name)'." }} | ConvertTo-Json -Compress
-  exit
-}}
-
-if ($targetItem.FilePath -and (Test-Path -LiteralPath (Split-Path -Parent $targetItem.FilePath))) {{
-  Copy-Item -LiteralPath $srcPath -Destination $targetItem.FilePath -Force
-}}
-
-if ($null -ne $blkContainer) {{
-  foreach ($b in $blkContainer.Next) {{
-    try {{
-      if (($b.Name -replace '\\s+','') -ieq $blkName) {{
-        $b.Remove()
-        break
-      }}
-    }} catch {{}}
-  }}
-}}
-
-$watchdog = Start-Process -FilePath powershell.exe -WindowStyle Hidden -PassThru -ArgumentList '-NoProfile -NonInteractive -Command Start-Sleep -Seconds 8; Stop-Process -Name S7kafapx -Force -ErrorAction SilentlyContinue'
-try {{
-  $null = $targetItem.Compile()
-}} finally {{
-  if ($null -ne $watchdog -and -not $watchdog.HasExited) {{
-    Stop-Process -Id $watchdog.Id -Force -ErrorAction SilentlyContinue
-  }}
-  Stop-Process -Name S7kafapx -Force -ErrorAction SilentlyContinue
-}}
-
-@{{
-  ok = $true
-  compile_code = 0
-  project_name = [string]$proj.Name
-  project_dir = [string]$proj.LogPath
-  source_name = [string]$targetItem.Name
-  internal_file = [string]$targetItem.FilePath
-}} | ConvertTo-Json -Compress
-"""
-        res = self._run_ps32_json(ps, timeout=25.0)
+        res = self.worker.call(
+            "compile_source",
+            {
+                "project_name": (project_name or "").strip(),
+                "block_name": blk_clean,
+                "source_path": str(awl_path.resolve()),
+                "source_name": f"MCP_{blk_clean}_SRC",
+            },
+            timeout_s=25.0,
+        )
         if not res.get("ok"):
             return False, res.get("error", "COM source import/compile failed."), res
 
-        compile_code = int(res.get("compile_code", 0))
         proj_dir_str = res.get("project_dir") or ""
         proj_dir = Path(proj_dir_str) if proj_dir_str else None
 
         should_set_lad = set_lad_language
-        if should_set_lad is None:
+        if should_set_lad is None and target_language is None:
             try:
                 from lad_converter import validate_lad_source
                 code_txt = awl_path.read_text(encoding="utf-8", errors="ignore")
@@ -3845,13 +3699,12 @@ try {{
             except Exception:
                 should_set_lad = False
 
+        lang_key = (target_language or ("LAD" if should_set_lad else "STL")).upper()
+        lang_code = STEP7_BLKLANG_CODES.get(lang_key, "00002" if should_set_lad else "00001")
+
         dbf_updated = 0
         if proj_dir and proj_dir.is_dir():
-            dbf_updated = _update_step7_subblk_language(
-                proj_dir,
-                blk_clean,
-                lang_code="00002" if should_set_lad else "00001",
-            )
+            dbf_updated = _update_step7_subblk_language(proj_dir, blk_clean, lang_code=lang_code)
             if dbf_updated == 0:
                 res["ok"] = False
                 res["compile_code"] = -1
@@ -3859,89 +3712,123 @@ try {{
                 res["error"] = err_msg
                 return False, err_msg, res
 
-        res["dbf_lad_records_updated"] = dbf_updated if should_set_lad else 0
-        res["block_language"] = "LAD" if (should_set_lad and dbf_updated > 0) else "STL"
-        return True, f"Compiled {awl_path.name} into {res.get('project_name')}/{blk_clean} via native STEP 7 COM.", res
+        res["dbf_lad_records_updated"] = dbf_updated if lang_key == "LAD" else 0
+        res["block_language"] = lang_key if (dbf_updated > 0 or not proj_dir) else "STL"
+        return True, f"Compiled {awl_path.name} into {res.get('project_name')}/{blk_clean} via persistent STEP 7 COM.", res
+
+    def copy_block(
+        self,
+        source_block: str,
+        target_block: str,
+        project_name: Optional[str] = None,
+        target_project: Optional[str] = None,
+    ) -> Tuple[bool, str, Dict[str, Any]]:
+        res = self.worker.call(
+            "copy_block",
+            {
+                "project_name": (project_name or "").strip(),
+                "target_project": (target_project or project_name or "").strip(),
+                "source_block": re.sub(r"\s+", "", source_block.strip().upper()),
+                "target_block": re.sub(r"\s+", "", target_block.strip().upper()),
+            },
+        )
+        if not res.get("ok"):
+            return False, res.get("error", "COM copy_block failed."), res
+        return True, f"Copied {source_block} to {target_block}.", res
+
+    def delete_block(self, block_name: str, project_name: Optional[str] = None) -> Tuple[bool, str, Dict[str, Any]]:
+        res = self.worker.call(
+            "delete_block",
+            {
+                "project_name": (project_name or "").strip(),
+                "block_name": re.sub(r"\s+", "", block_name.strip().upper()),
+            },
+        )
+        if not res.get("ok"):
+            return False, res.get("error", "COM delete_block failed."), res
+        return True, f"Deleted block {block_name}.", res
+
+    def import_station_cfg(
+        self,
+        cfg_path: Union[str, Path],
+        project_name: Optional[str] = None,
+        station_name: Optional[str] = None,
+    ) -> Tuple[bool, str, Dict[str, Any]]:
+        p = Path(cfg_path)
+        if not p.is_file():
+            return False, f"Station .cfg file not found: {p}", {}
+        res = self.worker.call(
+            "import_station_cfg",
+            {
+                "project_name": (project_name or "").strip(),
+                "station_name": (station_name or "").strip(),
+                "cfg_path": str(p.resolve()),
+            },
+            timeout_s=30.0,
+        )
+        if not res.get("ok"):
+            return False, res.get("error", "COM import_station_cfg failed."), res
+        return True, f"Imported hardware configuration {p.name}.", res
+
+    def export_station_cfg(
+        self,
+        output_path: Union[str, Path],
+        project_name: Optional[str] = None,
+        station_name: Optional[str] = None,
+    ) -> Tuple[bool, str, Dict[str, Any]]:
+        p = Path(output_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        res = self.worker.call(
+            "export_station_cfg",
+            {
+                "project_name": (project_name or "").strip(),
+                "station_name": (station_name or "").strip(),
+                "output_path": str(p.resolve()),
+            },
+            timeout_s=30.0,
+        )
+        if not res.get("ok"):
+            return False, res.get("error", "COM export_station_cfg failed."), res
+        return True, str(p), res
+
+    def download_blocks(
+        self,
+        block_names: Sequence[str],
+        project_name: Optional[str] = None,
+    ) -> Tuple[bool, str, Dict[str, Any]]:
+        cleaned = [re.sub(r"\s+", "", b.strip().upper()) for b in block_names]
+        res = self.worker.call(
+            "download_blocks",
+            {"project_name": (project_name or "").strip(), "blocks": cleaned},
+            timeout_s=30.0,
+        )
+        if not res.get("ok"):
+            return False, res.get("error", "COM download_blocks failed."), res
+        return True, f"Downloaded {len(cleaned)} block(s).", res
+
+    def upload_station(self, project_name: Optional[str] = None) -> Tuple[bool, str, Dict[str, Any]]:
+        res = self.worker.call("upload_station", {"project_name": (project_name or "").strip()}, timeout_s=30.0)
+        if not res.get("ok"):
+            return False, res.get("error", "COM upload_station failed."), res
+        return True, "Uploaded station from PLC.", res
 
     def open_block(self, block_name: str, project_name: Optional[str] = None) -> Tuple[bool, str]:
         blk_clean = re.sub(r"\s+", "", block_name.strip().upper())
-        proj_filter = (project_name or "").strip().replace("'", "''")
-        ps = f"""
-$s7 = New-Object -ComObject "Simatic.Simatic"
-$targetProj = '{proj_filter}'
-$blkName = '{blk_clean}'
-$foundBlock = $null
-$matchedProj = $null
-foreach ($p in $s7.Projects) {{
-  try {{
-    if ($targetProj -eq '' -or $p.Name -ieq $targetProj) {{
-      foreach ($prg in $p.Programs) {{
-        foreach ($c in $prg.Next) {{
-          if ($c.ConcreteType -eq 1138689 -or $c.Name -ieq 'Blocks' -or $c.Name -ieq 'Bausteine') {{
-            foreach ($b in $c.Next) {{
-              if (($b.Name -replace '\\s+','') -ieq $blkName) {{
-                $foundBlock = $b
-                $matchedProj = $p
-                break
-              }}
-            }}
-          }}
-          if ($null -ne $foundBlock) {{ break }}
-        }}
-        if ($null -ne $foundBlock) {{ break }}
-      }}
-      if ($null -ne $foundBlock -and ($targetProj -ne '' -or $p.Name -ieq 'TEST')) {{ break }}
-    }}
-  }} catch {{}}
-}}
-if ($null -eq $foundBlock) {{
-  @{{ ok = $false; error = "Block '$blkName' not found in STEP 7 COM project '$targetProj'." }} | ConvertTo-Json -Compress
-  exit
-}}
-$foundBlock.Edit()
-@{{ ok = $true; project_name = [string]$matchedProj.Name; block_name = [string]$foundBlock.Name }} | ConvertTo-Json -Compress
-"""
-        res = self._run_ps32_json(ps, timeout=15.0)
+        res = self.worker.call(
+            "open_block",
+            {"project_name": (project_name or "").strip(), "block_name": blk_clean},
+            timeout_s=15.0,
+        )
         if res.get("ok"):
             return True, f"Opened {blk_clean} in project '{res.get('project_name')}' via STEP 7 COM."
         return False, res.get("error", f"Failed to open {blk_clean} via COM.")
 
     def export_symbols(self, output_path: Path, project_name: Optional[str] = None) -> Tuple[bool, str]:
-        proj_filter = (project_name or "").strip().replace("'", "''")
-        out_resolved = str(output_path.resolve()).replace("'", "''")
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        if output_path.exists():
-            try:
-                output_path.unlink()
-            except Exception:
-                pass
-        ps = f"""
-$s7 = New-Object -ComObject "Simatic.Simatic"
-$s7.UnattendedServerMode = $true
-$targetProj = '{proj_filter}'
-$outFile = '{out_resolved}'
-$sym = $null
-foreach ($p in $s7.Projects) {{
-  try {{
-    if ($targetProj -eq '' -or $p.Name -ieq $targetProj) {{
-      foreach ($prg in $p.Programs) {{
-        if ($null -ne $prg.SymbolTable) {{
-          $sym = $prg.SymbolTable
-          break
-        }}
-      }}
-      if ($null -ne $sym -and ($targetProj -ne '' -or $p.Name -ieq 'TEST')) {{ break }}
-    }}
-  }} catch {{}}
-}}
-if ($null -eq $sym) {{
-  @{{ ok = $false; error = "SymbolTable not found in STEP 7 COM project '$targetProj'." }} | ConvertTo-Json -Compress
-  exit
-}}
-$sym.Export($outFile, 0)
-@{{ ok = [bool](Test-Path -LiteralPath $outFile); output_path = $outFile }} | ConvertTo-Json -Compress
-"""
-        res = self._run_ps32_json(ps)
+        res = self.worker.call(
+            "export_symbols",
+            {"project_name": (project_name or "").strip(), "output_path": str(output_path.resolve())},
+        )
         if res.get("ok") and output_path.is_file():
             return True, str(output_path)
         return False, res.get("error", "COM SymbolTable.Export failed.")
@@ -3949,40 +3836,14 @@ $sym.Export($outFile, 0)
     def import_symbols(self, input_path: Path, project_name: Optional[str] = None) -> Tuple[bool, str]:
         if not input_path.is_file():
             return False, f"Symbol file not found: {input_path}"
-        proj_filter = (project_name or "").strip().replace("'", "''")
-        in_resolved = str(input_path.resolve()).replace("'", "''")
-        ps = f"""
-$s7 = New-Object -ComObject "Simatic.Simatic"
-$s7.UnattendedServerMode = $true
-$targetProj = '{proj_filter}'
-$inFile = '{in_resolved}'
-$sym = $null
-$matchedProj = $null
-foreach ($p in $s7.Projects) {{
-  try {{
-    if ($targetProj -eq '' -or $p.Name -ieq $targetProj) {{
-      foreach ($prg in $p.Programs) {{
-        if ($null -ne $prg.SymbolTable) {{
-          $sym = $prg.SymbolTable
-          $matchedProj = $p
-          break
-        }}
-      }}
-      if ($null -ne $sym -and ($targetProj -ne '' -or $p.Name -ieq 'TEST')) {{ break }}
-    }}
-  }} catch {{}}
-}}
-if ($null -eq $sym) {{
-  @{{ ok = $false; error = "SymbolTable not found in STEP 7 COM project '$targetProj'." }} | ConvertTo-Json -Compress
-  exit
-}}
-$sym.Import($inFile, 1)
-@{{ ok = $true; project_name = [string]$matchedProj.Name }} | ConvertTo-Json -Compress
-"""
-        res = self._run_ps32_json(ps)
+        res = self.worker.call(
+            "import_symbols",
+            {"project_name": (project_name or "").strip(), "input_path": str(input_path.resolve())},
+        )
         if res.get("ok"):
             return True, f"Imported symbols from {input_path.name} into project '{res.get('project_name')}' via STEP 7 COM."
         return False, res.get("error", "COM SymbolTable.Import failed.")
+
 
 
 class S7CommLoopbackServer:
@@ -4194,11 +4055,28 @@ class S7RuntimeClient:
 
     def __init__(self, com_bridge: Optional[SimaticComBridge] = None) -> None:
         self.com_bridge = com_bridge or SimaticComBridge()
+        self.pool = S7ConnectionPool()
+        self.watch_monitor = WatchTableMonitor(self.pool)
 
     @staticmethod
-    def writes_enabled(confirm_live_write: bool = False) -> bool:
-        env_val = os.environ.get("S7_WRITES_ENABLED", "false").strip().lower()
-        return confirm_live_write or (env_val in ("1", "true", "yes", "on"))
+    def writes_enabled(
+        confirm_live_write: bool = False,
+        host: str = "127.0.0.1",
+        port: int = 102,
+    ) -> bool:
+        """Dual-guard safety check.
+
+        Physical PLCs and standard port-102 endpoints strictly require BOTH
+        ``confirm_live_write=True`` AND ``S7_WRITES_ENABLED=true`` (logical AND).
+        Explicit local ephemeral loopback test servers (127.0.0.1/localhost on non-102 ports)
+        and ``virtual`` PLC targets permit ``confirm_live_write=True`` directly.
+        """
+        env_enabled = os.environ.get("S7_WRITES_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+        h = (host or "").strip().lower()
+        is_local_test_loopback = (h in ("127.0.0.1", "localhost", "virtual", "loopback") and int(port) != 102) or h == "virtual"
+        if is_local_test_loopback:
+            return bool(confirm_live_write)
+        return bool(confirm_live_write) and env_enabled
 
     def resolve_address(
         self,
@@ -4519,13 +4397,15 @@ $state = $psim.GetState()
         project_name: Optional[str] = None,
         symbols: Optional[Any] = None,
     ) -> Dict[str, Any]:
-        if not self.writes_enabled(confirm_live_write):
+        if not self.writes_enabled(confirm_live_write, host=host, port=port):
             return {
                 "ok": False,
                 "status": "WRITE_GUARDRAIL_BLOCKED",
+                "failure_category": FailureCategory.WRITE_GUARDRAIL_BLOCKED.value,
                 "error": (
-                    "Live PLC runtime writes are disabled by default for industrial safety. "
-                    "Pass confirm_live_write=True or set environment variable S7_WRITES_ENABLED=true."
+                    "Live PLC runtime writes are disabled by strict dual-guard safety policy. "
+                    "Both confirm_live_write=True AND environment variable S7_WRITES_ENABLED=true are required "
+                    "(ephemeral local loopback test ports require confirm_live_write=True)."
                 ),
             }
 
@@ -4648,28 +4528,18 @@ $state = $psim.GetState()
         raise ValueError(f"Unsupported data_size: {data_size}")
 
     def _plcsim_read(self, spec: Dict[str, Any]) -> Dict[str, Any]:
-        # S7ProSim PointDataTypeConstants: S7_Bit=1, S7_Byte=2, S7_Word=3, S7_DoubleWord=4
-        dtype_const = {"BIT": 1, "BYTE": 2, "WORD": 3, "INT": 3, "DWORD": 4, "DINT": 4, "REAL": 4}[spec["data_size"]]
-        area = spec["area"]
-        byte_idx = spec["byte_offset"]
-        bit_idx = spec["bit_offset"]
-        db_num = spec["db_number"]
-
-        if area == "Q":
-            call_expr = f"$v = $null; $psim.ReadOutputPoint({byte_idx}, {bit_idx}, {dtype_const}, [ref]$v)"
-        elif area == "M":
-            call_expr = f"$v = $null; $psim.ReadFlagValue({byte_idx}, {bit_idx}, {dtype_const}, [ref]$v)"
-        elif area == "DB":
-            call_expr = f"$v = $null; $psim.ReadDataBlockValue({db_num}, {byte_idx}, {bit_idx}, {dtype_const}, [ref]$v)"
-        else:
-            return {"ok": False, "error": f"PLCSIM S7ProSim does not support reading area '{area}' without active CPU connection."}
-
-        ps = f"""
-$psim = New-Object -ComObject "S7wspsmx.S7ProSim.1"
-{call_expr}
-@{{ ok = $true; value = $v; state = [string]$psim.GetState() }} | ConvertTo-Json -Compress
-"""
-        res = self.com_bridge._run_ps32_json(ps, timeout=8.0)
+        """Reads Q, M, DB, or I process image values via persistent S7ProSim COM worker with exact IEEE-754 REAL decoding."""
+        res = self.com_bridge.worker.call(
+            "plcsim_read",
+            {
+                "area": spec["area"],
+                "byte_offset": spec["byte_offset"],
+                "bit_offset": spec["bit_offset"],
+                "db_number": spec["db_number"],
+                "data_size": spec["data_size"],
+            },
+            timeout_s=8.0,
+        )
         if not res.get("ok"):
             return {"ok": False, "error": f"PLCSIM read failed: {res.get('error')}"}
         return {
@@ -4683,30 +4553,22 @@ $psim = New-Object -ComObject "S7wspsmx.S7ProSim.1"
         }
 
     def _plcsim_write(self, spec: Dict[str, Any], value: Any) -> Dict[str, Any]:
-        area = spec["area"]
-        byte_idx = spec["byte_offset"]
-        bit_idx = spec["bit_offset"]
-        db_num = spec["db_number"]
-        if spec["data_size"] == "BIT":
-            val_expr = "$true" if self._encode_value(value, "BIT")[0] else "$false"
-        else:
-            val_expr = str(int(value))
-
-        if area == "I":
-            call_expr = f"$v = [object]({val_expr}); $psim.WriteInputPoint({byte_idx}, {bit_idx}, [ref]$v)"
-        elif area == "M":
-            call_expr = f"$v = [object]({val_expr}); $psim.WriteFlagValue({byte_idx}, {bit_idx}, [ref]$v)"
-        elif area == "DB":
-            call_expr = f"$v = [object]({val_expr}); $psim.WriteDataBlockValue({db_num}, {byte_idx}, {bit_idx}, [ref]$v)"
-        else:
-            return {"ok": False, "error": f"PLCSIM S7ProSim does not support writing area '{area}'."}
-
-        ps = f"""
-$psim = New-Object -ComObject "S7wspsmx.S7ProSim.1"
-{call_expr}
-@{{ ok = $true; state = [string]$psim.GetState() }} | ConvertTo-Json -Compress
-"""
-        res = self.com_bridge._run_ps32_json(ps, timeout=8.0)
+        """Writes I, M, or DB values via persistent S7ProSim COM worker with exact IEEE-754 REAL float preservation."""
+        val_to_send = float(value) if spec["data_size"] == "REAL" else (
+            bool(self._encode_value(value, "BIT")[0]) if spec["data_size"] == "BIT" else int(value)
+        )
+        res = self.com_bridge.worker.call(
+            "plcsim_write",
+            {
+                "area": spec["area"],
+                "byte_offset": spec["byte_offset"],
+                "bit_offset": spec["bit_offset"],
+                "db_number": spec["db_number"],
+                "data_size": spec["data_size"],
+                "value": val_to_send,
+            },
+            timeout_s=8.0,
+        )
         if not res.get("ok"):
             return {"ok": False, "error": f"PLCSIM write failed: {res.get('error')}"}
         return {
@@ -4716,9 +4578,103 @@ $psim = New-Object -ComObject "S7wspsmx.S7ProSim.1"
             "address": spec["canonical"],
             "symbol": spec.get("resolved_symbol"),
             "data_size": spec["data_size"],
-            "written_value": value,
+            "written_value": val_to_send,
             "cpu_state": res.get("state"),
         }
+
+    def batch_read(
+        self,
+        items: Sequence[Dict[str, Any]],
+        host: str = "127.0.0.1",
+        port: int = 102,
+        rack: int = 0,
+        slot: int = 2,
+        project_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        resolved: List[Dict[str, Any]] = []
+        for it in items:
+            raw_addr = it if isinstance(it, str) else str(it.get("address") or it.get("symbol") or "")
+            dt = None if isinstance(it, str) else it.get("data_type")
+            sym = None if isinstance(it, str) else it.get("symbol")
+            spec, err = self.resolve_address(raw_addr, project_name=project_name)
+            if spec is not None and not err:
+                resolved.append({
+                    "address": spec["canonical"].replace(" ", ""),
+                    "data_type": dt or ("BOOL" if spec["data_size"] == "BIT" else spec["data_size"]),
+                    "symbol": sym or spec.get("resolved_symbol"),
+                })
+            else:
+                resolved.append({"address": raw_addr.replace(" ", ""), "data_type": dt, "symbol": sym})
+        return self.pool.batch_read(host=host, items=resolved, port=port, rack=rack, slot=slot)
+
+    def batch_write(
+        self,
+        items: Sequence[Dict[str, Any]],
+        host: str = "127.0.0.1",
+        port: int = 102,
+        rack: int = 0,
+        slot: int = 2,
+        confirm_live_write: bool = False,
+        project_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if not self.writes_enabled(confirm_live_write, host=host, port=port):
+            return {
+                "ok": False,
+                "status": "WRITE_GUARDRAIL_BLOCKED",
+                "failure_category": FailureCategory.WRITE_GUARDRAIL_BLOCKED.value,
+                "error": (
+                    "Batch live PLC write blocked by strict dual-guard safety policy. "
+                    "Requires BOTH confirm_live_write=True AND S7_WRITES_ENABLED=true."
+                ),
+            }
+        resolved: List[Dict[str, Any]] = []
+        for it in items:
+            raw_addr = str(it.get("address") or it.get("symbol") or "")
+            dt = it.get("data_type")
+            spec, err = self.resolve_address(raw_addr, project_name=project_name)
+            if spec is not None and not err:
+                resolved.append({
+                    "address": spec["canonical"].replace(" ", ""),
+                    "data_type": dt or ("BOOL" if spec["data_size"] == "BIT" else spec["data_size"]),
+                    "value": it.get("value"),
+                    "symbol": it.get("symbol") or spec.get("resolved_symbol"),
+                })
+            else:
+                resolved.append({
+                    "address": raw_addr.replace(" ", ""),
+                    "data_type": dt,
+                    "value": it.get("value"),
+                    "symbol": it.get("symbol"),
+                })
+        return self.pool.batch_write(host=host, items=resolved, port=port, rack=rack, slot=slot)
+
+    def read_cpu_diagnostics(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 102,
+        rack: int = 0,
+        slot: int = 2,
+    ) -> Dict[str, Any]:
+        return self.pool.read_szl_diagnostics(host=host, port=port, rack=rack, slot=slot)
+
+    def cpu_control(
+        self,
+        action: str,
+        host: str = "127.0.0.1",
+        port: int = 102,
+        rack: int = 0,
+        slot: int = 2,
+        confirm_live_write: bool = False,
+    ) -> Dict[str, Any]:
+        if not self.writes_enabled(confirm_live_write, host=host, port=port):
+            return {
+                "ok": False,
+                "status": "WRITE_GUARDRAIL_BLOCKED",
+                "failure_category": FailureCategory.WRITE_GUARDRAIL_BLOCKED.value,
+                "error": "Remote CPU RUN/STOP control requires BOTH confirm_live_write=True AND S7_WRITES_ENABLED=true.",
+            }
+        return self.pool.cpu_control(host=host, action=action, port=port, rack=rack, slot=slot)
+
 
 
 # ============================================================================
@@ -5775,6 +5731,96 @@ mcp = FastMCP(
 
 controller = SimaticManagerController()
 
+# Production-grade safety posture, audit trail, HW stations registry & deterministic Virtual S7 PLC
+ACTIVE_ACCESS_MODE: AccessMode = resolve_access_mode()
+AUDIT_LOGGER: AuditLogger = AuditLogger(WORKSPACE_DIR / "audit.jsonl")
+HW_STATIONS: Dict[str, StationHardwareConfig] = {}
+VIRTUAL_PLC: VirtualS7PLC = VirtualS7PLC()
+
+
+def set_access_mode(mode: Union[AccessMode, str]) -> AccessMode:
+    global ACTIVE_ACCESS_MODE
+    ACTIVE_ACCESS_MODE = mode if isinstance(mode, AccessMode) else resolve_access_mode(str(mode))
+    return ACTIVE_ACCESS_MODE
+
+
+def _check_access_mode(tool_name: str, required: AccessMode = AccessMode.READ_WRITE) -> Optional[str]:
+    """Returns a canonical JSON error string if ACTIVE_ACCESS_MODE forbids this operation, else None."""
+    rank = {AccessMode.READ_ONLY: 0, AccessMode.READ_WRITE: 1, AccessMode.FULL: 2}
+    if rank[ACTIVE_ACCESS_MODE] < rank[required]:
+        msg = (
+            f"Tool '{tool_name}' requires access mode '{required.value}', "
+            f"but server is running in '{ACTIVE_ACCESS_MODE.value}' mode."
+        )
+        AUDIT_LOGGER.record(
+            tool=tool_name,
+            action="access_check",
+            success=False,
+            status="ACCESS_DENIED",
+            failure_category=FailureCategory.ACCESS_DENIED.value,
+            details={"current_mode": ACTIVE_ACCESS_MODE.value, "required_mode": required.value},
+        )
+        return json.dumps(
+            {
+                "success": False,
+                "status": "ACCESS_DENIED",
+                "failure_category": FailureCategory.ACCESS_DENIED.value,
+                "access_mode": ACTIVE_ACCESS_MODE.value,
+                "required_mode": required.value,
+                "error": msg,
+            },
+            indent=2,
+        )
+    return None
+
+
+def _check_optimistic_hash(
+    tool_name: str,
+    target: str,
+    expected_content_hash: Optional[str],
+    current_content: Optional[str],
+    prefix: str = "awl",
+) -> Optional[str]:
+    """Validates expected_content_hash against current content; returns JSON error with state_changed on mismatch."""
+    if not expected_content_hash:
+        return None
+    actual_hash = compute_content_hash(prefix, current_content or "")
+    if expected_content_hash.strip() != actual_hash:
+        AUDIT_LOGGER.record(
+            tool=tool_name,
+            action="optimistic_lock",
+            target=target,
+            success=False,
+            status="STATE_CHANGED",
+            content_hash=actual_hash,
+            failure_category=FailureCategory.STATE_CHANGED.value,
+            details={"expected_content_hash": expected_content_hash, "actual_content_hash": actual_hash},
+        )
+        return json.dumps(
+            {
+                "success": False,
+                "status": "STATE_CHANGED",
+                "failure_category": FailureCategory.STATE_CHANGED.value,
+                "target": target,
+                "expected_content_hash": expected_content_hash,
+                "actual_content_hash": actual_hash,
+                "error": (
+                    f"Target '{target}' changed since last read. Re-read the block and retry with "
+                    f"expected_content_hash='{actual_hash}'."
+                ),
+            },
+            indent=2,
+        )
+    return None
+
+
+def _get_or_create_station(station_name: str = "SIMATIC 300(1)", plc_family: str = "S7-300") -> StationHardwareConfig:
+    key = station_name.strip() or "SIMATIC 300(1)"
+    if key not in HW_STATIONS:
+        HW_STATIONS[key] = StationHardwareConfig(station_name=key, plc_family=plc_family.upper())
+    return HW_STATIONS[key]
+
+
 
 def serialized_gui(function):
     """Protects SIMATIC Manager GUI operations from concurrent interleaved access."""
@@ -6033,6 +6079,7 @@ def s7_write_program(
     run_compile_and_check: bool = True,
     auto_fix_mnemonics: bool = False,
     mnemonic_language: str = "International",
+    expected_content_hash: Optional[str] = None,
 ) -> str:
     """
     Validates, backs up, imports, compiles, checks, and reads back an S7 program block.
@@ -6050,7 +6097,12 @@ def s7_write_program(
         run_compile_and_check: Must be True; compilation and block checks are mandatory.
         auto_fix_mnemonics: If True, translates foreign or cross-language mnemonics.
         mnemonic_language: 'International' or 'German'.
+        expected_content_hash: Optional SHA-256 content_hash from prior read for optimistic concurrency control.
     """
+    denied = _check_access_mode("s7_write_program", AccessMode.READ_WRITE)
+    if denied:
+        return denied
+
     controller.import_started = False
     GUI_ACTIVE_WRITE.clear()
 
@@ -6064,6 +6116,21 @@ def s7_write_program(
     profile, profile_error = resolve_s7_plc_profile(plc_type)
     if profile_error or profile is None:
         return json.dumps({"status": "REJECTED_BEFORE_WRITE", "error": profile_error}, indent=2)
+
+    if expected_content_hash:
+        prior = json.loads(s7_read_program(block_name=block_name))
+        if prior.get("success") and prior.get("content_hash") and prior["content_hash"] != expected_content_hash:
+            return json.dumps(
+                {
+                    "success": False,
+                    "status": "STATE_CHANGED",
+                    "failure_category": FailureCategory.STATE_CHANGED.value,
+                    "expected_content_hash": expected_content_hash,
+                    "actual_content_hash": prior["content_hash"],
+                    "error": f"Block '{block_name}' changed since last read.",
+                },
+                indent=2,
+            )
 
     symbols_to_use = symbols if symbols is not None else (symbol_table if symbol_table is not None else device_comments)
 
@@ -6312,6 +6379,7 @@ def s7_read_program(block_name: str = "OB1") -> str:
                 if not parsed.get("error"):
                     parsed["success"] = True
                     parsed["mode"] = "gui"
+                    parsed["content_hash"] = compute_content_hash("awl", export_path.read_text(encoding="utf-8", errors="ignore"))
                     return json.dumps(parsed, indent=2)
 
     # If GUI export was not possible, attempt direct COM export before offline files
@@ -6327,6 +6395,7 @@ def s7_read_program(block_name: str = "OB1") -> str:
             if not parsed.get("error"):
                 parsed["success"] = True
                 parsed["mode"] = "com"
+                parsed["content_hash"] = compute_content_hash("awl", com_export_path.read_text(encoding="utf-8", errors="ignore"))
                 return json.dumps(parsed, indent=2)
 
     blk_clean = block_name.strip().upper()
@@ -6353,6 +6422,7 @@ def s7_read_program(block_name: str = "OB1") -> str:
             return json.dumps({"success": False, "error": parsed["error"]}, indent=2)
         parsed["success"] = True
         parsed["mode"] = "offline"
+        parsed["content_hash"] = compute_content_hash("awl", blk_file.read_text(encoding="utf-8", errors="ignore"))
         return json.dumps(parsed, indent=2)
 
     err = (
@@ -7035,7 +7105,7 @@ def s7_com_list_blocks(project_name: Optional[str] = None) -> str:
     }, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, title="Read Block via COM"))
 def s7_com_read_block(
     block_name: str = "OB1",
     project_name: Optional[str] = None,
@@ -7046,25 +7116,36 @@ def s7_com_read_block(
 
     Args:
         block_name: Block identifier such as 'OB1', 'FC10', 'FB5', 'DB1'.
-        project_name: Optional STEP 7 project name (e.g. 'TEST').
+        project_name: Optional STEP 7 project name.
     """
     bridge = getattr(controller, "com_bridge", None) or SimaticComBridge()
     eff_proj = project_name or (None if controller._is_offline_workspace_project() else controller.project_name)
-    export_path = new_s7_artifact_path(f"{re.sub(r'\\s+', '', block_name.lower())}-com-read")
+    safe_blk = re.sub(r"\s+", "", block_name.lower())
+    export_path = new_s7_artifact_path(f"{safe_blk}-com-read")
     ok, msg = bridge.export_block_to_awl(block_name=block_name, output_path=export_path, project_name=eff_proj)
     if not ok:
-        return json.dumps({"success": False, "error": msg, "block_name": block_name, "project_name": eff_proj}, indent=2)
+        return json.dumps(
+            {
+                "success": False,
+                "failure_category": FailureCategory.TARGET_NOT_FOUND.value,
+                "error": msg,
+                "block_name": block_name,
+                "project_name": eff_proj,
+            },
+            indent=2,
+        )
 
     raw_awl = export_path.read_text(encoding="utf-8", errors="ignore")
     parsed = parse_s7_awl_source(export_path)
     parsed["success"] = True
     parsed["mode"] = "native_com"
     parsed["exported_awl_path"] = str(export_path)
+    parsed["content_hash"] = compute_content_hash("awl", raw_awl)
     parsed["raw_awl"] = raw_awl
     return json.dumps(parsed, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=make_tool_annotations(read_only=False, destructive=False, idempotent=True, title="Write Block via COM"))
 def s7_com_write_block(
     block_name: str = "OB1",
     source_code: Optional[str] = None,
@@ -7074,24 +7155,21 @@ def s7_com_write_block(
     project_name: Optional[str] = None,
     convert_to_lad: bool = True,
     plc_type: str = "S7-300",
+    expected_content_hash: Optional[str] = None,
 ) -> str:
     """
     Compiles and writes a block (OB, FC, FB, DB) directly into a STEP 7 project using the native
     Siemens STEP 7 Command Interface (IS7Source.Compile in UnattendedServerMode) with automatic
-    backup, AST Ladder normalization, SUBBLK.DBF BLKLANG='00002' (LAD) tagging, and readback verification.
-
-    Args:
-        block_name: Target block name (e.g. 'OB1', 'FC10', 'FB5').
-        source_code: Optional raw AWL/STL source code string.
-        awl_code: Optional alias for source_code.
-        networks: Optional network list or instruction list if source_code is not provided.
-        awl_source_path: Optional path to an existing .awl file.
-        project_name: Optional STEP 7 project name (e.g. 'TEST').
-        convert_to_lad: If True (default), compiles through the AST Contact Graph LAD compiler and sets BLKLANG='00002' (LAD).
-        plc_type: Target PLC family ('S7-300', 'S7-400', 'WinAC').
+    backup, AST Ladder normalization, optimistic concurrency check, SUBBLK.DBF BLKLANG tagging,
+    audit trail logging, and readback verification.
     """
+    denied = _check_access_mode("s7_com_write_block", AccessMode.READ_WRITE)
+    if denied:
+        return denied
+
     from lad_converter import convert_awl_to_pure_lad, validate_lad_source
 
+    t0 = time.perf_counter()
     bridge = getattr(controller, "com_bridge", None) or SimaticComBridge()
     eff_proj = project_name or (None if controller._is_offline_workspace_project() else controller.project_name)
     blk_clean = re.sub(r"\s+", "", block_name.strip().upper())
@@ -7110,6 +7188,7 @@ def s7_com_write_block(
             return json.dumps({
                 "success": False,
                 "status": "REJECTED_BEFORE_WRITE",
+                "failure_category": FailureCategory.VALIDATION_ERROR.value,
                 "errors": report.errors,
                 "warnings": report.warnings,
             }, indent=2)
@@ -7127,6 +7206,7 @@ def s7_com_write_block(
         return json.dumps({
             "success": False,
             "status": "REJECTED_BEFORE_WRITE",
+            "failure_category": FailureCategory.VALIDATION_ERROR.value,
             "error": "Provide source_code, networks, or awl_source_path.",
         }, indent=2)
 
@@ -7141,6 +7221,7 @@ def s7_com_write_block(
             return json.dumps({
                 "success": False,
                 "status": "REJECTED_BEFORE_WRITE",
+                "failure_category": FailureCategory.VALIDATION_ERROR.value,
                 "errors": pre_report.errors,
                 "warnings": pre_report.warnings,
             }, indent=2)
@@ -7150,9 +7231,14 @@ def s7_com_write_block(
 
     lad_report = validate_lad_source(candidate_code)
 
-    # 2. Take pre-modification backup via COM GenerateSource (if block already exists)
+    # 2. Take pre-modification backup via COM GenerateSource (if block already exists) + optimistic hash check
     backup_path = new_s7_artifact_path(f"{blk_clean.lower()}-com-before")
     has_existing_backup, _ = bridge.export_block_to_awl(blk_clean, backup_path, project_name=eff_proj)
+    if expected_content_hash and has_existing_backup and backup_path.is_file():
+        current_txt = backup_path.read_text(encoding="utf-8", errors="ignore")
+        mismatch = _check_optimistic_hash("s7_com_write_block", blk_clean, expected_content_hash, current_txt, prefix="awl")
+        if mismatch:
+            return mismatch
 
     def _restore_com_backup() -> Dict[str, Any]:
         if not has_existing_backup or not backup_path.is_file():
@@ -7174,9 +7260,19 @@ def s7_com_write_block(
     )
     if not comp_ok:
         rollback_info = _restore_com_backup()
+        AUDIT_LOGGER.record(
+            tool="s7_com_write_block",
+            action="compile",
+            target=blk_clean,
+            success=False,
+            status="BUILD_FAILED",
+            failure_category=FailureCategory.COMPILE_FAILED.value,
+            latency_ms=(time.perf_counter() - t0) * 1000.0,
+        )
         return json.dumps({
             "success": False,
             "status": "BUILD_FAILED",
+            "failure_category": FailureCategory.COMPILE_FAILED.value,
             "error": comp_msg,
             "details": comp_meta,
             "backup_awl": str(backup_path) if has_existing_backup else None,
@@ -7191,11 +7287,22 @@ def s7_com_write_block(
         return json.dumps({
             "success": False,
             "status": "READBACK_FAILED",
+            "failure_category": FailureCategory.READBACK_MISMATCH.value,
             "error": ver_msg,
             "backup_awl": str(backup_path) if has_existing_backup else None,
             "rollback": rollback_info,
         }, indent=2)
 
+    new_hash = compute_content_hash("awl", verify_path.read_text(encoding="utf-8", errors="ignore"))
+    AUDIT_LOGGER.record(
+        tool="s7_com_write_block",
+        action="write_compile",
+        target=f"{comp_meta.get('project_name', eff_proj)}/{blk_clean}",
+        success=True,
+        status="SUCCESS",
+        content_hash=new_hash,
+        latency_ms=(time.perf_counter() - t0) * 1000.0,
+    )
     return json.dumps({
         "success": True,
         "status": "SUCCESS",
@@ -7207,6 +7314,7 @@ def s7_com_write_block(
         "total_networks": lad_report.total_networks,
         "compile_code": comp_meta.get("compile_code", 0),
         "dbf_lad_records_updated": comp_meta.get("dbf_lad_records_updated", 0),
+        "content_hash": new_hash,
         "artifacts": {
             "before_awl": str(backup_path) if has_existing_backup else None,
             "after_awl": str(after_path),
@@ -7215,7 +7323,7 @@ def s7_com_write_block(
     }, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, title="Ping S7 PLC or PLCSIM"))
 def s7_runtime_ping(
     host: str = "127.0.0.1",
     ip_address: Optional[str] = None,
@@ -7226,13 +7334,6 @@ def s7_runtime_ping(
     """
     Pings a live Siemens S7-300/400/WinAC PLC over ISO-on-TCP (RFC 1006 / S7comm Port 102)
     or local S7-PLCSIM via the S7ProSim COM interface.
-
-    Args:
-        host: PLC IP address, hostname, or 'plcsim' (default: '127.0.0.1').
-        ip_address: Optional alias for host.
-        port: S7comm TCP port (default: 102).
-        rack: CPU rack number (default: 0).
-        slot: CPU slot number (default: 2 for S7-300).
     """
     eff_host = ip_address or host
     res = runtime_client.ping(host=eff_host, port=port, rack=rack, slot=slot)
@@ -7240,7 +7341,7 @@ def s7_runtime_ping(
     return json.dumps(res, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, title="Read Live PLC Memory"))
 def s7_runtime_read(
     address: str,
     data_type: Optional[str] = None,
@@ -7253,18 +7354,7 @@ def s7_runtime_read(
 ) -> str:
     """
     Reads a live register, bit, word, dword, or float from a running S7 PLC or PLCSIM.
-    Accepts physical S7 addresses ('I 0.0', 'Q 0.0', 'M 10.0', 'MW 10', 'MD 20', 'DB1.DBX 0.0', 'DB1.DBW 2')
-    OR symbolic tag names ('START_PB', 'ELEVATOR_UP') resolved automatically from the project symbol table.
-
-    Args:
-        address: Physical S7 address or symbolic tag name.
-        data_type: Optional type interpretation override ('BIT', 'BYTE', 'WORD', 'INT', 'DWORD', 'DINT', 'REAL').
-        host: PLC IP address or 'plcsim' (default: '127.0.0.1').
-        ip_address: Optional alias for host.
-        port: S7comm TCP port (default: 102).
-        rack: CPU rack number (default: 0).
-        slot: CPU slot number (default: 2).
-        project_name: Optional project name for symbol table resolution.
+    Accepts physical S7 addresses or symbolic tag names resolved from the symbol table.
     """
     eff_host = ip_address or host
     res = runtime_client.read_memory(
@@ -7280,7 +7370,7 @@ def s7_runtime_read(
     return json.dumps(res, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=make_tool_annotations(read_only=False, destructive=True, open_world=True, title="Write Live PLC Memory"))
 def s7_runtime_write(
     address: str,
     value: Any,
@@ -7295,20 +7385,13 @@ def s7_runtime_write(
 ) -> str:
     """
     Writes a value to a live S7 PLC or PLCSIM memory address or symbolic tag.
-    Protected by industrial safety guardrails: requires confirm_live_write=True or S7_WRITES_ENABLED=true.
-
-    Args:
-        address: Physical S7 address ('I 0.0', 'M 10.0', 'MW 10', 'DB1.DBW 0') or symbol name.
-        value: Value to write (bool/int/float).
-        data_type: Optional type interpretation override ('BIT', 'BYTE', 'WORD', 'INT', 'DWORD', 'DINT', 'REAL').
-        host: PLC IP address or 'plcsim' (default: '127.0.0.1').
-        ip_address: Optional alias for host.
-        port: S7comm TCP port (default: 102).
-        rack: CPU rack number (default: 0).
-        slot: CPU slot number (default: 2).
-        confirm_live_write: Must be True (or S7_WRITES_ENABLED=true) to authorize live PLC memory modification.
-        project_name: Optional project name for symbol table resolution.
+    Protected by strict industrial dual-guard: remote & port-102 PLCs require BOTH
+    confirm_live_write=True AND S7_WRITES_ENABLED=true.
     """
+    denied = _check_access_mode("s7_runtime_write", AccessMode.READ_WRITE)
+    if denied:
+        return denied
+
     eff_host = ip_address or host
     res = runtime_client.write_memory(
         address_or_symbol=address,
@@ -7322,12 +7405,1279 @@ def s7_runtime_write(
         project_name=project_name or controller.project_name,
     )
     res["success"] = bool(res.get("ok"))
+    AUDIT_LOGGER.record(
+        tool="s7_runtime_write",
+        action="write_memory",
+        target=f"{eff_host}:{port}/{address}",
+        success=res["success"],
+        status=res.get("status", "SUCCESS" if res["success"] else "FAILED"),
+        failure_category=res.get("failure_category"),
+        details={"value": value, "data_type": data_type},
+    )
     return json.dumps(res, indent=2)
 
 
 # ============================================================================
-# 9. SERVER ENTRY POINT
+# 8B. DIAGNOSTICS, AI IDE CONFIG, DIN-RAIL HW CONFIG, ALL IEC 61131-3,
+#     PROJECT TREE, PLCSIM / VIRTUAL PLC & HIGH-SPEED BATCH MONITORING TOOLS
 # ============================================================================
 
-if __name__ == "__main__":
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, title="Environment Doctor"))
+def s7_doctor() -> str:
+    """
+    Runs a comprehensive readiness diagnostic of the SIMATIC STEP 7 Classic MCP server:
+    Python runtime, MCP SDK, STEP 7 binaries, persistent 32-bit COM worker, native C++ bridge,
+    workspace permissions, hardware catalog size, and safety posture.
+    """
+    rep = run_doctor(
+        server_script=Path(__file__).resolve(),
+        workspace_dir=WORKSPACE_DIR,
+        audit_log_path=AUDIT_LOGGER.log_path,
+        access_mode=ACTIVE_ACCESS_MODE,
+    )
+    rep["success"] = bool(rep.get("ok"))
+    return json.dumps(rep, indent=2)
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, title="Generate AI Client MCP Config"))
+def s7_generate_client_config(
+    client: str = "all",
+    mode: str = "read-write",
+    writes_enabled: bool = False,
+) -> str:
+    """
+    Generates drop-in MCP client configurations for VS Code (.vscode/mcp.json),
+    Google Antigravity (mcp_config.json), OpenAI Codex (~/.codex/config.toml),
+    and Claude Code (.mcp.json + CLI command).
+    """
+    try:
+        res = generate_client_config(
+            client=client,
+            server_script=Path(__file__).resolve(),
+            mode=mode,
+            writes_enabled=writes_enabled,
+        )
+        res["success"] = True
+        return json.dumps(res, indent=2)
+    except Exception as exc:
+        return json.dumps(
+            {"success": False, "failure_category": FailureCategory.VALIDATION_ERROR.value, "error": str(exc)},
+            indent=2,
+        )
+
+
+# --- Hardware Configuration & DIN Rail Assembly ---
+
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, title="Search Siemens Hardware Catalog"))
+def s7_hw_catalog_search(
+    query: str = "",
+    family: Optional[str] = None,
+    category: Optional[str] = None,
+    limit: int = 25,
+) -> str:
+    """
+    Searches the built-in Siemens STEP 7 Classic MLFB hardware catalog (S7-300, S7-400, ET200M, WinAC)
+    for mounting rails, power supplies (PS), CPUs, interface modules (IM), DI/DO/AI/AO signal modules,
+    communication processors (CP), and function modules (FM).
+    """
+    matches = search_hardware_catalog(query=query, family=family, category=category, max_results=limit)
+    return json.dumps(
+        {
+            "success": True,
+            "count": len(matches),
+            "catalog_total": len(S7_HARDWARE_CATALOG),
+            "modules": matches,
+        },
+        indent=2,
+    )
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=False, idempotent=True, title="Configure Station & DIN Rail"))
+def s7_hw_configure_station(
+    station_name: str = "SIMATIC 300(1)",
+    plc_family: str = "S7-300",
+    modules: Optional[List[Dict[str, Any]]] = None,
+    step7_version: str = "V5.6",
+) -> str:
+    """
+    Creates or replaces a complete SIMATIC 300/400/WinAC station hardware configuration and populates
+    its DIN rail / racks with modules (PS, CPU, IM, DI, DO, AI, AO, CP, FM).
+    Automatically assigns non-overlapping I/O byte addresses and validates slot rules & backplane power budget.
+    """
+    denied = _check_access_mode("s7_hw_configure_station", AccessMode.READ_WRITE)
+    if denied:
+        return denied
+
+    cfg = StationHardwareConfig(
+        station_name=station_name,
+        plc_family=plc_family.upper(),
+        step7_version=step7_version,
+    )
+    add_errors: List[str] = []
+    for mod in modules or []:
+        ok, _, err = cfg.add_module(
+            rack=int(mod.get("rack", 0)),
+            slot=int(mod["slot"]),
+            module=str(mod.get("mlfb") or mod.get("module") or mod.get("name") or ""),
+            input_start=mod.get("input_start"),
+            output_start=mod.get("output_start"),
+            ip_address=mod.get("ip_address"),
+            subnet_mask=mod.get("subnet_mask"),
+            mpi_address=mod.get("mpi_address"),
+            profibus_address=mod.get("profibus_address"),
+            subnet_ref=mod.get("subnet_ref"),
+            parameters=mod.get("parameters"),
+        )
+        if not ok and err:
+            add_errors.append(err)
+
+    HW_STATIONS[cfg.station_name] = cfg
+    validation = cfg.validate()
+    cfg_text = cfg.generate_cfg()
+    return json.dumps(
+        {
+            "success": len(add_errors) == 0 and validation["valid"],
+            "station_name": cfg.station_name,
+            "plc_family": cfg.plc_family,
+            "add_errors": add_errors,
+            "validation": validation,
+            "station": cfg.to_dict(),
+            "content_hash": compute_content_hash("cfg", cfg_text),
+        },
+        indent=2,
+    )
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=False, idempotent=True, title="Add Module to DIN Rail"))
+def s7_hw_add_module(
+    slot: int,
+    module: str,
+    station_name: str = "SIMATIC 300(1)",
+    plc_family: str = "S7-300",
+    rack: int = 0,
+    input_start: Optional[int] = None,
+    output_start: Optional[int] = None,
+    ip_address: Optional[str] = None,
+    subnet_mask: Optional[str] = None,
+    mpi_address: Optional[int] = None,
+    profibus_address: Optional[int] = None,
+    replace: bool = True,
+) -> str:
+    """
+    Snaps a Siemens module (by MLFB like '6ES7 321-1BH02-0AA0' or alias like 'DI16xDC24V', 'CPU 315-2 PN/DP', 'PS 307 5A')
+    onto a specific rack and DIN-rail slot, auto-assigning I/O addresses and validating rules.
+    """
+    denied = _check_access_mode("s7_hw_add_module", AccessMode.READ_WRITE)
+    if denied:
+        return denied
+
+    cfg = _get_or_create_station(station_name, plc_family)
+    ok, placed, err = cfg.add_module(
+        rack=rack,
+        slot=slot,
+        module=module,
+        input_start=input_start,
+        output_start=output_start,
+        ip_address=ip_address,
+        subnet_mask=subnet_mask,
+        mpi_address=mpi_address,
+        profibus_address=profibus_address,
+        replace=replace,
+    )
+    if not ok:
+        return json.dumps(
+            {
+                "success": False,
+                "failure_category": FailureCategory.HW_CONFIG_ERROR.value,
+                "error": err,
+                "station_name": cfg.station_name,
+            },
+            indent=2,
+        )
+    validation = cfg.validate()
+    return json.dumps(
+        {
+            "success": True,
+            "station_name": cfg.station_name,
+            "module": placed.to_dict() if placed else None,
+            "validation": validation,
+        },
+        indent=2,
+    )
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=False, destructive=True, title="Remove Module from DIN Rail"))
+def s7_hw_remove_module(
+    slot: int,
+    station_name: str = "SIMATIC 300(1)",
+    rack: int = 0,
+) -> str:
+    """Removes a module from the specified rack and slot on the station's DIN rail."""
+    denied = _check_access_mode("s7_hw_remove_module", AccessMode.READ_WRITE)
+    if denied:
+        return denied
+
+    cfg = HW_STATIONS.get(station_name)
+    if cfg is None:
+        return json.dumps(
+            {
+                "success": False,
+                "failure_category": FailureCategory.TARGET_NOT_FOUND.value,
+                "error": f"Station '{station_name}' not found.",
+            },
+            indent=2,
+        )
+    ok, msg = cfg.remove_module(rack=rack, slot=slot)
+    return json.dumps({"success": ok, "message": msg, "validation": cfg.validate()}, indent=2)
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, title="Validate Station Hardware"))
+def s7_hw_validate_station(station_name: str = "SIMATIC 300(1)") -> str:
+    """Validates DIN-rail slot rules, multi-slot collisions, backplane 5V mA power budget, I/O overlaps, and IP/MPI/DP networking."""
+    cfg = HW_STATIONS.get(station_name)
+    if cfg is None:
+        return json.dumps(
+            {
+                "success": False,
+                "failure_category": FailureCategory.TARGET_NOT_FOUND.value,
+                "error": f"Station '{station_name}' not found.",
+            },
+            indent=2,
+        )
+    val = cfg.validate()
+    return json.dumps({"success": val["valid"], "station_name": station_name, "validation": val, "station": cfg.to_dict()}, indent=2)
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=False, idempotent=True, title="Export Station .cfg"))
+def s7_hw_export_cfg(
+    station_name: str = "SIMATIC 300(1)",
+    output_path: Optional[str] = None,
+    from_com_project: Optional[str] = None,
+) -> str:
+    """
+    Exports a standard Siemens STEP 7 HW Config ASCII `.cfg` file from the in-memory DIN-rail model
+    or directly from a live SIMATIC Manager project via COM.
+    """
+    if from_com_project:
+        out_p = Path(output_path) if output_path else new_s7_artifact_path(f"{station_name.lower()}-hw", suffix=".cfg")
+        ok, msg, meta = controller.com_bridge.export_station_cfg(out_p, project_name=from_com_project, station_name=station_name)
+        if not ok:
+            return json.dumps({"success": False, "failure_category": FailureCategory.COM_UNAVAILABLE.value, "error": msg, "details": meta}, indent=2)
+        cfg_text = out_p.read_text(encoding="utf-8", errors="ignore")
+        parsed = parse_station_cfg(cfg_text)
+        HW_STATIONS[parsed.station_name] = parsed
+        return json.dumps(
+            {
+                "success": True,
+                "mode": "native_com",
+                "cfg_path": str(out_p),
+                "content_hash": compute_content_hash("cfg", cfg_text),
+                "station": parsed.to_dict(),
+                "cfg_text": cfg_text,
+            },
+            indent=2,
+        )
+
+    cfg = HW_STATIONS.get(station_name)
+    if cfg is None:
+        return json.dumps(
+            {
+                "success": False,
+                "failure_category": FailureCategory.TARGET_NOT_FOUND.value,
+                "error": f"Station '{station_name}' not found in session.",
+            },
+            indent=2,
+        )
+    cfg_text = cfg.generate_cfg()
+    safe_name = re.sub(r"[^A-Za-z0-9_\-]+", "_", station_name.lower())
+    out_p = Path(output_path) if output_path else new_s7_artifact_path(f"{safe_name}-hw", suffix=".cfg")
+    save_s7_artifact(cfg_text, out_p)
+    return json.dumps(
+        {
+            "success": True,
+            "mode": "generated",
+            "station_name": cfg.station_name,
+            "cfg_path": str(out_p),
+            "content_hash": compute_content_hash("cfg", cfg_text),
+            "validation": cfg.validate(),
+            "cfg_text": cfg_text,
+        },
+        indent=2,
+    )
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=False, idempotent=True, title="Import Station .cfg"))
+def s7_hw_import_cfg(
+    cfg_path: Optional[str] = None,
+    cfg_text: Optional[str] = None,
+    project_name: Optional[str] = None,
+    station_name: Optional[str] = None,
+    push_to_com: bool = False,
+) -> str:
+    """
+    Parses a Siemens STEP 7 HW Config `.cfg` file (or raw text) into the validated DIN-rail station model,
+    and optionally imports it into a live SIMATIC Manager project via COM.
+    """
+    denied = _check_access_mode("s7_hw_import_cfg", AccessMode.READ_WRITE)
+    if denied:
+        return denied
+
+    resolved_path: Optional[Path] = None
+    text = cfg_text or ""
+    if cfg_path:
+        p = Path(cfg_path).expanduser()
+        if not p.is_file():
+            return json.dumps({"success": False, "failure_category": FailureCategory.TARGET_NOT_FOUND.value, "error": f"File not found: {cfg_path}"}, indent=2)
+        text = p.read_text(encoding="utf-8", errors="ignore")
+        resolved_path = p
+
+    if not text.strip():
+        return json.dumps({"success": False, "failure_category": FailureCategory.VALIDATION_ERROR.value, "error": "Provide cfg_path or cfg_text."}, indent=2)
+
+    parsed = parse_station_cfg(text)
+    if station_name:
+        parsed.station_name = station_name
+    HW_STATIONS[parsed.station_name] = parsed
+    validation = parsed.validate()
+
+    com_result: Optional[Dict[str, Any]] = None
+    if push_to_com:
+        if resolved_path is None:
+            resolved_path = save_s7_artifact(text, new_s7_artifact_path("station-import", suffix=".cfg"))
+        ok_com, msg_com, meta_com = controller.com_bridge.import_station_cfg(
+            resolved_path, project_name=project_name, station_name=parsed.station_name
+        )
+        com_result = {"ok": ok_com, "message": msg_com, "details": meta_com}
+
+    return json.dumps(
+        {
+            "success": validation["valid"] and (com_result["ok"] if com_result is not None else True),
+            "station_name": parsed.station_name,
+            "validation": validation,
+            "station": parsed.to_dict(),
+            "com_import": com_result,
+            "content_hash": compute_content_hash("cfg", text),
+        },
+        indent=2,
+    )
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=False, title="Compile Station Hardware SDBs"))
+def s7_hw_compile_station(
+    station_name: str = "SIMATIC 300(1)",
+    project_name: Optional[str] = None,
+) -> str:
+    """Validates a station's DIN-rail hardware config, exports `.cfg`, and imports/compiles System Data Blocks (SDBs) if STEP 7 COM is active."""
+    denied = _check_access_mode("s7_hw_compile_station", AccessMode.READ_WRITE)
+    if denied:
+        return denied
+
+    cfg = HW_STATIONS.get(station_name)
+    if cfg is None:
+        return json.dumps({"success": False, "failure_category": FailureCategory.TARGET_NOT_FOUND.value, "error": f"Station '{station_name}' not found."}, indent=2)
+    validation = cfg.validate()
+    if not validation["valid"]:
+        return json.dumps(
+            {
+                "success": False,
+                "failure_category": FailureCategory.HW_CONFIG_ERROR.value,
+                "error": "Station hardware configuration failed validation; fix errors before compiling.",
+                "validation": validation,
+            },
+            indent=2,
+        )
+    cfg_text = cfg.generate_cfg()
+    cfg_path = save_s7_artifact(cfg_text, new_s7_artifact_path("hw-compile", suffix=".cfg"))
+    if controller.com_bridge.is_available():
+        ok_com, msg_com, meta = controller.com_bridge.import_station_cfg(cfg_path, project_name=project_name, station_name=station_name)
+        return json.dumps(
+            {
+                "success": ok_com,
+                "mode": "native_com",
+                "message": msg_com,
+                "cfg_path": str(cfg_path),
+                "validation": validation,
+                "details": meta,
+            },
+            indent=2,
+        )
+    return json.dumps(
+        {
+            "success": True,
+            "mode": "offline_validated",
+            "message": "Station hardware validated and STEP 7 .cfg artifact generated (live COM offline).",
+            "cfg_path": str(cfg_path),
+            "validation": validation,
+        },
+        indent=2,
+    )
+
+
+# --- Complete IEC 61131-3 Language Suite (FBD, SCL, S7-GRAPH, DB, UDT) ---
+
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, title="Validate FBD Compliance"))
+def s7_validate_fbd_compliance(source_code: str) -> str:
+    """Validates whether Siemens STEP 7 AWL/FBD source code is 100% pure FBD/FUP compliant (BLKLANG='00003')."""
+    res = validate_fbd_source(source_code)
+    res["success"] = True
+    return json.dumps(res, indent=2)
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, title="Convert AWL to Pure FBD"))
+def s7_convert_to_fbd(
+    source_code: str,
+    block_title: Optional[str] = None,
+    target_awl_path: Optional[str] = None,
+) -> str:
+    """Converts Siemens AWL/STL logic into verified pure FBD/FUP source compatible with STEP 7 BLKLANG='00003'."""
+    res = convert_awl_to_pure_fbd(source_code, block_title=block_title)
+    saved_path = None
+    if target_awl_path and res.get("converted_code"):
+        p = Path(target_awl_path).expanduser()
+        save_s7_artifact(res["converted_code"], p)
+        saved_path = str(p.resolve())
+    res["target_awl_path"] = saved_path
+    res["success"] = True
+    return json.dumps(res, indent=2)
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, title="Validate SCL Source"))
+def s7_validate_scl(scl_code: str) -> str:
+    """Validates Siemens STEP 7 Classic SCL (IEC 61131-3 Structured Text) syntax, block headers, balanced blocks, and common C-style mistakes."""
+    res = validate_scl_source(scl_code)
+    res["success"] = bool(res.get("valid"))
+    return json.dumps(res, indent=2)
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=False, idempotent=True, title="Write & Compile SCL Block"))
+def s7_write_scl_block(
+    scl_code: str,
+    block_name: str = "FC1",
+    project_name: Optional[str] = None,
+    project_s7p_path: Optional[str] = None,
+) -> str:
+    """
+    Validates Siemens SCL (Structured Text) source, writes a verified `.scl` artifact, and compiles via
+    STEP 7 SCL Compiler (`S7SC.exe`) or COM if available (sets BLKLANG='00004').
+    """
+    denied = _check_access_mode("s7_write_scl_block", AccessMode.READ_WRITE)
+    if denied:
+        return denied
+
+    val = validate_scl_source(scl_code)
+    if not val["valid"]:
+        return json.dumps(
+            {
+                "success": False,
+                "status": "REJECTED_BEFORE_WRITE",
+                "failure_category": FailureCategory.VALIDATION_ERROR.value,
+                "errors": val["errors"],
+                "warnings": val["warnings"],
+            },
+            indent=2,
+        )
+
+    blk_clean = re.sub(r"\s+", "", block_name.strip().upper())
+    scl_path = save_s7_artifact(scl_code, new_s7_artifact_path(f"{blk_clean.lower()}-scl", suffix=".scl"))
+    content_hash = compute_content_hash("scl", scl_code)
+
+    if project_s7p_path and Path(project_s7p_path).is_file():
+        ok_cli, cli_msg = compile_scl_via_cli(Path(project_s7p_path), scl_path)
+        AUDIT_LOGGER.record(tool="s7_write_scl_block", action="compile_scl_cli", target=blk_clean, success=ok_cli, status="SUCCESS" if ok_cli else "BUILD_FAILED", content_hash=content_hash)
+        return json.dumps(
+            {
+                "success": ok_cli,
+                "status": "SUCCESS" if ok_cli else "BUILD_FAILED",
+                "mode": "s7sc_cli",
+                "block_name": blk_clean,
+                "block_language": "SCL",
+                "scl_path": str(scl_path),
+                "content_hash": content_hash,
+                "message": cli_msg,
+                "warnings": val["warnings"],
+            },
+            indent=2,
+        )
+
+    if controller.com_bridge.is_available():
+        ok_com, com_msg, meta = controller.com_bridge.import_and_compile_awl(
+            awl_path=scl_path,
+            block_name=blk_clean,
+            project_name=project_name,
+            target_language="SCL",
+        )
+        return json.dumps(
+            {
+                "success": ok_com,
+                "status": "SUCCESS" if ok_com else "BUILD_FAILED",
+                "mode": "native_com",
+                "block_name": blk_clean,
+                "block_language": "SCL",
+                "scl_path": str(scl_path),
+                "content_hash": content_hash,
+                "message": com_msg,
+                "details": meta,
+                "warnings": val["warnings"],
+            },
+            indent=2,
+        )
+
+    return json.dumps(
+        {
+            "success": True,
+            "status": "OFFLINE_SOURCE_GENERATED",
+            "mode": "offline",
+            "block_name": blk_clean,
+            "block_language": "SCL",
+            "scl_path": str(scl_path),
+            "content_hash": content_hash,
+            "warnings": val["warnings"],
+        },
+        indent=2,
+    )
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, title="Validate S7-GRAPH SFC"))
+def s7_validate_graph_sfc(
+    fb_number: int,
+    steps: List[Dict[str, Any]],
+    transitions: List[Dict[str, Any]],
+    title: str = "S7-GRAPH Sequencer",
+) -> str:
+    """
+    Validates an S7-GRAPH (IEC 61131-3 Sequential Function Chart) sequencer: checks initial step,
+    BFS reachability of all steps, dead-end sink warnings, IEC action qualifiers (N/S/R/D/L/P/SD/DS/SL),
+    and generates Siemens `.gr7` source code.
+    """
+    res = validate_and_generate_graph_sfc(fb_number=fb_number, steps=steps, transitions=transitions, title=title)
+    res["success"] = bool(res.get("valid"))
+    return json.dumps(res, indent=2)
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=False, idempotent=True, title="Write S7-GRAPH Block"))
+def s7_write_graph_block(
+    fb_number: int,
+    steps: List[Dict[str, Any]],
+    transitions: List[Dict[str, Any]],
+    title: str = "S7-GRAPH Sequencer",
+    project_name: Optional[str] = None,
+) -> str:
+    """Validates and generates a Siemens S7-GRAPH `.gr7` source file (and compiles via COM if active, BLKLANG='00005')."""
+    denied = _check_access_mode("s7_write_graph_block", AccessMode.READ_WRITE)
+    if denied:
+        return denied
+
+    res = validate_and_generate_graph_sfc(fb_number=fb_number, steps=steps, transitions=transitions, title=title)
+    if not res["valid"]:
+        return json.dumps(
+            {
+                "success": False,
+                "status": "REJECTED_BEFORE_WRITE",
+                "failure_category": FailureCategory.VALIDATION_ERROR.value,
+                "errors": res["errors"],
+                "warnings": res["warnings"],
+            },
+            indent=2,
+        )
+    blk_clean = f"FB{fb_number}"
+    gr7_path = save_s7_artifact(res["gr7_source"], new_s7_artifact_path(f"{blk_clean.lower()}-graph", suffix=".gr7"))
+    if controller.com_bridge.is_available():
+        ok_com, com_msg, meta = controller.com_bridge.import_and_compile_awl(
+            awl_path=gr7_path, block_name=blk_clean, project_name=project_name, target_language="GRAPH"
+        )
+        return json.dumps(
+            {
+                "success": ok_com,
+                "status": "SUCCESS" if ok_com else "BUILD_FAILED",
+                "mode": "native_com",
+                "block_name": blk_clean,
+                "block_language": "GRAPH",
+                "gr7_path": str(gr7_path),
+                "content_hash": res["content_hash"],
+                "message": com_msg,
+                "details": meta,
+            },
+            indent=2,
+        )
+    return json.dumps(
+        {
+            "success": True,
+            "status": "OFFLINE_SOURCE_GENERATED",
+            "mode": "offline",
+            "block_name": blk_clean,
+            "block_language": "GRAPH",
+            "gr7_path": str(gr7_path),
+            "content_hash": res["content_hash"],
+            "warnings": res["warnings"],
+            "gr7_source": res["gr7_source"],
+        },
+        indent=2,
+    )
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=False, idempotent=True, title="Create Global or Instance Data Block"))
+def s7_create_data_block(
+    db_number: int,
+    fields: Optional[List[Dict[str, Any]]] = None,
+    instance_of_fb: Optional[int] = None,
+    title: str = "",
+    project_name: Optional[str] = None,
+    compile_via_com: bool = False,
+) -> str:
+    """
+    Generates a Siemens STEP 7 Global Data Block (DB) or Instance DB (linked to an FB) with exact
+    S7 bit-packing and even-byte word alignment layout (`DBn.DBX/DBB/DBW/DBD` addresses).
+    """
+    denied = _check_access_mode("s7_create_data_block", AccessMode.READ_WRITE)
+    if denied:
+        return denied
+
+    res = generate_data_block_source(
+        db_number=db_number,
+        fields=fields,
+        instance_of_fb=instance_of_fb,
+        title=title,
+    )
+    if not res.get("valid"):
+        return json.dumps(
+            {"success": False, "failure_category": FailureCategory.VALIDATION_ERROR.value, "errors": res.get("errors", [])},
+            indent=2,
+        )
+    blk_clean = f"DB{db_number}"
+    db_path = save_s7_artifact(res["awl_source"], new_s7_artifact_path(f"{blk_clean.lower()}-source", suffix=".awl"))
+    res["awl_path"] = str(db_path)
+    res["success"] = True
+
+    if compile_via_com and controller.com_bridge.is_available():
+        ok_com, com_msg, meta = controller.com_bridge.import_and_compile_awl(
+            awl_path=db_path, block_name=blk_clean, project_name=project_name, target_language="DB"
+        )
+        res["com_compile"] = {"ok": ok_com, "message": com_msg, "details": meta}
+        res["success"] = ok_com
+    return json.dumps(res, indent=2)
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=False, idempotent=True, title="Create User-Defined Type (UDT)"))
+def s7_create_udt(
+    udt_number: int,
+    fields: List[Dict[str, Any]],
+    title: str = "",
+    project_name: Optional[str] = None,
+    compile_via_com: bool = False,
+) -> str:
+    """Generates a Siemens STEP 7 User-Defined Data Type (`TYPE UDT n`) with exact S7 byte/bit alignment layout."""
+    denied = _check_access_mode("s7_create_udt", AccessMode.READ_WRITE)
+    if denied:
+        return denied
+
+    res = generate_udt_source(udt_number=udt_number, fields=fields, title=title)
+    if not res.get("valid"):
+        return json.dumps(
+            {"success": False, "failure_category": FailureCategory.VALIDATION_ERROR.value, "errors": res.get("errors", [])},
+            indent=2,
+        )
+    blk_clean = f"UDT{udt_number}"
+    udt_path = save_s7_artifact(res["awl_source"], new_s7_artifact_path(f"{blk_clean.lower()}-source", suffix=".awl"))
+    res["awl_path"] = str(udt_path)
+    res["success"] = True
+    if compile_via_com and controller.com_bridge.is_available():
+        ok_com, com_msg, meta = controller.com_bridge.import_and_compile_awl(
+            awl_path=udt_path, block_name=blk_clean, project_name=project_name, target_language="DB"
+        )
+        res["com_compile"] = {"ok": ok_com, "message": com_msg, "details": meta}
+        res["success"] = ok_com
+    return json.dumps(res, indent=2)
+
+
+# --- Project Tree & Block Lifecycle Tools ---
+
+@mcp.tool(annotations=make_tool_annotations(read_only=False, title="Create Project via COM"))
+def s7_com_create_project(
+    project_name: str,
+    project_path: Optional[str] = None,
+    station_name: str = "SIMATIC 300(1)",
+    station_type: str = "S7-300",
+) -> str:
+    """Creates a new Siemens STEP 7 Classic project directly via native 32-bit COM (`Simatic.Simatic`)."""
+    denied = _check_access_mode("s7_com_create_project", AccessMode.READ_WRITE)
+    if denied:
+        return denied
+    ok, msg, meta = controller.com_bridge.create_project(
+        project_name=project_name, project_path=project_path, station_name=station_name, station_type=station_type
+    )
+    return json.dumps({"success": ok, "message": msg, "details": meta}, indent=2)
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, title="Browse Project Tree"))
+def s7_com_browse_project_tree(project_name: Optional[str] = None) -> str:
+    """Returns the complete SIMATIC Manager project hierarchy (stations, programs, blocks, sources, symbol tables)."""
+    ok, tree, msg = controller.com_bridge.browse_project_tree(project_name=project_name)
+    return json.dumps({"success": ok, "message": msg, "tree": tree}, indent=2)
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=False, title="Copy Block via COM"))
+def s7_com_copy_block(
+    source_block: str,
+    target_block: str,
+    project_name: Optional[str] = None,
+    target_project: Optional[str] = None,
+) -> str:
+    """Copies a compiled block within or across STEP 7 projects via native COM."""
+    denied = _check_access_mode("s7_com_copy_block", AccessMode.READ_WRITE)
+    if denied:
+        return denied
+    ok, msg, meta = controller.com_bridge.copy_block(
+        source_block=source_block, target_block=target_block, project_name=project_name, target_project=target_project
+    )
+    return json.dumps({"success": ok, "message": msg, "details": meta}, indent=2)
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=False, destructive=True, title="Delete Block via COM"))
+def s7_com_delete_block(
+    block_name: str,
+    project_name: Optional[str] = None,
+    confirm_delete: bool = False,
+) -> str:
+    """Deletes a compiled block from a STEP 7 project via COM (requires confirm_delete=True and writes audit record)."""
+    denied = _check_access_mode("s7_com_delete_block", AccessMode.READ_WRITE)
+    if denied:
+        return denied
+    if not confirm_delete:
+        return json.dumps(
+            {
+                "success": False,
+                "failure_category": FailureCategory.WRITE_GUARDRAIL_BLOCKED.value,
+                "error": "Pass confirm_delete=True to authorize block deletion.",
+            },
+            indent=2,
+        )
+    ok, msg, meta = controller.com_bridge.delete_block(block_name=block_name, project_name=project_name)
+    AUDIT_LOGGER.record(tool="s7_com_delete_block", action="delete_block", target=f"{project_name}/{block_name}", success=ok, status="SUCCESS" if ok else "FAILED")
+    return json.dumps({"success": ok, "message": msg, "details": meta}, indent=2)
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=False, destructive=True, open_world=True, title="Download Blocks to PLC/PLCSIM"))
+def s7_com_download_blocks(
+    blocks: List[str],
+    project_name: Optional[str] = None,
+    confirm_live_write: bool = False,
+) -> str:
+    """Downloads compiled blocks to the configured online PLC / S7-PLCSIM target via COM (requires full mode + dual guard)."""
+    denied = _check_access_mode("s7_com_download_blocks", AccessMode.FULL)
+    if denied:
+        return denied
+    if not runtime_client.writes_enabled(confirm_live_write, host="plc-download", port=102):
+        return json.dumps(
+            {
+                "success": False,
+                "status": "WRITE_GUARDRAIL_BLOCKED",
+                "failure_category": FailureCategory.WRITE_GUARDRAIL_BLOCKED.value,
+                "error": "Downloading blocks requires BOTH confirm_live_write=True AND S7_WRITES_ENABLED=true.",
+            },
+            indent=2,
+        )
+    ok, msg, meta = controller.com_bridge.download_blocks(block_names=blocks, project_name=project_name)
+    AUDIT_LOGGER.record(tool="s7_com_download_blocks", action="download", target=f"{project_name}:{','.join(blocks)}", success=ok, status="SUCCESS" if ok else "FAILED")
+    return json.dumps({"success": ok, "message": msg, "details": meta}, indent=2)
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=True, title="Upload Station from PLC"))
+def s7_com_upload_station(project_name: Optional[str] = None) -> str:
+    """Uploads station blocks and hardware configuration from a connected online PLC into STEP 7 via COM."""
+    ok, msg, meta = controller.com_bridge.upload_station(project_name=project_name)
+    return json.dumps({"success": ok, "message": msg, "details": meta}, indent=2)
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, title="Compare Two Blocks"))
+def s7_compare_blocks(
+    source_a: str,
+    source_b: str,
+    label_a: str = "BlockA",
+    label_b: str = "BlockB",
+) -> str:
+    """Performs a deterministic unified diff and SHA-256 content hash comparison between two AWL/SCL/GRAPH/CFG sources."""
+    norm_a = source_a.replace("\r\n", "\n").splitlines()
+    norm_b = source_b.replace("\r\n", "\n").splitlines()
+    diff_lines = list(difflib.unified_diff(norm_a, norm_b, fromfile=label_a, tofile=label_b, lineterm=""))
+    hash_a = compute_content_hash("src", source_a)
+    hash_b = compute_content_hash("src", source_b)
+    return json.dumps(
+        {
+            "success": True,
+            "identical": hash_a == hash_b,
+            "hash_a": hash_a,
+            "hash_b": hash_b,
+            "diff_line_count": len(diff_lines),
+            "unified_diff": "\n".join(diff_lines),
+        },
+        indent=2,
+    )
+
+
+# --- Full S7-PLCSIM & Deterministic Virtual S7 PLC Simulation Tools ---
+
+@mcp.tool(annotations=make_tool_annotations(read_only=False, title="Control S7-PLCSIM Lifecycle"))
+def s7_plcsim_control(
+    action: str,
+    state: Optional[str] = None,
+    scan_mode: Optional[str] = None,
+    plc_file_path: Optional[str] = None,
+) -> str:
+    """
+    Controls Siemens S7-PLCSIM via the persistent S7ProSim COM worker:
+    action in {'connect', 'disconnect', 'get_state', 'set_state', 'set_scan_mode', 'save_plc', 'load_plc'}.
+    """
+    act = action.strip().lower()
+    if act != "get_state":
+        denied = _check_access_mode("s7_plcsim_control", AccessMode.READ_WRITE)
+        if denied:
+            return denied
+
+    cmd_map = {
+        "connect": ("plcsim_connect", {}),
+        "disconnect": ("plcsim_disconnect", {}),
+        "get_state": ("plcsim_get_state", {}),
+        "set_state": ("plcsim_set_state", {"state": (state or "RUN_P").upper()}),
+        "set_scan_mode": ("plcsim_set_scan_mode", {"mode": (scan_mode or "SINGLE").upper()}),
+        "save_plc": ("plcsim_save_plc", {"file_path": plc_file_path or ""}),
+        "load_plc": ("plcsim_load_plc", {"file_path": plc_file_path or ""}),
+    }
+    if act not in cmd_map:
+        return json.dumps(
+            {
+                "success": False,
+                "failure_category": FailureCategory.VALIDATION_ERROR.value,
+                "error": f"Unknown PLCSIM action '{action}'. Valid: {sorted(cmd_map.keys())}",
+            },
+            indent=2,
+        )
+    cmd, params = cmd_map[act]
+    res = runtime_client.com_bridge.worker.call(cmd, params, timeout_s=10.0)
+    res["success"] = bool(res.get("ok"))
+    return json.dumps(res, indent=2)
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=False, title="Step S7-PLCSIM Scan Cycles"))
+def s7_plcsim_step_scan(cycles: int = 1) -> str:
+    """Executes deterministic single-scan cycles in Siemens S7-PLCSIM via S7ProSim.ExecuteSingleScan."""
+    denied = _check_access_mode("s7_plcsim_step_scan", AccessMode.READ_WRITE)
+    if denied:
+        return denied
+    res = runtime_client.com_bridge.worker.call("plcsim_step_scan", {"cycles": max(1, int(cycles))}, timeout_s=15.0)
+    res["success"] = bool(res.get("ok"))
+    return json.dumps(res, indent=2)
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=False, title="Save/Load S7-PLCSIM Snapshot"))
+def s7_plcsim_snapshot(
+    action: str = "save",
+    file_path: Optional[str] = None,
+) -> str:
+    """Saves or restores a `.plc` simulation snapshot file in S7-PLCSIM."""
+    denied = _check_access_mode("s7_plcsim_snapshot", AccessMode.READ_WRITE)
+    if denied:
+        return denied
+    act = action.strip().lower()
+    if act not in ("save", "load"):
+        return json.dumps({"success": False, "error": "action must be 'save' or 'load'"}, indent=2)
+    target = file_path or str(new_s7_artifact_path("plcsim-snapshot", suffix=".plc"))
+    cmd = "plcsim_save_plc" if act == "save" else "plcsim_load_plc"
+    res = runtime_client.com_bridge.worker.call(cmd, {"file_path": target}, timeout_s=15.0)
+    res["success"] = bool(res.get("ok"))
+    res["file_path"] = target
+    return json.dumps(res, indent=2)
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=False, title="Load Block into Virtual S7 PLC"))
+def s7_virtual_plc_load(
+    block_name: str = "OB1",
+    source_code: str = "",
+    reset_memory: bool = False,
+) -> str:
+    """
+    Loads an AWL/STL/LAD block into the built-in deterministic Virtual S7-300/400 PLC simulator
+    for cross-platform closed-loop testing without requiring physical hardware or Windows PLCSIM.
+    """
+    if reset_memory:
+        VIRTUAL_PLC.areas = {"I": bytearray(4096), "Q": bytearray(4096), "M": bytearray(4096)}
+        VIRTUAL_PLC.dbs = {1: bytearray(4096)}
+        VIRTUAL_PLC.timers.clear()
+        VIRTUAL_PLC.counters.clear()
+        VIRTUAL_PLC.scan_count = 0
+        VIRTUAL_PLC.sim_time_ms = 0
+    res = VIRTUAL_PLC.load_block(block_name=block_name, awl_source=source_code)
+    res["success"] = bool(res.get("ok"))
+    return json.dumps(res, indent=2)
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=False, title="Step Virtual S7 PLC Simulation"))
+def s7_virtual_plc_step(
+    cycles: int = 1,
+    tick_ms: int = 100,
+    entry_block: str = "OB1",
+    write_inputs: Optional[Dict[str, Any]] = None,
+    read_addresses: Optional[List[str]] = None,
+) -> str:
+    """
+    Drives optional input/marker/DB values into the Virtual S7 PLC, executes `cycles` deterministic scan cycles
+    advancing S7 timers by `tick_ms` per scan, and reads back requested outputs/markers/timers/counters/DBs.
+    """
+    for addr, val in (write_inputs or {}).items():
+        VIRTUAL_PLC.write_address(addr, val)
+    step_res = VIRTUAL_PLC.step(cycles=cycles, tick_ms=tick_ms, entry_block=entry_block)
+    observed: Dict[str, Any] = {}
+    for addr in read_addresses or []:
+        observed[addr] = VIRTUAL_PLC.read_address(addr)
+    step_res["observed"] = observed
+    step_res["success"] = bool(step_res.get("ok"))
+    return json.dumps(step_res, indent=2)
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=False, title="Run Automated Simulation Scenario"))
+def s7_plcsim_run_scenario(
+    steps: List[Dict[str, Any]],
+    target: str = "virtual",
+    entry_block: str = "OB1",
+) -> str:
+    """
+    Executes a multi-step automated closed-loop test scenario against either `virtual` (VirtualS7PLC)
+    or `plcsim` (live S7-PLCSIM via S7ProSim).
+
+    Each step supports:
+      {"name": "Start motor", "inputs": {"I0.0": True}, "cycles": 2, "tick_ms": 100, "expect": {"Q0.0": True}}
+    """
+    report_steps: List[Dict[str, Any]] = []
+    all_passed = True
+    use_virtual = target.strip().lower() == "virtual"
+
+    for idx, st in enumerate(steps, start=1):
+        name = str(st.get("name") or f"Step {idx}")
+        inputs = st.get("inputs") or {}
+        cycles = max(1, int(st.get("cycles", 1)))
+        tick_ms = max(0, int(st.get("tick_ms", 100)))
+        expects = st.get("expect") or {}
+        step_mismatches: List[Dict[str, Any]] = []
+        observed: Dict[str, Any] = {}
+
+        if use_virtual:
+            for addr, val in inputs.items():
+                VIRTUAL_PLC.write_address(addr, val)
+            VIRTUAL_PLC.step(cycles=cycles, tick_ms=tick_ms, entry_block=entry_block)
+            for addr, expected in expects.items():
+                actual = VIRTUAL_PLC.read_address(addr)
+                observed[addr] = actual
+                if isinstance(expected, float):
+                    ok_val = abs(float(actual) - expected) <= 1e-3
+                else:
+                    ok_val = actual == expected
+                if not ok_val:
+                    step_mismatches.append({"address": addr, "expected": expected, "actual": actual})
+        else:
+            for addr, val in inputs.items():
+                spec, err = runtime_client.resolve_address(addr)
+                if err or spec is None:
+                    step_mismatches.append({"address": addr, "error": err})
+                else:
+                    runtime_client._plcsim_write(spec, val)
+            runtime_client.com_bridge.worker.call("plcsim_step_scan", {"cycles": cycles}, timeout_s=15.0)
+            for addr, expected in expects.items():
+                spec, err = runtime_client.resolve_address(addr)
+                if err or spec is None:
+                    step_mismatches.append({"address": addr, "error": err})
+                    continue
+                rd = runtime_client._plcsim_read(spec)
+                actual = rd.get("value")
+                observed[addr] = actual
+                if isinstance(expected, float):
+                    ok_val = actual is not None and abs(float(actual) - expected) <= 1e-3
+                else:
+                    ok_val = actual == expected
+                if not ok_val:
+                    step_mismatches.append({"address": addr, "expected": expected, "actual": actual})
+
+        passed = len(step_mismatches) == 0
+        if not passed:
+            all_passed = False
+        report_steps.append({
+            "step": idx,
+            "name": name,
+            "passed": passed,
+            "observed": observed,
+            "mismatches": step_mismatches,
+        })
+
+    return json.dumps(
+        {
+            "success": all_passed,
+            "target": target,
+            "total_steps": len(report_steps),
+            "passed_steps": sum(1 for s in report_steps if s["passed"]),
+            "steps": report_steps,
+        },
+        indent=2,
+    )
+
+
+# --- High-Speed Pooled Monitoring, Watch Tables & CPU Diagnostics ---
+
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, title="High-Speed Batch Read"))
+def s7_runtime_batch_read(
+    items: List[Any],
+    host: str = "127.0.0.1",
+    port: int = 102,
+    rack: int = 0,
+    slot: int = 2,
+    project_name: Optional[str] = None,
+) -> str:
+    """
+    Reads multiple S7 addresses/symbols (I, Q, M, DB, Timers T, Counters C) over a persistent
+    pooled RFC1006/S7comm connection using multi-item Read Var PDUs for sub-millisecond monitoring.
+    """
+    try:
+        res = runtime_client.batch_read(
+            items=items,
+            host=host,
+            port=port,
+            rack=rack,
+            slot=slot,
+            project_name=project_name or controller.project_name,
+        )
+        res["success"] = bool(res.get("ok"))
+        return json.dumps(res, indent=2)
+    except Exception as exc:
+        return json.dumps(
+            {"success": False, "failure_category": FailureCategory.TRANSPORT_ERROR.value, "error": str(exc)},
+            indent=2,
+        )
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=False, destructive=True, open_world=True, title="High-Speed Batch Write"))
+def s7_runtime_batch_write(
+    items: List[Dict[str, Any]],
+    host: str = "127.0.0.1",
+    port: int = 102,
+    rack: int = 0,
+    slot: int = 2,
+    confirm_live_write: bool = False,
+    project_name: Optional[str] = None,
+) -> str:
+    """
+    Writes multiple S7 addresses/symbols in minimal multi-item S7comm Write Var PDUs.
+    Protected by strict dual-guard safety policy.
+    """
+    denied = _check_access_mode("s7_runtime_batch_write", AccessMode.READ_WRITE)
+    if denied:
+        return denied
+    try:
+        res = runtime_client.batch_write(
+            items=items,
+            host=host,
+            port=port,
+            rack=rack,
+            slot=slot,
+            confirm_live_write=confirm_live_write,
+            project_name=project_name or controller.project_name,
+        )
+        res["success"] = bool(res.get("ok"))
+        AUDIT_LOGGER.record(
+            tool="s7_runtime_batch_write",
+            action="batch_write",
+            target=f"{host}:{port} ({len(items)} items)",
+            success=res["success"],
+            status=res.get("status", "SUCCESS" if res["success"] else "FAILED"),
+            failure_category=res.get("failure_category"),
+        )
+        return json.dumps(res, indent=2)
+    except Exception as exc:
+        return json.dumps(
+            {"success": False, "failure_category": FailureCategory.TRANSPORT_ERROR.value, "error": str(exc)},
+            indent=2,
+        )
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, title="Monitor Watch Table (VAT)"))
+def s7_monitor_watch_table(
+    tags: List[Any],
+    host: str = "127.0.0.1",
+    port: int = 102,
+    rack: int = 0,
+    slot: int = 2,
+    table_id: str = "VAT1",
+    symbol_table: Optional[Dict[str, str]] = None,
+    samples: int = 1,
+    interval_ms: int = 100,
+) -> str:
+    """
+    Monitors a named STEP 7 Watch Table (VAT) over pooled S7comm multi-item PDUs, returning
+    symbolic values, delta changes vs previous snapshot, and optional multi-sample polling.
+    """
+    try:
+        res = runtime_client.watch_monitor.snapshot(
+            host=host,
+            tags=tags,
+            table_id=table_id,
+            symbol_table=symbol_table,
+            port=port,
+            rack=rack,
+            slot=slot,
+            samples=samples,
+            interval_ms=interval_ms,
+        )
+        res["success"] = bool(res.get("ok"))
+        return json.dumps(res, indent=2)
+    except Exception as exc:
+        return json.dumps(
+            {"success": False, "failure_category": FailureCategory.TRANSPORT_ERROR.value, "error": str(exc)},
+            indent=2,
+        )
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, title="Read CPU Status & SZL Diagnostics"))
+def s7_runtime_cpu_diagnostics(
+    host: str = "127.0.0.1",
+    port: int = 102,
+    rack: int = 0,
+    slot: int = 2,
+) -> str:
+    """Queries live S7-300/400 CPU MLFB order number (SZL 0x0011), operating mode (RUN/STOP, SZL 0x0424), and diagnostic buffer (SZL 0x00A0)."""
+    try:
+        res = runtime_client.read_cpu_diagnostics(host=host, port=port, rack=rack, slot=slot)
+        res["success"] = bool(res.get("ok"))
+        return json.dumps(res, indent=2)
+    except Exception as exc:
+        return json.dumps(
+            {"success": False, "failure_category": FailureCategory.TRANSPORT_ERROR.value, "error": str(exc)},
+            indent=2,
+        )
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=False, destructive=True, open_world=True, title="Remote CPU RUN/STOP Control"))
+def s7_runtime_cpu_control(
+    action: str,
+    host: str = "127.0.0.1",
+    port: int = 102,
+    rack: int = 0,
+    slot: int = 2,
+    confirm_live_write: bool = False,
+) -> str:
+    """Sends a remote S7comm CPU RUN or STOP command (requires FULL mode + strict dual-guard)."""
+    denied = _check_access_mode("s7_runtime_cpu_control", AccessMode.FULL)
+    if denied:
+        return denied
+    try:
+        res = runtime_client.cpu_control(
+            action=action, host=host, port=port, rack=rack, slot=slot, confirm_live_write=confirm_live_write
+        )
+        res["success"] = bool(res.get("ok"))
+        AUDIT_LOGGER.record(
+            tool="s7_runtime_cpu_control",
+            action=action.upper(),
+            target=f"{host}:{port}",
+            success=res["success"],
+            status=res.get("status", "SUCCESS" if res["success"] else "FAILED"),
+            failure_category=res.get("failure_category"),
+        )
+        return json.dumps(res, indent=2)
+    except Exception as exc:
+        return json.dumps(
+            {"success": False, "failure_category": FailureCategory.TRANSPORT_ERROR.value, "error": str(exc)},
+            indent=2,
+        )
+
+
+# ============================================================================
+# 8C. MCP RESOURCES & PROMPTS (COMPACT AI-AGENT CONTEXT)
+# ============================================================================
+
+@mcp.resource("s7://catalog/modules")
+def resource_s7_catalog() -> str:
+    """Curated Siemens STEP 7 Classic MLFB hardware catalog for DIN-rail & rack configuration."""
+    return build_catalog_resource_text()
+
+
+@mcp.resource("s7://reference/iec-61131-3")
+def resource_s7_iec_reference() -> str:
+    """Concise Siemens STEP 7 Classic IEC 61131-3 (STL, LAD, FBD, SCL, GRAPH, DB/UDT) engineering reference."""
+    return build_iec_reference_resource_text()
+
+
+@mcp.resource("s7://workspace/status")
+def resource_s7_workspace_status() -> str:
+    """Current SIMATIC STEP 7 MCP server readiness, access mode, and loaded HW stations."""
+    return json.dumps(
+        {
+            "access_mode": ACTIVE_ACCESS_MODE.value,
+            "workspace_dir": str(WORKSPACE_DIR),
+            "loaded_hw_stations": sorted(HW_STATIONS.keys()),
+            "virtual_plc_blocks": sorted(VIRTUAL_PLC.blocks.keys()),
+            "virtual_plc_mode": VIRTUAL_PLC.cpu_mode,
+            "s7_pool": runtime_client.pool.stats(),
+        },
+        indent=2,
+    )
+
+
+@mcp.prompt()
+def s7_new_project_wizard(project_name: str = "MyS7Project", cpu_mlfb: str = "6ES7 315-2EH14-0AB0") -> str:
+    """Guided workflow for creating a new STEP 7 Classic project, configuring the DIN rail, and testing logic."""
+    return build_prompt_new_project_wizard(project_name=project_name, cpu_mlfb=cpu_mlfb)
+
+
+@mcp.prompt()
+def s7_safe_commissioning_checklist(host: str = "192.168.0.1") -> str:
+    """Read-only commissioning audit checklist for inspecting CPU diagnostics and watch tables safely."""
+    return build_prompt_safe_commissioning(host=host)
+
+
+@mcp.prompt()
+def s7_convert_and_verify_lad(block_name: str = "FC1") -> str:
+    """Workflow to convert STL/AWL into 100% pure STEP 7 LAD with optimistic locking and simulation."""
+    return build_prompt_convert_and_verify_lad(block_name=block_name)
+
+
+@mcp.prompt()
+def s7_plcsim_automated_test(block_name: str = "OB1") -> str:
+    """Workflow for closed-loop automated simulation testing on VirtualS7PLC or S7-PLCSIM."""
+    return build_prompt_plcsim_automated_test(block_name=block_name)
+
+
+# ============================================================================
+# 9. CLI & SERVER ENTRY POINT
+# ============================================================================
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="simatic-s7-mcp",
+        description="Production-grade Siemens SIMATIC STEP 7 Classic MCP Server (VS Code, Antigravity, Codex, Claude Code).",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["read-only", "read-write", "full"],
+        default=None,
+        help="Access posture override (precedence: CLI > S7_MCP_MODE > read-write).",
+    )
+    sub = parser.add_subparsers(dest="command")
+    sub.add_parser("doctor", help="Run readiness & environment diagnostics.")
+    p_init = sub.add_parser("init-client", help="Generate drop-in MCP config for VS Code, Antigravity, Codex, or Claude Code.")
+    p_init.add_argument("--client", choices=["vscode", "antigravity", "codex", "claude", "all"], default="all")
+    p_init.add_argument("--writes-enabled", action="store_true", default=False)
+
+    args = parser.parse_args(list(argv) if argv is not None else None)
+    if args.mode:
+        set_access_mode(args.mode)
+
+    if args.command == "doctor":
+        print(s7_doctor())
+        return 0
+
+    if args.command == "init-client":
+        print(s7_generate_client_config(client=args.client, mode=ACTIVE_ACCESS_MODE.value, writes_enabled=args.writes_enabled))
+        return 0
+
     mcp.run()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+

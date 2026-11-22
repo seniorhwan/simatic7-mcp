@@ -1,0 +1,4 @@
+{
+  "name": "SIMATIC STEP 7 Classic MCP Server",
+  "description": "Production-grade Model Context Protocol (MCP) server for Siemens SIMATIC Manager / STEP 7 Classic (S7-300, S7-400, WinAC) with full IEC 61131-3 programming, DIN-rail hardware configuration, S7-PLCSIM simulation, live S7comm monitoring, and sub-15ms 32-bit COM automation."
+}
