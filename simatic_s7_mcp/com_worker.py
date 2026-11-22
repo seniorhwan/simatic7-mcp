@@ -102,6 +102,20 @@ function Find-ProjectAndProgram([string]$targetProj) {
   }
 }
 
+function Find-UserProject([string]$targetProj) {
+  $s7 = Get-S7
+  foreach ($p in $s7.Projects) {
+    try {
+      $pType = [int]$p.Type
+      $isUser = ($pType -eq 1122305 -or $pType -eq 1)
+      if ($targetProj -ne '' -and $p.Name -ine $targetProj) { continue }
+      if ($targetProj -eq '' -and -not $isUser) { continue }
+      return $p
+    } catch {}
+  }
+  return $null
+}
+
 function Handle-Command($req) {
   $cmd = [string]$req.cmd
 
@@ -132,17 +146,27 @@ function Handle-Command($req) {
   if ($cmd -eq 'create_project') {
     $s7 = Get-S7
     $pName = [string]$req.project_name
-    $pDir = [string]$req.project_dir
+    $pDir = if ($req.project_dir) { [string]$req.project_dir } elseif ($req.project_path) { [string]$req.project_path } else { '' }
     if (-not $pName) { return @{ ok = $false; error = 'project_name is required.' } }
     if ($pDir) {
       $proj = $s7.Projects.Add($pName, $pDir, 1)
     } else {
       $proj = $s7.Projects.Add($pName)
     }
+    $createdStation = ''
+    if ($req.create_station -and $req.station_name) {
+      try {
+        $stType = ([string]$req.station_type).ToUpper()
+        $stCode = if ($stType -match '400') { 1310722 } elseif ($stType -match 'WIN|PC') { 1310724 } else { 1310721 }
+        $st = $proj.Stations.Add([string]$req.station_name, $stCode)
+        $createdStation = [string]$st.Name
+      } catch {}
+    }
     return @{
       ok = $true
       project_name = [string]$proj.Name
       project_dir = [string]$proj.LogPath
+      station_name = $createdStation
     }
   }
 
@@ -170,7 +194,9 @@ function Handle-Command($req) {
               try { $itemCount = $c.Next.Count } catch {}
               $containers += @{ name = [string]$c.Name; concrete_type = [int]$c.ConcreteType; item_count = $itemCount }
             }
-            $programs += @{ name = [string]$prg.Name; containers = $containers }
+            $hasSyms = $false
+            try { $hasSyms = ($null -ne $prg.SymbolTable) } catch {}
+            $programs += @{ name = [string]$prg.Name; symbol_table_available = $hasSyms; containers = $containers }
           }
         } catch {}
         $tree += @{
@@ -182,7 +208,8 @@ function Handle-Command($req) {
         if ($targetProj -ne '') { break }
       } catch {}
     }
-    return @{ ok = $true; projects = $tree }
+    $firstName = if ($tree.Count -gt 0) { $tree[0].name } else { $targetProj }
+    return @{ ok = $true; project_name = $firstName; projects = $tree }
   }
 
   if ($cmd -eq 'list_blocks') {
@@ -254,7 +281,17 @@ function Handle-Command($req) {
     }
     $srcPath = [string]$req.source_path
     $srcName = [string]$req.source_name
-    $srcType = if ($req.source_type) { [int]$req.source_type } else { 65 }
+    $ext = [System.IO.Path]::GetExtension($srcPath).ToLower()
+    $srcType = if ($req.source_type) {
+      [int]$req.source_type
+    } elseif ($ext -eq '.scl') {
+      66
+    } elseif ($ext -eq '.gr7') {
+      67
+    } else {
+      65
+    }
+    $altType = if ($srcType -eq 66) { 1122310 } elseif ($srcType -eq 67) { 1122311 } else { 1122309 }
 
     $targetItem = $null
     foreach ($it in $ctx.sources.Next) {
@@ -262,7 +299,10 @@ function Handle-Command($req) {
     }
     if ($null -eq $targetItem) {
       try { $targetItem = $ctx.sources.Next.Add($srcName, $srcType, $srcPath) }
-      catch { $targetItem = $ctx.sources.Next.Add($srcName, 1122309, $srcPath) }
+      catch {
+        try { $targetItem = $ctx.sources.Next.Add($srcName, $altType, $srcPath) }
+        catch { $targetItem = $ctx.sources.Next.Add($srcName, 1122309, $srcPath) }
+      }
     }
     if ($targetItem.FilePath -and (Test-Path -LiteralPath (Split-Path -Parent $targetItem.FilePath))) {
       Copy-Item -LiteralPath $srcPath -Destination $targetItem.FilePath -Force
@@ -272,6 +312,7 @@ function Handle-Command($req) {
     return @{
       ok = $true
       compile_code = 0
+      source_type = $srcType
       project_name = [string]$ctx.project.Name
       project_dir = [string]$ctx.project.LogPath
       source_name = [string]$targetItem.Name
@@ -293,44 +334,59 @@ function Handle-Command($req) {
   }
 
   if ($cmd -eq 'copy_block') {
-    $srcCtx = Find-ProjectAndProgram ([string]$req.source_project)
-    $dstCtx = Find-ProjectAndProgram ([string]$req.target_project)
+    $srcProjName = if ($req.source_project) { [string]$req.source_project } else { [string]$req.project_name }
+    $dstProjName = if ($req.target_project) { [string]$req.target_project } else { $srcProjName }
+    $srcBlkRaw = if ($req.source_block) { [string]$req.source_block } else { [string]$req.block_name }
+    $dstBlkRaw = if ($req.target_block) { [string]$req.target_block } else { $srcBlkRaw }
+    $srcCtx = Find-ProjectAndProgram $srcProjName
+    $dstCtx = Find-ProjectAndProgram $dstProjName
     if ($null -eq $srcCtx.blocks -or $null -eq $dstCtx.blocks) {
       return @{ ok = $false; error = 'Source or target Blocks container not found.' }
     }
-    $blkClean = ([string]$req.block_name) -replace '\s+', ''
+    $blkClean = $srcBlkRaw -replace '\s+', ''
+    $dstClean = $dstBlkRaw -replace '\s+', ''
     foreach ($b in $srcCtx.blocks.Next) {
       if (($b.Name -replace '\s+', '') -ieq $blkClean) {
-        $b.Copy($dstCtx.blocks)
-        return @{ ok = $true; copied = $blkClean; source_project = [string]$srcCtx.project.Name; target_project = [string]$dstCtx.project.Name }
+        $copiedObj = $b.Copy($dstCtx.blocks)
+        if ($dstClean -ne '' -and $dstClean -ine $blkClean -and $null -ne $copiedObj) {
+          try { $copiedObj.Name = $dstClean } catch {}
+        }
+        return @{
+          ok = $true
+          source_block = $blkClean
+          target_block = $dstClean
+          source_project = [string]$srcCtx.project.Name
+          target_project = [string]$dstCtx.project.Name
+        }
       }
     }
-    return @{ ok = $false; error = "Block '$blkClean' not found in source project." }
+    return @{ ok = $false; error = "Block '$blkClean' not found in source project '$($srcCtx.project.Name)'." }
   }
 
   if ($cmd -eq 'import_station_cfg') {
-    $s7 = Get-S7
     $targetProj = [string]$req.project_name
     $cfgPath = [string]$req.cfg_path
-    $proj = $null
-    foreach ($p in $s7.Projects) {
-      if ($targetProj -eq '' -or $p.Name -ieq $targetProj) { $proj = $p; break }
-    }
-    if ($null -eq $proj) { return @{ ok = $false; error = "Project '$targetProj' not found." } }
+    $proj = Find-UserProject $targetProj
+    if ($null -eq $proj) { return @{ ok = $false; error = "User project '$targetProj' not found." } }
     $st = $proj.Stations.Import($cfgPath)
-    return @{ ok = $true; project_name = [string]$proj.Name; station_name = [string]$st.Name; cfg_path = $cfgPath }
+    $progs = @()
+    try { foreach ($prg in $proj.Programs) { $progs += [string]$prg.Name } } catch {}
+    return @{
+      ok = $true
+      project_name = [string]$proj.Name
+      station_name = [string]$st.Name
+      programs = $progs
+      cfg_path = $cfgPath
+    }
   }
 
   if ($cmd -eq 'export_station_cfg') {
-    $s7 = Get-S7
     $targetProj = [string]$req.project_name
     $stationName = [string]$req.station_name
-    $cfgPath = [string]$req.cfg_path
-    $proj = $null
-    foreach ($p in $s7.Projects) {
-      if ($targetProj -eq '' -or $p.Name -ieq $targetProj) { $proj = $p; break }
-    }
-    if ($null -eq $proj) { return @{ ok = $false; error = "Project '$targetProj' not found." } }
+    $cfgPath = if ($req.cfg_path) { [string]$req.cfg_path } else { [string]$req.output_path }
+    if (-not $cfgPath) { return @{ ok = $false; error = 'cfg_path / output_path is required.' } }
+    $proj = Find-UserProject $targetProj
+    if ($null -eq $proj) { return @{ ok = $false; error = "User project '$targetProj' not found." } }
     $st = $null
     foreach ($cand in $proj.Stations) {
       if ($stationName -eq '' -or $cand.Name -ieq $stationName) { $st = $cand; break }
@@ -363,25 +419,67 @@ function Handle-Command($req) {
   if ($cmd -eq 'download_blocks') {
     $ctx = Find-ProjectAndProgram ([string]$req.project_name)
     if ($null -eq $ctx.program) { return @{ ok = $false; error = 'Program not found for download.' } }
-    $mode = if ($req.overwrite) { 1 } else { 0 }
-    $ctx.program.Download($mode)
-    return @{ ok = $true; project_name = [string]$ctx.project.Name; program_name = [string]$ctx.program.Name }
+    $mode = if ($null -eq $req.overwrite -or [bool]$req.overwrite) { 1 } else { 0 }
+    $reqBlocks = @()
+    if ($null -ne $req.blocks) {
+      foreach ($rb in $req.blocks) {
+        $c = ([string]$rb) -replace '\s+', ''
+        if ($c -ne '') { $reqBlocks += $c.ToUpper() }
+      }
+    }
+    if ($reqBlocks.Count -eq 0 -or ($reqBlocks -contains '*') -or ($reqBlocks -contains 'ALL')) {
+      $ctx.program.Download($mode)
+      return @{
+        ok = $true
+        scope = 'full_program'
+        project_name = [string]$ctx.project.Name
+        program_name = [string]$ctx.program.Name
+      }
+    }
+    if ($null -eq $ctx.blocks) { return @{ ok = $false; error = 'Blocks container not found for selective download.' } }
+    $downloaded = @()
+    $missing = @()
+    foreach ($want in $reqBlocks) {
+      $hit = $null
+      foreach ($b in $ctx.blocks.Next) {
+        if (($b.Name -replace '\s+', '') -ieq $want) { $hit = $b; break }
+      }
+      if ($null -ne $hit) {
+        $hit.Download($mode)
+        $downloaded += [string]$hit.Name
+      } else {
+        $missing += $want
+      }
+    }
+    return @{
+      ok = ($downloaded.Count -gt 0 -and $missing.Count -eq 0)
+      scope = 'selective_blocks'
+      project_name = [string]$ctx.project.Name
+      program_name = [string]$ctx.program.Name
+      downloaded_blocks = $downloaded
+      missing_blocks = $missing
+      error = if ($missing.Count -gt 0) { "Blocks not found for download: $($missing -join ', ')" } else { $null }
+    }
   }
 
   if ($cmd -eq 'upload_station') {
-    $s7 = Get-S7
     $targetProj = [string]$req.project_name
-    $proj = $null
-    foreach ($p in $s7.Projects) {
-      if ($targetProj -eq '' -or $p.Name -ieq $targetProj) { $proj = $p; break }
-    }
-    if ($null -eq $proj) { return @{ ok = $false; error = "Project '$targetProj' not found." } }
-    $rack = [int]$req.rack
-    $slot = [int]$req.slot
-    $addr = [string]$req.address
-    $subType = [string]$req.subnet_type
+    $proj = Find-UserProject $targetProj
+    if ($null -eq $proj) { return @{ ok = $false; error = "User project '$targetProj' not found." } }
+    $rack = if ($null -ne $req.rack) { [int]$req.rack } else { 0 }
+    $slot = if ($null -ne $req.slot) { [int]$req.slot } else { 2 }
+    $addr = if ($req.address) { [string]$req.address } else { '2' }
+    $subType = if ($req.subnet_type) { [string]$req.subnet_type } else { 'MPI' }
     $rc = $proj.UploadStationEx($rack, $slot, $addr, $subType, 0)
-    return @{ ok = ($rc -eq 0); return_code = $rc; project_name = [string]$proj.Name }
+    return @{
+      ok = ($rc -eq 0)
+      return_code = $rc
+      project_name = [string]$proj.Name
+      rack = $rack
+      slot = $slot
+      address = $addr
+      subnet_type = $subType
+    }
   }
 
   if ($cmd -eq 'open_block') {
@@ -429,7 +527,8 @@ function Handle-Command($req) {
   if ($cmd -eq 'plcsim_set_scan_mode') {
     $psim = Get-PSim
     if (-not $script:PSimConnected) { try { $psim.Connect(); $script:PSimConnected = $true } catch {} }
-    $modeVal = if (([string]$req.scan_mode).ToUpper() -match 'SINGLE') { 0 } else { 1 }
+    $rawMode = if ($req.scan_mode) { [string]$req.scan_mode } else { [string]$req.mode }
+    $modeVal = if ($rawMode.ToUpper() -match 'SINGLE') { 0 } else { 1 }
     $psim.SetScanMode($modeVal)
     return @{ ok = $true; scan_mode = [string]$psim.GetScanMode() }
   }
@@ -522,6 +621,53 @@ function Handle-Command($req) {
     return @{ ok = $true; cpu_state = [string]$psim.GetState() }
   }
 
+  if ($cmd -eq 'plcsim_batch_read') {
+    $results = @()
+    foreach ($it in $req.items) {
+      $subReq = [PSCustomObject]@{
+        cmd = 'plcsim_read'
+        area = $it.area
+        byte_offset = $it.byte_offset
+        bit_offset = $it.bit_offset
+        db_number = $it.db_number
+        data_size = $it.data_size
+      }
+      $r = Handle-Command $subReq
+      $results += @{
+        address = [string]$it.address
+        symbol = $it.symbol
+        ok = [bool]$r.ok
+        value = $r.value
+        error = $r.error
+      }
+    }
+    return @{ ok = $true; items = $results }
+  }
+
+  if ($cmd -eq 'plcsim_batch_write') {
+    $results = @()
+    foreach ($it in $req.items) {
+      $subReq = [PSCustomObject]@{
+        cmd = 'plcsim_write'
+        area = $it.area
+        byte_offset = $it.byte_offset
+        bit_offset = $it.bit_offset
+        db_number = $it.db_number
+        data_size = $it.data_size
+        value = $it.value
+      }
+      $r = Handle-Command $subReq
+      $results += @{
+        address = [string]$it.address
+        symbol = $it.symbol
+        ok = [bool]$r.ok
+        written_value = $it.value
+        error = $r.error
+      }
+    }
+    return @{ ok = $true; items = $results }
+  }
+
   return @{ ok = $false; error = "Unknown COM worker command '$cmd'." }
 }
 
@@ -565,10 +711,13 @@ class PersistentComWorker:
         self,
         native_exe_path: Optional[Path] = None,
         mock_handler: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+        prefer_native: bool = True,
     ) -> None:
         self._lock = threading.RLock()
         self._proc: Optional[subprocess.Popen] = None
+        self._fallback_ps_worker: Optional["PersistentComWorker"] = None
         self._mock_handler = mock_handler
+        self._prefer_native = prefer_native
         self._native_exe = native_exe_path or (Path(__file__).resolve().parents[1] / "native" / "s7_com_bridge.exe")
         self._ps32_exe: Optional[Path] = next((p for p in self.PS32_CANDIDATES if p.is_file()), None)
         self._backend_name: str = "unavailable"
@@ -580,7 +729,7 @@ class PersistentComWorker:
     def backend_name(self) -> str:
         if self._mock_handler is not None:
             return "mock_worker"
-        if sys.platform == "win32" and self._native_exe.is_file():
+        if self._prefer_native and sys.platform == "win32" and self._native_exe.is_file():
             return "native_cpp_x86"
         if sys.platform == "win32" and self._ps32_exe is not None:
             return "ps32_persistent_daemon"
@@ -600,6 +749,7 @@ class PersistentComWorker:
                 "request_count": self._request_count,
                 "restart_count": self._restart_count,
                 "native_bridge_present": self._native_exe.is_file(),
+                "hybrid_fallback_active": self._fallback_ps_worker is not None,
             }
 
     def _start_locked(self) -> Tuple[bool, Optional[str]]:
@@ -609,7 +759,7 @@ class PersistentComWorker:
             return False, "32-bit Windows COM host is not available on this platform."
 
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if sys.platform == "win32" else 0
-        if self._native_exe.is_file() and sys.platform == "win32":
+        if self._prefer_native and self._native_exe.is_file() and sys.platform == "win32":
             cmd = [str(self._native_exe)]
             self._backend_name = "native_cpp_x86"
         else:
@@ -686,6 +836,12 @@ class PersistentComWorker:
 
     def stop(self) -> None:
         with self._lock:
+            if self._fallback_ps_worker is not None:
+                try:
+                    self._fallback_ps_worker.stop()
+                except Exception:
+                    pass
+                self._fallback_ps_worker = None
             if self._proc is not None and self._proc.poll() is None:
                 try:
                     if self._proc.stdin:
@@ -710,6 +866,14 @@ class PersistentComWorker:
             payload.update(params)
         return self.request(payload, timeout=timeout_s)
 
+    def _delegate_to_ps32_fallback(self, payload: Dict[str, Any], timeout: float) -> Dict[str, Any]:
+        if self._fallback_ps_worker is None:
+            self._fallback_ps_worker = PersistentComWorker(
+                native_exe_path=self._native_exe,
+                prefer_native=False,
+            )
+        return self._fallback_ps_worker.request(payload, timeout=timeout)
+
     def request(self, payload: Dict[str, Any], timeout: float = 20.0) -> Dict[str, Any]:
         """Executes a single serialized command against the persistent 32-bit COM worker."""
         t0 = time.perf_counter()
@@ -717,6 +881,8 @@ class PersistentComWorker:
             self._request_count += 1
             if self._mock_handler is not None:
                 res = dict(self._mock_handler(payload))
+                if res.get("fallback_required") and self._fallback_ps_worker is not None:
+                    return self._fallback_ps_worker.request(payload, timeout=timeout)
                 res.setdefault("latency_ms", round((time.perf_counter() - t0) * 1000.0, 2))
                 return res
 
@@ -753,6 +919,8 @@ class PersistentComWorker:
                             "latency_ms": round((time.perf_counter() - t0) * 1000.0, 2),
                         }
                     parsed = json.loads(line.strip())
+                    if parsed.get("fallback_required") and self._backend_name == "native_cpp_x86" and self._ps32_exe is not None:
+                        return self._delegate_to_ps32_fallback(payload, timeout=timeout)
                     parsed["latency_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
                     return parsed
                 except Exception as exc:

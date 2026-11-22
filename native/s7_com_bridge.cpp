@@ -134,8 +134,8 @@ int main() {
             continue;
         }
 
-        // Delegate complex/extended commands by returning unsupported so Python falls back or extends
-        std::cout << "{\"ok\":false,\"error\":\"Command '" << json_escape(cmd) << "' requires extended COM dispatch\"}\n" << std::flush;
+        // Delegate complex/extended commands by signalling fallback_required so Python routes to persistent 32-bit PS COM worker
+        std::cout << "{\"ok\":false,\"fallback_required\":true,\"error\":\"Command '" << json_escape(cmd) << "' delegated to extended COM worker\"}\n" << std::flush;
     }
 
     if (pSimatic) pSimatic->Release();

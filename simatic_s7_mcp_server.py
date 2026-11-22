@@ -3598,14 +3598,17 @@ class SimaticComBridge:
         project_path: Optional[str] = None,
         station_name: str = "SIMATIC 300(1)",
         station_type: str = "S7-300",
+        create_station: bool = False,
     ) -> Tuple[bool, str, Dict[str, Any]]:
         res = self.worker.call(
             "create_project",
             {
                 "project_name": project_name,
+                "project_dir": project_path or "",
                 "project_path": project_path or "",
                 "station_name": station_name,
                 "station_type": station_type,
+                "create_station": bool(create_station),
             },
         )
         if not res.get("ok"):
@@ -3673,6 +3676,15 @@ class SimaticComBridge:
             return False, f"AWL source file does not exist: {awl_path}", {}
 
         blk_clean = re.sub(r"\s+", "", block_name.strip().upper())
+        ext = awl_path.suffix.lower()
+        tlang_up = (target_language or "").strip().upper()
+        if tlang_up == "SCL" or ext == ".scl":
+            src_type = 66
+        elif tlang_up == "GRAPH" or ext == ".gr7":
+            src_type = 67
+        else:
+            src_type = 65
+
         res = self.worker.call(
             "compile_source",
             {
@@ -3680,6 +3692,7 @@ class SimaticComBridge:
                 "block_name": blk_clean,
                 "source_path": str(awl_path.resolve()),
                 "source_name": f"MCP_{blk_clean}_SRC",
+                "source_type": src_type,
             },
             timeout_s=25.0,
         )
@@ -3690,7 +3703,7 @@ class SimaticComBridge:
         proj_dir = Path(proj_dir_str) if proj_dir_str else None
 
         should_set_lad = set_lad_language
-        if should_set_lad is None and target_language is None:
+        if should_set_lad is None and target_language is None and not blk_clean.startswith(("DB", "UDT")):
             try:
                 from lad_converter import validate_lad_source
                 code_txt = awl_path.read_text(encoding="utf-8", errors="ignore")
@@ -3699,11 +3712,11 @@ class SimaticComBridge:
             except Exception:
                 should_set_lad = False
 
-        lang_key = (target_language or ("LAD" if should_set_lad else "STL")).upper()
+        lang_key = (target_language or ("DB" if blk_clean.startswith(("DB", "UDT")) else ("LAD" if should_set_lad else "STL"))).upper()
         lang_code = STEP7_BLKLANG_CODES.get(lang_key, "00002" if should_set_lad else "00001")
 
         dbf_updated = 0
-        if proj_dir and proj_dir.is_dir():
+        if proj_dir and proj_dir.is_dir() and not blk_clean.startswith("UDT"):
             dbf_updated = _update_step7_subblk_language(proj_dir, blk_clean, lang_code=lang_code)
             if dbf_updated == 0:
                 res["ok"] = False
@@ -3713,7 +3726,7 @@ class SimaticComBridge:
                 return False, err_msg, res
 
         res["dbf_lad_records_updated"] = dbf_updated if lang_key == "LAD" else 0
-        res["block_language"] = lang_key if (dbf_updated > 0 or not proj_dir) else "STL"
+        res["block_language"] = lang_key if (dbf_updated > 0 or not proj_dir or blk_clean.startswith("UDT")) else "STL"
         return True, f"Compiled {awl_path.name} into {res.get('project_name')}/{blk_clean} via persistent STEP 7 COM.", res
 
     def copy_block(
@@ -3723,13 +3736,19 @@ class SimaticComBridge:
         project_name: Optional[str] = None,
         target_project: Optional[str] = None,
     ) -> Tuple[bool, str, Dict[str, Any]]:
+        src_proj = (project_name or "").strip()
+        dst_proj = (target_project or project_name or "").strip()
+        src_blk = re.sub(r"\s+", "", source_block.strip().upper())
+        dst_blk = re.sub(r"\s+", "", target_block.strip().upper())
         res = self.worker.call(
             "copy_block",
             {
-                "project_name": (project_name or "").strip(),
-                "target_project": (target_project or project_name or "").strip(),
-                "source_block": re.sub(r"\s+", "", source_block.strip().upper()),
-                "target_block": re.sub(r"\s+", "", target_block.strip().upper()),
+                "source_project": src_proj,
+                "project_name": src_proj,
+                "target_project": dst_proj,
+                "source_block": src_blk,
+                "block_name": src_blk,
+                "target_block": dst_blk,
             },
         )
         if not res.get("ok"):
@@ -3778,12 +3797,14 @@ class SimaticComBridge:
     ) -> Tuple[bool, str, Dict[str, Any]]:
         p = Path(output_path)
         p.parent.mkdir(parents=True, exist_ok=True)
+        resolved = str(p.resolve())
         res = self.worker.call(
             "export_station_cfg",
             {
                 "project_name": (project_name or "").strip(),
                 "station_name": (station_name or "").strip(),
-                "output_path": str(p.resolve()),
+                "cfg_path": resolved,
+                "output_path": resolved,
             },
             timeout_s=30.0,
         )
@@ -3795,19 +3816,41 @@ class SimaticComBridge:
         self,
         block_names: Sequence[str],
         project_name: Optional[str] = None,
+        overwrite: bool = True,
     ) -> Tuple[bool, str, Dict[str, Any]]:
         cleaned = [re.sub(r"\s+", "", b.strip().upper()) for b in block_names]
         res = self.worker.call(
             "download_blocks",
-            {"project_name": (project_name or "").strip(), "blocks": cleaned},
+            {
+                "project_name": (project_name or "").strip(),
+                "blocks": cleaned,
+                "overwrite": bool(overwrite),
+            },
             timeout_s=30.0,
         )
         if not res.get("ok"):
             return False, res.get("error", "COM download_blocks failed."), res
-        return True, f"Downloaded {len(cleaned)} block(s).", res
+        return True, f"Downloaded {len(cleaned) if cleaned else 'all'} block(s).", res
 
-    def upload_station(self, project_name: Optional[str] = None) -> Tuple[bool, str, Dict[str, Any]]:
-        res = self.worker.call("upload_station", {"project_name": (project_name or "").strip()}, timeout_s=30.0)
+    def upload_station(
+        self,
+        project_name: Optional[str] = None,
+        rack: int = 0,
+        slot: int = 2,
+        address: str = "2",
+        subnet_type: str = "MPI",
+    ) -> Tuple[bool, str, Dict[str, Any]]:
+        res = self.worker.call(
+            "upload_station",
+            {
+                "project_name": (project_name or "").strip(),
+                "rack": int(rack),
+                "slot": int(slot),
+                "address": str(address),
+                "subnet_type": str(subnet_type).upper(),
+            },
+            timeout_s=30.0,
+        )
         if not res.get("ok"):
             return False, res.get("error", "COM upload_station failed."), res
         return True, "Uploaded station from PLC.", res
@@ -4051,6 +4094,9 @@ class S7RuntimeClient:
         "A": 0x82,
         "M": 0x83,
         "DB": 0x84,
+        "T": 0x1D,
+        "C": 0x1C,
+        "Z": 0x1C,
     }
 
     def __init__(self, com_bridge: Optional[SimaticComBridge] = None) -> None:
@@ -4214,6 +4260,22 @@ class S7RuntimeClient:
                 "byte_length": blen,
             }
 
+        # 4. Timers (T n) and Counters (C n / Z n)
+        m_tc = re.match(r"^([TCZ])(\d+)$", s)
+        if m_tc:
+            tc_ch = "C" if m_tc.group(1) in ("C", "Z") else "T"
+            tc_num = int(m_tc.group(2))
+            return {
+                "canonical": f"{tc_ch} {tc_num}",
+                "area": tc_ch,
+                "area_code": self.AREA_MAP[tc_ch],
+                "db_number": 0,
+                "data_size": "WORD",
+                "byte_offset": tc_num,
+                "bit_offset": 0,
+                "byte_length": 2,
+            }
+
         return None
 
     def _iso_tcp_connect(self, host: str, port: int, rack: int, slot: int, timeout: float = 2.5) -> socket.socket:
@@ -4278,38 +4340,48 @@ class S7RuntimeClient:
 
     def ping(self, host: str = "127.0.0.1", port: int = 102, rack: int = 0, slot: int = 2) -> Dict[str, Any]:
         t0 = time.perf_counter()
-        if host.strip().lower() not in ("plcsim", "prosim"):
+        h_low = host.strip().lower()
+        if h_low == "virtual":
+            return {
+                "ok": True,
+                "connected": True,
+                "transport": "virtual_s7_plc",
+                "host": "virtual",
+                "cpu_state": VIRTUAL_PLC.cpu_mode,
+                "order_number": VIRTUAL_PLC.order_number,
+                "scan_count": VIRTUAL_PLC.scan_count,
+                "latency_ms": round((time.perf_counter() - t0) * 1000.0, 3),
+            }
+        if h_low not in ("plcsim", "prosim"):
             try:
-                with self._iso_tcp_connect(host, port, rack, slot, timeout=2.0):
-                    latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
-                    return {
-                        "ok": True,
-                        "connected": True,
-                        "transport": "s7comm_iso_tcp",
-                        "host": host,
-                        "port": port,
-                        "rack": rack,
-                        "slot": slot,
-                        "latency_ms": latency_ms,
-                    }
+                self.pool.acquire(host, port, rack, slot, timeout_s=2.0)
+                latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+                return {
+                    "ok": True,
+                    "connected": True,
+                    "transport": "s7comm_iso_tcp",
+                    "host": host,
+                    "port": port,
+                    "rack": rack,
+                    "slot": slot,
+                    "latency_ms": latency_ms,
+                    "pool": self.pool.stats(),
+                }
             except Exception as tcp_exc:
                 tcp_err = str(tcp_exc)
         else:
             tcp_err = "PLCSIM COM requested explicitly."
 
-        # Fallback: check local S7ProSim COM
-        ps = r"""
-$psim = New-Object -ComObject "S7wspsmx.S7ProSim.1"
-$state = $psim.GetState()
-@{ ok = $true; state = [string]$state } | ConvertTo-Json -Compress
-"""
-        res = self.com_bridge._run_ps32_json(ps, timeout=8.0)
+        # Fast persistent S7ProSim COM worker check (no cold PS spawn)
+        res = self.com_bridge.worker.call("plcsim_get_state", timeout_s=6.0)
         if res.get("ok"):
             return {
                 "ok": True,
                 "connected": True,
                 "transport": "plcsim_s7prosim_com",
-                "cpu_state": res.get("state"),
+                "cpu_state": res.get("cpu_state") or res.get("state"),
+                "scan_mode": res.get("scan_mode"),
+                "latency_ms": round((time.perf_counter() - t0) * 1000.0, 2),
                 "tcp_fallback_note": tcp_err,
             }
         return {
@@ -4340,43 +4412,49 @@ $state = $psim.GetState()
                 spec["data_size"] = dt_up
                 spec["byte_length"] = {"BIT": 1, "BYTE": 1, "WORD": 2, "INT": 2, "DWORD": 4, "DINT": 4, "REAL": 4}[dt_up]
 
-        if host.strip().lower() not in ("plcsim", "prosim"):
-            try:
-                with self._iso_tcp_connect(host, port, rack, slot, timeout=2.5) as sock:
-                    is_bit = spec["data_size"] == "BIT"
-                    transport_sz = 0x01 if is_bit else 0x02
-                    req_count = 1 if is_bit else spec["byte_length"]
-                    bit_addr = (spec["byte_offset"] * 8) + (spec["bit_offset"] if is_bit else 0)
-                    addr_bytes = bytes([(bit_addr >> 16) & 0xFF, (bit_addr >> 8) & 0xFF, bit_addr & 0xFF])
+        h_low = host.strip().lower()
+        if h_low == "virtual":
+            dt_v = "BOOL" if spec["data_size"] == "BIT" else spec["data_size"]
+            val = VIRTUAL_PLC.read_address(spec["canonical"].replace(" ", ""), data_type=dt_v)
+            raw_b = self._encode_value(val, spec["data_size"])
+            return {
+                "ok": True,
+                "transport": "virtual_s7_plc",
+                "address": spec["canonical"],
+                "symbol": spec.get("resolved_symbol"),
+                "data_size": spec["data_size"],
+                "value": val,
+                "raw_hex": raw_b.hex(),
+                "cpu_state": VIRTUAL_PLC.cpu_mode,
+            }
 
-                    item_spec = (
-                        bytes([0x12, 0x0A, 0x10, transport_sz])
-                        + struct.pack(">HHB", req_count, spec["db_number"], spec["area_code"])
-                        + addr_bytes
-                    )
-                    s7_param = bytes([0x04, 0x01]) + item_spec
-                    s7_pdu = (
-                        bytes([0x02, 0xF0, 0x80, 0x32, 0x01, 0x00, 0x00, 0x00, 0x02])
-                        + struct.pack(">HH", len(s7_param), 0)
-                        + s7_param
-                    )
-                    sock.sendall(struct.pack(">BBH", 0x03, 0x00, 4 + len(s7_pdu)) + s7_pdu)
-                    resp = self._recv_tpkt(sock)
-                    # COTP DT (3) + S7 Ack_Data header (12) + Param (2) = offset 17
-                    if len(resp) < 21 or resp[17] != 0xFF:
-                        ret_code = resp[17] if len(resp) > 17 else -1
-                        raise RuntimeError(f"S7 Read Var rejected by PLC (return code 0x{ret_code:02X}).")
-                    raw_data = resp[21:]
-                    val = self._decode_value(raw_data, spec["data_size"])
-                    return {
-                        "ok": True,
-                        "transport": "s7comm_iso_tcp",
-                        "address": spec["canonical"],
+        if h_low not in ("plcsim", "prosim"):
+            try:
+                dt_p = "BOOL" if spec["data_size"] == "BIT" else spec["data_size"]
+                res = self.pool.batch_read(
+                    host=host,
+                    items=[{
+                        "address": spec["canonical"].replace(" ", ""),
+                        "data_type": dt_p,
                         "symbol": spec.get("resolved_symbol"),
-                        "data_size": spec["data_size"],
-                        "value": val,
-                        "raw_hex": raw_data[:spec["byte_length"]].hex(),
-                    }
+                    }],
+                    port=port,
+                    rack=rack,
+                    slot=slot,
+                    timeout_s=2.5,
+                )
+                item = res["items"][0] if res.get("items") else {}
+                if not item.get("ok"):
+                    raise RuntimeError(f"S7 Read Var rejected by PLC ({item.get('return_code') or item.get('error')}).")
+                return {
+                    "ok": True,
+                    "transport": "s7comm_iso_tcp",
+                    "address": spec["canonical"],
+                    "symbol": spec.get("resolved_symbol"),
+                    "data_size": spec["data_size"],
+                    "value": item["value"],
+                    "raw_hex": item.get("raw_hex", ""),
+                }
             except Exception as tcp_exc:
                 if host not in ("127.0.0.1", "localhost"):
                     return {"ok": False, "error": f"ISO-on-TCP read failed on {host}:{port}: {tcp_exc}"}
@@ -4425,46 +4503,50 @@ $state = $psim.GetState()
         except Exception as enc_exc:
             return {"ok": False, "error": f"Invalid value '{value}' for {spec['data_size']}: {enc_exc}"}
 
-        if host.strip().lower() not in ("plcsim", "prosim"):
+        decoded_val = self._decode_value(encoded_bytes, spec["data_size"])
+        h_low = host.strip().lower()
+        if h_low == "virtual":
+            dt_v = "BOOL" if spec["data_size"] == "BIT" else spec["data_size"]
+            VIRTUAL_PLC.write_address(spec["canonical"].replace(" ", ""), decoded_val, data_type=dt_v)
+            return {
+                "ok": True,
+                "status": "SUCCESS",
+                "transport": "virtual_s7_plc",
+                "address": spec["canonical"],
+                "symbol": spec.get("resolved_symbol"),
+                "data_size": spec["data_size"],
+                "written_value": decoded_val,
+                "cpu_state": VIRTUAL_PLC.cpu_mode,
+            }
+
+        if h_low not in ("plcsim", "prosim"):
             try:
-                with self._iso_tcp_connect(host, port, rack, slot, timeout=2.5) as sock:
-                    is_bit = spec["data_size"] == "BIT"
-                    transport_sz = 0x01 if is_bit else 0x02
-                    req_count = 1 if is_bit else spec["byte_length"]
-                    bit_addr = (spec["byte_offset"] * 8) + (spec["bit_offset"] if is_bit else 0)
-                    addr_bytes = bytes([(bit_addr >> 16) & 0xFF, (bit_addr >> 8) & 0xFF, bit_addr & 0xFF])
-
-                    item_spec = (
-                        bytes([0x12, 0x0A, 0x10, transport_sz])
-                        + struct.pack(">HHB", req_count, spec["db_number"], spec["area_code"])
-                        + addr_bytes
-                    )
-                    s7_param = bytes([0x05, 0x01]) + item_spec
-                    if is_bit:
-                        data_sec = bytes([0x00, 0x03, 0x00, 0x01]) + encoded_bytes
-                    else:
-                        data_sec = bytes([0x00, 0x04]) + struct.pack(">H", len(encoded_bytes) * 8) + encoded_bytes
-
-                    s7_pdu = (
-                        bytes([0x02, 0xF0, 0x80, 0x32, 0x01, 0x00, 0x00, 0x00, 0x03])
-                        + struct.pack(">HH", len(s7_param), len(data_sec))
-                        + s7_param
-                        + data_sec
-                    )
-                    sock.sendall(struct.pack(">BBH", 0x03, 0x00, 4 + len(s7_pdu)) + s7_pdu)
-                    resp = self._recv_tpkt(sock)
-                    if len(resp) < 18 or resp[17] != 0xFF:
-                        ret_code = resp[17] if len(resp) > 17 else -1
-                        raise RuntimeError(f"S7 Write Var rejected by PLC (return code 0x{ret_code:02X}).")
-                    return {
-                        "ok": True,
-                        "status": "SUCCESS",
-                        "transport": "s7comm_iso_tcp",
-                        "address": spec["canonical"],
+                dt_p = "BOOL" if spec["data_size"] == "BIT" else spec["data_size"]
+                res = self.pool.batch_write(
+                    host=host,
+                    items=[{
+                        "address": spec["canonical"].replace(" ", ""),
+                        "data_type": dt_p,
+                        "value": decoded_val,
                         "symbol": spec.get("resolved_symbol"),
-                        "data_size": spec["data_size"],
-                        "written_value": self._decode_value(encoded_bytes, spec["data_size"]),
-                    }
+                    }],
+                    port=port,
+                    rack=rack,
+                    slot=slot,
+                    timeout_s=2.5,
+                )
+                item = res["items"][0] if res.get("items") else {}
+                if not item.get("ok"):
+                    raise RuntimeError(f"S7 Write Var rejected by PLC ({item.get('return_code') or item.get('error')}).")
+                return {
+                    "ok": True,
+                    "status": "SUCCESS",
+                    "transport": "s7comm_iso_tcp",
+                    "address": spec["canonical"],
+                    "symbol": spec.get("resolved_symbol"),
+                    "data_size": spec["data_size"],
+                    "written_value": decoded_val,
+                }
             except Exception as tcp_exc:
                 if host not in ("127.0.0.1", "localhost"):
                     return {"ok": False, "error": f"ISO-on-TCP write failed on {host}:{port}: {tcp_exc}"}
@@ -4549,7 +4631,7 @@ $state = $psim.GetState()
             "symbol": spec.get("resolved_symbol"),
             "data_size": spec["data_size"],
             "value": res.get("value"),
-            "cpu_state": res.get("state"),
+            "cpu_state": res.get("cpu_state") or res.get("state"),
         }
 
     def _plcsim_write(self, spec: Dict[str, Any], value: Any) -> Dict[str, Any]:
@@ -4579,7 +4661,7 @@ $state = $psim.GetState()
             "symbol": spec.get("resolved_symbol"),
             "data_size": spec["data_size"],
             "written_value": val_to_send,
-            "cpu_state": res.get("state"),
+            "cpu_state": res.get("cpu_state") or res.get("state"),
         }
 
     def batch_read(
@@ -4591,20 +4673,71 @@ $state = $psim.GetState()
         slot: int = 2,
         project_name: Optional[str] = None,
     ) -> Dict[str, Any]:
+        t0 = time.perf_counter()
         resolved: List[Dict[str, Any]] = []
+        specs: List[Tuple[Dict[str, Any], Optional[Dict[str, Any]]]] = []
         for it in items:
             raw_addr = it if isinstance(it, str) else str(it.get("address") or it.get("symbol") or "")
             dt = None if isinstance(it, str) else it.get("data_type")
             sym = None if isinstance(it, str) else it.get("symbol")
             spec, err = self.resolve_address(raw_addr, project_name=project_name)
             if spec is not None and not err:
-                resolved.append({
+                entry = {
                     "address": spec["canonical"].replace(" ", ""),
                     "data_type": dt or ("BOOL" if spec["data_size"] == "BIT" else spec["data_size"]),
                     "symbol": sym or spec.get("resolved_symbol"),
-                })
+                }
+                resolved.append(entry)
+                specs.append((entry, spec))
             else:
-                resolved.append({"address": raw_addr.replace(" ", ""), "data_type": dt, "symbol": sym})
+                entry = {"address": raw_addr.replace(" ", ""), "data_type": dt, "symbol": sym}
+                resolved.append(entry)
+                specs.append((entry, None))
+
+        h_low = host.strip().lower()
+        if h_low == "virtual":
+            out_items: List[Dict[str, Any]] = []
+            for entry, _ in specs:
+                val = VIRTUAL_PLC.read_address(entry["address"], data_type=entry.get("data_type"))
+                out_items.append({
+                    "address": entry["address"],
+                    "symbol": entry.get("symbol"),
+                    "data_type": entry.get("data_type"),
+                    "value": val,
+                    "ok": True,
+                })
+            return {
+                "ok": True,
+                "transport": "virtual_s7_plc",
+                "host": "virtual",
+                "port": 0,
+                "item_count": len(out_items),
+                "pdu_count": 1,
+                "latency_ms": round((time.perf_counter() - t0) * 1000.0, 2),
+                "items": out_items,
+            }
+
+        if h_low in ("plcsim", "prosim"):
+            plcsim_items = []
+            for entry, spec in specs:
+                if spec is None:
+                    continue
+                dsize = (entry.get("data_type") or spec["data_size"]).upper()
+                if dsize == "BOOL":
+                    dsize = "BIT"
+                plcsim_items.append({
+                    "address": entry["address"],
+                    "area": spec["area"],
+                    "byte_offset": spec["byte_offset"],
+                    "bit_offset": spec["bit_offset"],
+                    "db_number": spec["db_number"],
+                    "data_size": dsize,
+                })
+            res = self.com_bridge.worker.call("plcsim_batch_read", {"items": plcsim_items}, timeout_s=10.0)
+            res["transport"] = "plcsim_s7prosim_com"
+            res["latency_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
+            return res
+
         return self.pool.batch_read(host=host, items=resolved, port=port, rack=rack, slot=slot)
 
     def batch_write(
@@ -4627,25 +4760,82 @@ $state = $psim.GetState()
                     "Requires BOTH confirm_live_write=True AND S7_WRITES_ENABLED=true."
                 ),
             }
+        t0 = time.perf_counter()
         resolved: List[Dict[str, Any]] = []
+        specs: List[Tuple[Dict[str, Any], Optional[Dict[str, Any]]]] = []
         for it in items:
             raw_addr = str(it.get("address") or it.get("symbol") or "")
             dt = it.get("data_type")
             spec, err = self.resolve_address(raw_addr, project_name=project_name)
             if spec is not None and not err:
-                resolved.append({
+                entry = {
                     "address": spec["canonical"].replace(" ", ""),
                     "data_type": dt or ("BOOL" if spec["data_size"] == "BIT" else spec["data_size"]),
                     "value": it.get("value"),
                     "symbol": it.get("symbol") or spec.get("resolved_symbol"),
-                })
+                }
+                resolved.append(entry)
+                specs.append((entry, spec))
             else:
-                resolved.append({
+                entry = {
                     "address": raw_addr.replace(" ", ""),
                     "data_type": dt,
                     "value": it.get("value"),
                     "symbol": it.get("symbol"),
+                }
+                resolved.append(entry)
+                specs.append((entry, None))
+
+        h_low = host.strip().lower()
+        if h_low == "virtual":
+            out_items: List[Dict[str, Any]] = []
+            for entry, _ in specs:
+                VIRTUAL_PLC.write_address(entry["address"], entry["value"], data_type=entry.get("data_type"))
+                out_items.append({
+                    "address": entry["address"],
+                    "symbol": entry.get("symbol"),
+                    "data_type": entry.get("data_type"),
+                    "written_value": entry["value"],
+                    "ok": True,
                 })
+            return {
+                "ok": True,
+                "status": "SUCCESS",
+                "transport": "virtual_s7_plc",
+                "host": "virtual",
+                "port": 0,
+                "item_count": len(out_items),
+                "pdu_count": 1,
+                "latency_ms": round((time.perf_counter() - t0) * 1000.0, 2),
+                "items": out_items,
+            }
+
+        if h_low in ("plcsim", "prosim"):
+            plcsim_items = []
+            for entry, spec in specs:
+                if spec is None:
+                    continue
+                dsize = (entry.get("data_type") or spec["data_size"]).upper()
+                if dsize == "BOOL":
+                    dsize = "BIT"
+                val = entry["value"]
+                val_to_send = float(val) if dsize == "REAL" else (
+                    bool(self._encode_value(val, "BIT")[0]) if dsize == "BIT" else int(val)
+                )
+                plcsim_items.append({
+                    "address": entry["address"],
+                    "area": spec["area"],
+                    "byte_offset": spec["byte_offset"],
+                    "bit_offset": spec["bit_offset"],
+                    "db_number": spec["db_number"],
+                    "data_size": dsize,
+                    "value": val_to_send,
+                })
+            res = self.com_bridge.worker.call("plcsim_batch_write", {"items": plcsim_items}, timeout_s=10.0)
+            res["transport"] = "plcsim_s7prosim_com"
+            res["latency_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
+            return res
+
         return self.pool.batch_write(host=host, items=resolved, port=port, rack=rack, slot=slot)
 
     def read_cpu_diagnostics(
@@ -4655,6 +4845,39 @@ $state = $psim.GetState()
         rack: int = 0,
         slot: int = 2,
     ) -> Dict[str, Any]:
+        h_low = host.strip().lower()
+        if h_low == "virtual":
+            return {
+                "ok": True,
+                "transport": "virtual_s7_plc",
+                "host": "virtual",
+                "port": 0,
+                "order_number": VIRTUAL_PLC.order_number,
+                "cpu_mode": VIRTUAL_PLC.cpu_mode,
+                "scan_count": VIRTUAL_PLC.scan_count,
+                "sim_time_ms": VIRTUAL_PLC.sim_time_ms,
+                "diagnostics_count": len(VIRTUAL_PLC.diagnostics),
+                "diagnostics_buffer": [
+                    {
+                        "event_id": f"0x{d['event_id']:04X}",
+                        "priority_class": d["priority_class"],
+                        "ob_number": d["ob_number"],
+                        "info1": f"0x{d['info1']:04X}",
+                        "info2": f"0x{d['info2']:08X}",
+                    }
+                    for d in VIRTUAL_PLC.diagnostics
+                ],
+            }
+        if h_low in ("plcsim", "prosim"):
+            st = self.com_bridge.worker.call("plcsim_get_state", timeout_s=6.0)
+            return {
+                "ok": bool(st.get("ok")),
+                "transport": "plcsim_s7prosim_com",
+                "host": host,
+                "cpu_mode": st.get("cpu_state") or st.get("state") or "UNKNOWN",
+                "scan_mode": st.get("scan_mode"),
+                "error": st.get("error"),
+            }
         return self.pool.read_szl_diagnostics(host=host, port=port, rack=rack, slot=slot)
 
     def cpu_control(
@@ -4673,6 +4896,22 @@ $state = $psim.GetState()
                 "failure_category": FailureCategory.WRITE_GUARDRAIL_BLOCKED.value,
                 "error": "Remote CPU RUN/STOP control requires BOTH confirm_live_write=True AND S7_WRITES_ENABLED=true.",
             }
+        h_low = host.strip().lower()
+        if h_low == "virtual":
+            new_mode = VIRTUAL_PLC.set_mode(action)
+            return {
+                "ok": True,
+                "transport": "virtual_s7_plc",
+                "host": "virtual",
+                "action": action.upper(),
+                "cpu_mode": new_mode,
+            }
+        if h_low in ("plcsim", "prosim"):
+            target_state = "STOP" if action.strip().upper() == "STOP" else "RUN_P"
+            res = self.com_bridge.worker.call("plcsim_set_state", {"state": target_state}, timeout_s=8.0)
+            res["transport"] = "plcsim_s7prosim_com"
+            res["action"] = action.upper()
+            return res
         return self.pool.cpu_control(host=host, action=action, port=port, rack=rack, slot=slot)
 
 
@@ -5855,7 +6094,7 @@ def serialized_gui(function):
     return wrapper
 
 
-@mcp.tool()
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, title="Get SIMATIC Manager Status"))
 @serialized_gui
 def s7_get_status() -> str:
     """
@@ -5883,7 +6122,7 @@ def s7_get_status() -> str:
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, title="List Supported PLC Families"))
 def s7_list_supported_plc_types() -> str:
     """
     Lists supported Siemens S7 PLC families (S7-300, S7-400, WinAC), limits, aliases, and addressing conventions.
@@ -5917,7 +6156,7 @@ def s7_list_supported_plc_types() -> str:
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=make_tool_annotations(read_only=False, title="Create STEP 7 Project"))
 @serialized_gui
 def s7_create_project(
     project_name: str,
@@ -5969,7 +6208,7 @@ def s7_create_project(
     }, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=make_tool_annotations(read_only=False, idempotent=True, title="Open STEP 7 Project"))
 @serialized_gui
 def s7_open_project(
     project_path_or_name: str,
@@ -5991,7 +6230,7 @@ def s7_open_project(
     }, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=make_tool_annotations(read_only=False, idempotent=True, title="Open Block in Editor"))
 @serialized_gui
 def s7_open_block(
     block_name: str = "OB1",
@@ -6012,7 +6251,7 @@ def s7_open_block(
     }, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, title="Validate AWL/STL Program"))
 def s7_validate_program(
     networks: List[Dict[str, Any]],
     symbols: Optional[Any] = None,
@@ -6066,7 +6305,7 @@ def s7_validate_program(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=make_tool_annotations(read_only=False, idempotent=True, title="Write & Verify S7 Program"))
 @serialized_gui
 def s7_write_program(
     networks: List[Dict[str, Any]],
@@ -6361,7 +6600,7 @@ def s7_write_program(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, title="Read S7 Program Block"))
 @serialized_gui
 def s7_read_program(block_name: str = "OB1") -> str:
     """
@@ -6435,7 +6674,7 @@ def s7_read_program(block_name: str = "OB1") -> str:
     }, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=make_tool_annotations(read_only=False, idempotent=True, title="Compile & Check Block"))
 @serialized_gui
 def s7_compile_and_check(block_name: str = "OB1") -> str:
     """
@@ -6460,7 +6699,7 @@ def s7_compile_and_check(block_name: str = "OB1") -> str:
     }, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=make_tool_annotations(read_only=False, idempotent=True, title="Write Symbol Table Artifacts"))
 def s7_write_symbol_table(
     symbols: Any,
     import_via_gui: bool = False,
@@ -6520,7 +6759,7 @@ def s7_write_symbol_table(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, title="Read Symbol Table File"))
 def s7_read_symbol_table(symbol_table_path: str) -> str:
     """
     Reads and validates a previously exported Siemens STEP 7 Symbol Table (.SDF, .SEQ, or .CSV).
@@ -6537,7 +6776,7 @@ def s7_read_symbol_table(symbol_table_path: str) -> str:
     return json.dumps(parsed, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=make_tool_annotations(read_only=False, idempotent=True, title="Write Device Comments"))
 def s7_write_device_comments(
     device_comments: Dict[str, Any],
     plc_type: str = "S7-300",
@@ -6620,7 +6859,7 @@ def s7_write_device_comments(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, title="Read Device Comments"))
 def s7_read_device_comments(comment_file_path: Optional[str] = None) -> str:
     """
     Reads and parses a SIMATIC STEP 7 Device Comment / Symbol Table file (.SDF, .SEQ, or .CSV).
@@ -6669,7 +6908,7 @@ def s7_read_device_comments(comment_file_path: Optional[str] = None) -> str:
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, title="Search Symbols & Comments"))
 def s7_search_symbols_and_comments(
     query: str,
     filter_type: str = "ALL",
@@ -6719,7 +6958,7 @@ def s7_search_symbols_and_comments(
     return json.dumps(res, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=make_tool_annotations(read_only=False, idempotent=True, title="Annotate AWL Code"))
 def s7_annotate_awl_code(
     source_code: Optional[str] = None,
     networks: Optional[List[Dict[str, Any]]] = None,
@@ -6801,7 +7040,7 @@ def s7_annotate_awl_code(
         return json.dumps({"success": False, "error": f"Failed to annotate AWL code: {exc}"}, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, title="Get Cross-References"))
 def s7_get_cross_references(
     networks: Optional[List[Dict[str, Any]]] = None,
     awl_source_path: Optional[str] = None,
@@ -6848,7 +7087,7 @@ def s7_get_cross_references(
     return json.dumps(res, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, title="Get Memory Usage Map"))
 def s7_get_memory_usage_map(
     networks: Optional[List[Dict[str, Any]]] = None,
     awl_source_path: Optional[str] = None,
@@ -6906,7 +7145,7 @@ def s7_get_memory_usage_map(
     return json.dumps(res, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, title="Get Project Block Overview"))
 def s7_get_block_overview(project_path_or_name: Optional[str] = None) -> str:
     """
     Scans the STEP 7 project workspace and returns an overview of all program blocks
@@ -6921,7 +7160,7 @@ def s7_get_block_overview(project_path_or_name: Optional[str] = None) -> str:
     return json.dumps(res, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, title="Analyze Program Safety"))
 def s7_analyze_program(
     networks: Optional[List[Dict[str, Any]]] = None,
     awl_source_path: Optional[str] = None,
@@ -6968,7 +7207,7 @@ def s7_analyze_program(
     return json.dumps(res, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, title="Auto-Detect STEP 7 Environment"))
 def s7_auto_detect_controllers() -> str:
     """
     Auto-detects the host SIMATIC STEP 7 Classic environment:
@@ -6982,7 +7221,7 @@ def s7_auto_detect_controllers() -> str:
     return json.dumps(res, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, title="Validate LAD Compliance"))
 def s7_validate_lad_compliance(
     source_code: Optional[str] = None,
     awl_source_path: Optional[str] = None,
@@ -7013,7 +7252,7 @@ def s7_validate_lad_compliance(
     return json.dumps(res, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, title="Convert AWL to Pure LAD"))
 def s7_convert_to_ladder(
     source_code: Optional[str] = None,
     awl_source_path: Optional[str] = None,
@@ -7067,7 +7306,7 @@ def s7_convert_to_ladder(
 runtime_client = S7RuntimeClient()
 
 
-@mcp.tool()
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, title="List Projects via COM"))
 def s7_com_list_projects() -> str:
     """
     Lists all Siemens STEP 7 projects registered in the native 32-bit STEP 7 Command Interface
@@ -7085,7 +7324,7 @@ def s7_com_list_projects() -> str:
     }, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, title="List Blocks via COM"))
 def s7_com_list_blocks(project_name: Optional[str] = None) -> str:
     """
     Lists all compiled blocks (OB, FC, FB, DB, SDB) and source files in a STEP 7 project
@@ -7154,14 +7393,15 @@ def s7_com_write_block(
     awl_source_path: Optional[str] = None,
     project_name: Optional[str] = None,
     convert_to_lad: bool = True,
+    target_language: Optional[str] = None,
     plc_type: str = "S7-300",
     expected_content_hash: Optional[str] = None,
 ) -> str:
     """
-    Compiles and writes a block (OB, FC, FB, DB) directly into a STEP 7 project using the native
+    Compiles and writes a block (OB, FC, FB, DB, UDT) directly into a STEP 7 project using the native
     Siemens STEP 7 Command Interface (IS7Source.Compile in UnattendedServerMode) with automatic
-    backup, AST Ladder normalization, optimistic concurrency check, SUBBLK.DBF BLKLANG tagging,
-    audit trail logging, and readback verification.
+    backup, AST Ladder normalization (skipped for DB/UDT), optimistic concurrency check, SUBBLK.DBF
+    BLKLANG tagging (STL/LAD/FBD/DB), audit trail logging, and readback verification.
     """
     denied = _check_access_mode("s7_com_write_block", AccessMode.READ_WRITE)
     if denied:
@@ -7215,7 +7455,8 @@ def s7_com_write_block(
         (ln.strip().upper() for ln in candidate_code.splitlines() if ln.strip() and not ln.strip().startswith("//")),
         "",
     )
-    if not first_header.startswith(("DATA_BLOCK", "TYPE")):
+    is_data_or_type_block = first_header.startswith(("DATA_BLOCK", "TYPE")) or blk_clean.startswith(("DB", "UDT"))
+    if not is_data_or_type_block:
         pre_report = validate_and_analyze_program(candidate_code, plc_type=plc_type)
         if not pre_report.valid:
             return json.dumps({
@@ -7226,10 +7467,13 @@ def s7_com_write_block(
                 "warnings": pre_report.warnings,
             }, indent=2)
 
-    if convert_to_lad:
+    eff_tlang = (target_language or ("DB" if is_data_or_type_block else None))
+    if convert_to_lad and not is_data_or_type_block and (eff_tlang or "").upper() != "STL":
         candidate_code = convert_awl_to_pure_lad(candidate_code)
 
-    lad_report = validate_lad_source(candidate_code)
+    lad_report = validate_lad_source(candidate_code) if not is_data_or_type_block else None
+    is_lad_ok = bool(lad_report.is_lad_compliant) if lad_report is not None else False
+    total_nets = lad_report.total_networks if lad_report is not None else 0
 
     # 2. Take pre-modification backup via COM GenerateSource (if block already exists) + optimistic hash check
     backup_path = new_s7_artifact_path(f"{blk_clean.lower()}-com-before")
@@ -7256,7 +7500,8 @@ def s7_com_write_block(
         awl_path=after_path,
         block_name=blk_clean,
         project_name=eff_proj,
-        set_lad_language=lad_report.is_lad_compliant,
+        set_lad_language=is_lad_ok if not eff_tlang else None,
+        target_language=eff_tlang,
     )
     if not comp_ok:
         rollback_info = _restore_com_backup()
@@ -7309,9 +7554,9 @@ def s7_com_write_block(
         "mode": "native_com",
         "project_name": comp_meta.get("project_name", eff_proj),
         "block_name": blk_clean,
-        "block_language": comp_meta.get("block_language", "LAD" if lad_report.is_lad_compliant else "STL"),
-        "is_lad_compliant": lad_report.is_lad_compliant,
-        "total_networks": lad_report.total_networks,
+        "block_language": comp_meta.get("block_language", eff_tlang or ("LAD" if is_lad_ok else "STL")),
+        "is_lad_compliant": is_lad_ok,
+        "total_networks": total_nets,
         "compile_code": comp_meta.get("compile_code", 0),
         "dbf_lad_records_updated": comp_meta.get("dbf_lad_records_updated", 0),
         "content_hash": new_hash,
@@ -8097,13 +8342,18 @@ def s7_com_create_project(
     project_path: Optional[str] = None,
     station_name: str = "SIMATIC 300(1)",
     station_type: str = "S7-300",
+    create_station: bool = False,
 ) -> str:
     """Creates a new Siemens STEP 7 Classic project directly via native 32-bit COM (`Simatic.Simatic`)."""
     denied = _check_access_mode("s7_com_create_project", AccessMode.READ_WRITE)
     if denied:
         return denied
     ok, msg, meta = controller.com_bridge.create_project(
-        project_name=project_name, project_path=project_path, station_name=station_name, station_type=station_type
+        project_name=project_name,
+        project_path=project_path,
+        station_name=station_name,
+        station_type=station_type,
+        create_station=create_station,
     )
     return json.dumps({"success": ok, "message": msg, "details": meta}, indent=2)
 
@@ -8160,9 +8410,10 @@ def s7_com_delete_block(
 def s7_com_download_blocks(
     blocks: List[str],
     project_name: Optional[str] = None,
+    overwrite: bool = True,
     confirm_live_write: bool = False,
 ) -> str:
-    """Downloads compiled blocks to the configured online PLC / S7-PLCSIM target via COM (requires full mode + dual guard)."""
+    """Downloads compiled blocks (or all program blocks when blocks is empty/['*']) to the online PLC / S7-PLCSIM target via COM (requires full mode + dual guard)."""
     denied = _check_access_mode("s7_com_download_blocks", AccessMode.FULL)
     if denied:
         return denied
@@ -8176,16 +8427,93 @@ def s7_com_download_blocks(
             },
             indent=2,
         )
-    ok, msg, meta = controller.com_bridge.download_blocks(block_names=blocks, project_name=project_name)
+    ok, msg, meta = controller.com_bridge.download_blocks(block_names=blocks, project_name=project_name, overwrite=overwrite)
     AUDIT_LOGGER.record(tool="s7_com_download_blocks", action="download", target=f"{project_name}:{','.join(blocks)}", success=ok, status="SUCCESS" if ok else "FAILED")
     return json.dumps({"success": ok, "message": msg, "details": meta}, indent=2)
 
 
-@mcp.tool(annotations=make_tool_annotations(read_only=True, title="Upload Station from PLC"))
-def s7_com_upload_station(project_name: Optional[str] = None) -> str:
+@mcp.tool(annotations=make_tool_annotations(read_only=False, title="Upload Station from PLC"))
+def s7_com_upload_station(
+    project_name: Optional[str] = None,
+    rack: int = 0,
+    slot: int = 2,
+    address: str = "2",
+    subnet_type: str = "MPI",
+) -> str:
     """Uploads station blocks and hardware configuration from a connected online PLC into STEP 7 via COM."""
-    ok, msg, meta = controller.com_bridge.upload_station(project_name=project_name)
+    denied = _check_access_mode("s7_com_upload_station", AccessMode.READ_WRITE)
+    if denied:
+        return denied
+    ok, msg, meta = controller.com_bridge.upload_station(
+        project_name=project_name, rack=rack, slot=slot, address=address, subnet_type=subnet_type
+    )
     return json.dumps({"success": ok, "message": msg, "details": meta}, indent=2)
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, title="Export Symbol Table via COM"))
+def s7_com_export_symbols(
+    project_name: Optional[str] = None,
+    output_path: Optional[str] = None,
+) -> str:
+    """Exports the live STEP 7 Symbol Table directly from SIMATIC Manager via COM (`SymbolTable.Export`) and parses all entries."""
+    out_p = Path(output_path).expanduser() if output_path else new_s7_artifact_path("com-symbols", suffix=".asc")
+    ok, msg_or_path = controller.com_bridge.export_symbols(output_path=out_p, project_name=project_name)
+    if not ok:
+        return json.dumps({"success": False, "failure_category": FailureCategory.COM_UNAVAILABLE.value, "error": msg_or_path}, indent=2)
+    parsed = parse_s7_symbol_table(out_p)
+    return json.dumps(
+        {
+            "success": True,
+            "mode": "native_com",
+            "symbol_file_path": str(out_p),
+            "symbol_count": parsed.get("symbol_count", 0),
+            "symbols": parsed.get("symbols", []),
+        },
+        indent=2,
+    )
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=False, idempotent=True, title="Import Symbol Table via COM"))
+def s7_com_import_symbols(
+    symbols: Optional[Any] = None,
+    symbol_file_path: Optional[str] = None,
+    project_name: Optional[str] = None,
+) -> str:
+    """Validates and imports symbols directly into a live STEP 7 project's Symbol Table via COM (`SymbolTable.Import`)."""
+    denied = _check_access_mode("s7_com_import_symbols", AccessMode.READ_WRITE)
+    if denied:
+        return denied
+    target_path: Optional[Path] = None
+    symbol_count = 0
+    if symbol_file_path:
+        p = Path(symbol_file_path).expanduser()
+        if not p.is_file():
+            return json.dumps({"success": False, "failure_category": FailureCategory.TARGET_NOT_FOUND.value, "error": f"Symbol file not found: {symbol_file_path}"}, indent=2)
+        target_path = p
+        parsed = parse_s7_symbol_table(p)
+        symbol_count = parsed.get("symbol_count", 0)
+    elif symbols is not None:
+        errors, entries = _validate_symbol_map(symbols)
+        if errors:
+            return json.dumps({"success": False, "failure_category": FailureCategory.VALIDATION_ERROR.value, "errors": errors}, indent=2)
+        asc_txt = generate_s7_symbol_asc(entries)
+        target_path = save_s7_artifact(asc_txt, new_s7_artifact_path("com-import-symbols", suffix=".asc"))
+        symbol_count = len(entries)
+    else:
+        return json.dumps({"success": False, "failure_category": FailureCategory.VALIDATION_ERROR.value, "error": "Provide symbols or symbol_file_path."}, indent=2)
+
+    ok, msg = controller.com_bridge.import_symbols(input_path=target_path, project_name=project_name)
+    AUDIT_LOGGER.record(tool="s7_com_import_symbols", action="import_symbols", target=str(project_name or "active"), success=ok, status="SUCCESS" if ok else "FAILED")
+    return json.dumps(
+        {
+            "success": ok,
+            "mode": "native_com",
+            "message": msg,
+            "symbol_count": symbol_count,
+            "symbol_file_path": str(target_path),
+        },
+        indent=2,
+    )
 
 
 @mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, title="Compare Two Blocks"))
@@ -8238,7 +8566,7 @@ def s7_plcsim_control(
         "disconnect": ("plcsim_disconnect", {}),
         "get_state": ("plcsim_get_state", {}),
         "set_state": ("plcsim_set_state", {"state": (state or "RUN_P").upper()}),
-        "set_scan_mode": ("plcsim_set_scan_mode", {"mode": (scan_mode or "SINGLE").upper()}),
+        "set_scan_mode": ("plcsim_set_scan_mode", {"scan_mode": (scan_mode or "SINGLE").upper()}),
         "save_plc": ("plcsim_save_plc", {"file_path": plc_file_path or ""}),
         "load_plc": ("plcsim_load_plc", {"file_path": plc_file_path or ""}),
     }
@@ -8508,10 +8836,73 @@ def s7_monitor_watch_table(
     interval_ms: int = 100,
 ) -> str:
     """
-    Monitors a named STEP 7 Watch Table (VAT) over pooled S7comm multi-item PDUs, returning
-    symbolic values, delta changes vs previous snapshot, and optional multi-sample polling.
+    Monitors a named STEP 7 Watch Table (VAT) over pooled S7comm multi-item PDUs, VirtualS7PLC (`host='virtual'`),
+    or S7-PLCSIM (`host='plcsim'`), returning symbolic values, delta changes vs previous snapshot, and optional polling.
     """
     try:
+        h_low = host.strip().lower()
+        if h_low in ("virtual", "plcsim", "prosim"):
+            sym_lookup = {k.strip().upper(): v.strip() for k, v in (symbol_table or {}).items()}
+            resolved_tags: List[Dict[str, Any]] = []
+            for t in tags:
+                if isinstance(t, str):
+                    addr_or_sym, dt, sym = t.strip(), None, None
+                else:
+                    addr_or_sym = str(t.get("address") or t.get("symbol") or "").strip()
+                    dt = t.get("data_type")
+                    sym = t.get("symbol")
+                if addr_or_sym.upper() in sym_lookup:
+                    sym = sym or addr_or_sym
+                    addr = sym_lookup[addr_or_sym.upper()]
+                else:
+                    addr = addr_or_sym
+                resolved_tags.append({"address": addr, "data_type": dt, "symbol": sym})
+
+            sample_count = max(1, min(int(samples), 20))
+            all_samples: List[Dict[str, Any]] = []
+            key = f"{table_id}@{h_low}:0"
+            for idx in range(sample_count):
+                br = runtime_client.batch_read(resolved_tags, host=host, port=port, rack=rack, slot=slot)
+                with runtime_client.watch_monitor._lock:
+                    prev = runtime_client.watch_monitor._last_snapshots.get(key, {})
+                    deltas: List[Dict[str, Any]] = []
+                    curr_map: Dict[str, Any] = {}
+                    for it in br.get("items", []):
+                        addr = it["address"]
+                        val = it.get("value")
+                        curr_map[addr] = val
+                        if addr in prev and prev[addr] != val:
+                            deltas.append({
+                                "address": addr,
+                                "symbol": it.get("symbol"),
+                                "previous": prev[addr],
+                                "current": val,
+                            })
+                    runtime_client.watch_monitor._last_snapshots[key] = curr_map
+                all_samples.append({
+                    "sample_index": idx,
+                    "timestamp": time.time(),
+                    "latency_ms": br.get("latency_ms", 0.0),
+                    "pdu_count": br.get("pdu_count", 1),
+                    "items": br.get("items", []),
+                    "changed": deltas,
+                })
+                if idx < sample_count - 1 and interval_ms > 0:
+                    time.sleep(min(interval_ms, 5000) / 1000.0)
+            res = {
+                "ok": True,
+                "success": True,
+                "transport": "virtual_s7_plc" if h_low == "virtual" else "plcsim_s7prosim_com",
+                "table_id": table_id,
+                "host": host,
+                "port": 0,
+                "tag_count": len(resolved_tags),
+                "sample_count": len(all_samples),
+                "latest": all_samples[-1] if all_samples else None,
+                "samples": all_samples,
+            }
+            return json.dumps(res, indent=2)
+
         res = runtime_client.watch_monitor.snapshot(
             host=host,
             tags=tags,

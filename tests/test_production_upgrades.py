@@ -424,5 +424,304 @@ class TestPersistentComWorkerAndCli(unittest.TestCase):
         self.assertIn("MyPlant", SERVER.s7_new_project_wizard("MyPlant"))
 
 
+class TestEndToEndSimaticManagerWorkflow(unittest.TestCase):
+    """Verifies the complete SIMATIC Manager end-to-end workflow across COM, HW Config,
+    Symbols, all IEC 61131-3 languages, PLCSIM, VirtualS7PLC, and Runtime Monitoring."""
+
+    def setUp(self):
+        self._orig_mode = SERVER.ACTIVE_ACCESS_MODE
+        self._orig_env = os.environ.get("S7_WRITES_ENABLED")
+        self._orig_bridge = SERVER.controller.com_bridge
+        self._orig_rt_bridge = SERVER.runtime_client.com_bridge
+
+    def tearDown(self):
+        SERVER.set_access_mode(self._orig_mode)
+        if self._orig_env is None:
+            os.environ.pop("S7_WRITES_ENABLED", None)
+        else:
+            os.environ["S7_WRITES_ENABLED"] = self._orig_env
+        SERVER.controller.com_bridge = self._orig_bridge
+        SERVER.runtime_client.com_bridge = self._orig_rt_bridge
+
+    def test_full_simatic_manager_lifecycle_via_mock_com_and_virtual_plc(self):
+        recorded: list = []
+        stored_blocks: dict = {}
+        stored_symbols_text = ""
+        stored_cfg_text = ""
+
+        def mock_com(req):
+            nonlocal stored_symbols_text, stored_cfg_text
+            cmd = req.get("cmd")
+            recorded.append((cmd, dict(req)))
+
+            if cmd == "create_project":
+                return {"ok": True, "project_name": req["project_name"], "project_dir": req.get("project_dir") or "/tmp/s7proj"}
+            if cmd == "import_station_cfg":
+                stored_cfg_text = Path(req["cfg_path"]).read_text(encoding="utf-8")
+                return {"ok": True, "project_name": req["project_name"], "station_name": req.get("station_name") or "SIMATIC 300(1)", "programs": ["S7 Program(1)"]}
+            if cmd == "export_station_cfg":
+                out_p = Path(req.get("cfg_path") or req.get("output_path"))
+                out_p.write_text(stored_cfg_text, encoding="utf-8")
+                return {"ok": True, "cfg_path": str(out_p)}
+            if cmd == "import_symbols":
+                stored_symbols_text = Path(req["input_path"]).read_text(encoding="latin1")
+                return {"ok": True, "project_name": req.get("project_name") or "PlantE2E"}
+            if cmd == "export_symbols":
+                out_p = Path(req["output_path"])
+                out_p.write_text(stored_symbols_text, encoding="latin1")
+                return {"ok": True, "output_path": str(out_p)}
+            if cmd == "compile_source":
+                src = Path(req["source_path"]).read_text(encoding="utf-8")
+                stored_blocks[req["block_name"]] = src
+                return {"ok": True, "project_name": req.get("project_name") or "PlantE2E", "compile_code": 0, "source_type": req.get("source_type")}
+            if cmd == "export_block":
+                blk = req["block_name"]
+                if blk not in stored_blocks:
+                    return {"ok": False, "error": f"Block {blk} not found"}
+                Path(req["output_path"]).write_text(stored_blocks[blk], encoding="utf-8")
+                return {"ok": True, "output_path": req["output_path"]}
+            if cmd == "browse_project_tree":
+                return {"ok": True, "project_name": req.get("project_name") or "PlantE2E", "stations": [{"name": "SIMATIC 300(1)"}], "programs": [{"name": "S7 Program(1)", "blocks": sorted(stored_blocks.keys()), "symbol_table_available": True}]}
+            if cmd == "copy_block":
+                stored_blocks[req["target_block"]] = stored_blocks.get(req["source_block"], "")
+                return {"ok": True, "source_block": req["source_block"], "target_block": req["target_block"]}
+            if cmd == "delete_block":
+                stored_blocks.pop(req["block_name"], None)
+                return {"ok": True, "deleted": req["block_name"]}
+            if cmd == "download_blocks":
+                return {"ok": True, "downloaded": req.get("blocks"), "overwrite": req.get("overwrite")}
+            if cmd == "upload_station":
+                return {"ok": True, "rack": req.get("rack"), "slot": req.get("slot"), "address": req.get("address"), "subnet_type": req.get("subnet_type")}
+            if cmd == "plcsim_get_state":
+                return {"ok": True, "cpu_state": "RUN_P", "scan_mode": "SINGLE"}
+            if cmd == "plcsim_set_scan_mode":
+                return {"ok": True, "scan_mode": req.get("scan_mode")}
+            if cmd == "plcsim_step_scan":
+                return {"ok": True, "cycles_executed": req.get("cycles")}
+            if cmd == "plcsim_batch_write":
+                return {"ok": True, "item_count": len(req.get("items", [])), "items": [{"address": i["address"], "ok": True} for i in req.get("items", [])]}
+            if cmd == "plcsim_batch_read":
+                return {"ok": True, "item_count": len(req.get("items", [])), "items": [{"address": i["address"], "value": True, "ok": True} for i in req.get("items", [])]}
+            if cmd == "plcsim_read":
+                return {"ok": True, "value": 12.5, "cpu_state": "RUN_P"}
+            if cmd == "plcsim_write":
+                return {"ok": True, "cpu_state": "RUN_P"}
+            return {"ok": True}
+
+        worker = PersistentComWorker(mock_handler=mock_com)
+        bridge = SERVER.SimaticComBridge(worker=worker)
+        bridge.is_available = lambda: True  # Simulate Windows COM availability
+        SERVER.controller.com_bridge = bridge
+        SERVER.runtime_client.com_bridge = bridge
+        SERVER.set_access_mode(AccessMode.FULL)
+        os.environ["S7_WRITES_ENABLED"] = "true"
+
+        # 1. Create STEP 7 project via COM
+        cp = json.loads(SERVER.s7_com_create_project("PlantE2E", project_path="/tmp/PlantE2E", create_station=True))
+        self.assertTrue(cp["success"])
+        cp_req = next(r for c, r in recorded if c == "create_project")
+        self.assertEqual(cp_req["project_dir"], "/tmp/PlantE2E")
+        self.assertTrue(cp_req["create_station"])
+
+        # 2. Configure DIN rail, export .cfg, push to COM, and re-export from COM
+        hw = json.loads(SERVER.s7_hw_configure_station(
+            station_name="SIMATIC 300(1)",
+            plc_family="S7-300",
+            modules=[
+                {"slot": 1, "module": "PS 307 5A"},
+                {"slot": 2, "module": "6ES7 315-2EH14-0AB0", "ip_address": "192.168.0.10"},
+                {"slot": 4, "module": "DI16xDC24V"},
+                {"slot": 5, "module": "DO16xDC24V"},
+            ],
+        ))
+        self.assertTrue(hw["success"])
+        exp_cfg = json.loads(SERVER.s7_hw_export_cfg(station_name="SIMATIC 300(1)"))
+        imp_cfg = json.loads(SERVER.s7_hw_import_cfg(cfg_path=exp_cfg["cfg_path"], project_name="PlantE2E", push_to_com=True))
+        self.assertTrue(imp_cfg["success"])
+        self.assertTrue(imp_cfg["com_import"]["ok"])
+        exp_from_com = json.loads(SERVER.s7_hw_export_cfg(station_name="SIMATIC 300(1)", from_com_project="PlantE2E"))
+        self.assertTrue(exp_from_com["success"])
+        self.assertIn("6ES7 315-2EH14-0AB0", exp_from_com["cfg_text"])
+
+        # 3. Import & Export live Symbol Table via COM
+        imp_sym = json.loads(SERVER.s7_com_import_symbols(
+            symbols={"START_PB": "I 0.0", "STOP_PB": "I 0.1", "MOTOR_Q": "Q 0.0"},
+            project_name="PlantE2E",
+        ))
+        self.assertTrue(imp_sym["success"])
+        self.assertEqual(imp_sym["symbol_count"], 3)
+        exp_sym = json.loads(SERVER.s7_com_export_symbols(project_name="PlantE2E"))
+        self.assertTrue(exp_sym["success"])
+        self.assertEqual(exp_sym["symbol_count"], 3)
+
+        # 4. Program all IEC 61131-3 types: UDT, DB (via s7_create_data_block AND s7_com_write_block!), LAD, FBD, SCL, S7-GRAPH
+        udt = json.loads(SERVER.s7_create_udt(1, [{"name": "Run", "type": "BOOL"}, {"name": "Speed", "type": "INT"}], project_name="PlantE2E", compile_via_com=True))
+        self.assertTrue(udt["success"])
+        db = json.loads(SERVER.s7_create_data_block(10, [{"name": "Run", "type": "BOOL"}, {"name": "Speed", "type": "INT"}], project_name="PlantE2E", compile_via_com=True))
+        self.assertTrue(db["success"])
+        # Ensure s7_com_write_block with default convert_to_lad=True does NOT corrupt DATA_BLOCK source
+        db_direct = json.loads(SERVER.s7_com_write_block(block_name="DB11", source_code=db["awl_source"].replace("DB 10", "DB 11"), project_name="PlantE2E", convert_to_lad=True))
+        self.assertTrue(db_direct["success"], f"DB direct COM write failed: {db_direct}")
+        self.assertIn("DATA_BLOCK DB 11", stored_blocks["DB11"])
+
+        ob1_lad = json.loads(SERVER.s7_com_write_block(
+            block_name="OB1",
+            networks=[{"title": "Latch", "instructions": ["A I 0.0", "AN I 0.1", "= Q 0.0"]}],
+            project_name="PlantE2E",
+            convert_to_lad=True,
+        ))
+        self.assertTrue(ob1_lad["success"])
+        self.assertEqual(ob1_lad["block_language"], "LAD")
+
+        fc_fbd = json.loads(SERVER.s7_com_write_block(
+            block_name="FC2",
+            networks=[{"title": "Interlock", "instructions": ["A I 0.2", "= Q 0.1"]}],
+            project_name="PlantE2E",
+            convert_to_lad=True,
+            target_language="FBD",
+        ))
+        self.assertTrue(fc_fbd["success"])
+        self.assertEqual(fc_fbd["block_language"], "FBD")
+
+        scl = json.loads(SERVER.s7_write_scl_block(
+            scl_code="FUNCTION FC 3 : VOID\nVAR_INPUT\n  En : BOOL;\nEND_VAR\nBEGIN\n  IF En THEN\n    ;\n  END_IF;\nEND_FUNCTION\n",
+            block_name="FC3",
+            project_name="PlantE2E",
+        ))
+        self.assertTrue(scl["success"])
+        scl_req = [r for c, r in recorded if c == "compile_source" and r["block_name"] == "FC3"][-1]
+        self.assertEqual(scl_req["source_type"], 66)
+
+        gr7 = json.loads(SERVER.s7_write_graph_block(
+            fb_number=5,
+            steps=[
+                {"number": 1, "name": "S_IDLE", "initial": True, "actions": [{"qualifier": "N", "operand": "Q 0.0"}]},
+                {"number": 2, "name": "S_RUN", "actions": [{"qualifier": "S", "operand": "Q 0.1"}]},
+            ],
+            transitions=[
+                {"number": 1, "name": "T1", "from_step": 1, "to_step": 2, "condition": "I 0.0"},
+                {"number": 2, "name": "T2", "from_step": 2, "to_step": 1, "condition": "I 0.1"},
+            ],
+            project_name="PlantE2E",
+        ))
+        self.assertTrue(gr7["success"])
+        gr7_req = [r for c, r in recorded if c == "compile_source" and r["block_name"] == "FB5"][-1]
+        self.assertEqual(gr7_req["source_type"], 67)
+
+        # 5. Browse tree, copy block, compare blocks, delete block
+        tree = json.loads(SERVER.s7_com_browse_project_tree("PlantE2E"))
+        self.assertTrue(tree["success"])
+        cp_blk = json.loads(SERVER.s7_com_copy_block("OB1", "OB100", project_name="PlantE2E"))
+        self.assertTrue(cp_blk["success"])
+        cp_blk_req = next(r for c, r in recorded if c == "copy_block")
+        self.assertEqual(cp_blk_req["source_project"], "PlantE2E")
+        self.assertEqual(cp_blk_req["target_block"], "OB100")
+
+        diff = json.loads(SERVER.s7_compare_blocks(stored_blocks["OB1"], stored_blocks["OB100"], "OB1", "OB100"))
+        self.assertTrue(diff["identical"])
+        del_blk = json.loads(SERVER.s7_com_delete_block("OB100", project_name="PlantE2E", confirm_delete=True))
+        self.assertTrue(del_blk["success"])
+
+        # 6. Selective download & upload station with MPI/rack/slot parameters
+        dl = json.loads(SERVER.s7_com_download_blocks(["OB1", "DB10"], project_name="PlantE2E", overwrite=False, confirm_live_write=True))
+        self.assertTrue(dl["success"])
+        dl_req = next(r for c, r in recorded if c == "download_blocks")
+        self.assertEqual(dl_req["blocks"], ["OB1", "DB10"])
+        self.assertFalse(dl_req["overwrite"])
+
+        ul = json.loads(SERVER.s7_com_upload_station(project_name="PlantE2E", rack=0, slot=2, address="2", subnet_type="MPI"))
+        self.assertTrue(ul["success"])
+        ul_req = next(r for c, r in recorded if c == "upload_station")
+        self.assertEqual(ul_req["subnet_type"], "MPI")
+        self.assertEqual(ul_req["slot"], 2)
+
+        # 7. PLCSIM control, ping, single & batch read/write (verifying scan_mode + cpu_state)
+        sm = json.loads(SERVER.s7_plcsim_control(action="set_scan_mode", scan_mode="SINGLE"))
+        self.assertTrue(sm["success"])
+        self.assertEqual(sm["scan_mode"], "SINGLE")
+        p_sim = json.loads(SERVER.s7_runtime_ping(host="plcsim"))
+        self.assertTrue(p_sim["success"])
+        self.assertEqual(p_sim["cpu_state"], "RUN_P")
+        rd_sim = json.loads(SERVER.s7_runtime_read("DB1.DBD0", data_type="REAL", host="plcsim"))
+        self.assertEqual(rd_sim["cpu_state"], "RUN_P")
+        br_sim = json.loads(SERVER.s7_runtime_batch_read(["I0.0", "Q0.0"], host="plcsim"))
+        self.assertTrue(br_sim["success"])
+        self.assertEqual(br_sim["transport"], "plcsim_s7prosim_com")
+
+        # 8. VirtualS7PLC first-class runtime target (`host='virtual'`) across ALL runtime tools
+        self.assertTrue(json.loads(SERVER.s7_runtime_ping(host="virtual"))["success"])
+        self.assertTrue(json.loads(SERVER.s7_runtime_write("MW20", 1234, data_type="INT", host="virtual", confirm_live_write=True))["success"])
+        self.assertEqual(json.loads(SERVER.s7_runtime_read("MW20", data_type="INT", host="virtual"))["value"], 1234)
+        self.assertTrue(json.loads(SERVER.s7_runtime_batch_write([{"address": "M5.0", "value": True}, {"address": "T2", "value": 50}], host="virtual", confirm_live_write=True))["success"])
+        vbr = json.loads(SERVER.s7_runtime_batch_read(["M5.0", "MW20"], host="virtual"))
+        self.assertTrue(vbr["success"])
+        vat_v1 = json.loads(SERVER.s7_monitor_watch_table(["M5.0", "MW20"], host="virtual", table_id="VAT_VIRT"))
+        self.assertTrue(vat_v1["success"])
+        SERVER.VIRTUAL_PLC.write_address("M5.0", False)
+        vat_v2 = json.loads(SERVER.s7_monitor_watch_table(["M5.0", "MW20"], host="virtual", table_id="VAT_VIRT"))
+        self.assertEqual(len(vat_v2["latest"]["changed"]), 1)
+        self.assertTrue(json.loads(SERVER.s7_runtime_cpu_control("STOP", host="virtual", confirm_live_write=True))["success"])
+        self.assertEqual(json.loads(SERVER.s7_runtime_cpu_diagnostics(host="virtual"))["cpu_mode"], "STOP")
+        SERVER.VIRTUAL_PLC.set_mode("RUN")
+
+
+class TestAuditRemediationsAndAnnotations(unittest.TestCase):
+    def test_s7_access_mode_env_var_matches_client_config(self):
+        from simatic_s7_mcp.contracts import resolve_access_mode
+
+        orig_a = os.environ.get("S7_ACCESS_MODE")
+        orig_m = os.environ.get("S7_MCP_MODE")
+        try:
+            os.environ.pop("S7_MCP_MODE", None)
+            os.environ["S7_ACCESS_MODE"] = "read-only"
+            self.assertEqual(resolve_access_mode(None), AccessMode.READ_ONLY)
+            os.environ["S7_ACCESS_MODE"] = "full"
+            self.assertEqual(resolve_access_mode(None), AccessMode.FULL)
+        finally:
+            if orig_a is None:
+                os.environ.pop("S7_ACCESS_MODE", None)
+            else:
+                os.environ["S7_ACCESS_MODE"] = orig_a
+            if orig_m is None:
+                os.environ.pop("S7_MCP_MODE", None)
+            else:
+                os.environ["S7_MCP_MODE"] = orig_m
+
+    def test_iec_reference_and_prompts_use_valid_tool_names(self):
+        ref_txt = SERVER.resource_s7_iec_reference()
+        prompt_txt = SERVER.s7_convert_and_verify_lad("FC1")
+        wizard_txt = SERVER.s7_new_project_wizard("Line1")
+        self.assertIn("s7_convert_to_ladder", ref_txt)
+        self.assertNotIn("s7_convert_to_lad`", ref_txt)
+        self.assertIn("s7_convert_to_ladder", prompt_txt)
+        self.assertIn("s7_com_import_symbols", wizard_txt)
+
+    def test_native_bridge_fallback_required_delegates_to_ps32(self):
+        calls = []
+
+        def fake_fallback(req):
+            calls.append(req["cmd"])
+            return {"ok": True, "via": "ps32_fallback", "cmd": req["cmd"]}
+
+        fallback_worker = PersistentComWorker(mock_handler=fake_fallback)
+        primary = PersistentComWorker(mock_handler=lambda req: {"ok": False, "fallback_required": True, "error": "extended cmd"})
+        primary._fallback_ps_worker = fallback_worker
+        res = primary.call("import_station_cfg", {"cfg_path": "x.cfg"})
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["via"], "ps32_fallback")
+        self.assertEqual(calls, ["import_station_cfg"])
+
+    def test_every_registered_mcp_tool_has_annotations(self):
+        if hasattr(SERVER.mcp, "_tool_manager"):
+            tools = SERVER.mcp._tool_manager.list_tools()
+            self.assertGreaterEqual(len(tools), 54)
+            missing = [t.name for t in tools if t.annotations is None]
+        else:
+            tools_map = getattr(SERVER.mcp, "_tools", {})
+            self.assertGreaterEqual(len(tools_map), 54)
+            missing = [name for name, meta in tools_map.items() if meta.get("annotations") is None]
+        self.assertEqual(missing, [], f"Tools missing MCP ToolAnnotations: {missing}")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -324,7 +324,7 @@ def build_iec_reference_resource_text() -> str:
         "",
         "## Critical STEP 7 Classic Rules",
         "1. LAD/KOP: Every S7 Timer/Counter/Math/Move box needs exact BLD 101/102 and NOP 0 placeholders.",
-        "   Always call s7_convert_to_lad or s7_validate_lad_compliance before writing LAD blocks.",
+        "   Always call s7_convert_to_ladder or s7_validate_lad_compliance before writing LAD blocks.",
         "2. FBD/FUP: Use s7_convert_to_fbd + s7_validate_fbd_compliance; avoid STL-only jumps (JL, LOOP).",
         "3. SCL: Use := for assignment, = for equality, <> for inequality, AND/OR/NOT, END_IF/END_FOR.",
         "4. S7-GRAPH: Every step must be reachable from an initial step; avoid sink states without transitions.",
@@ -341,7 +341,7 @@ def build_prompt_new_project_wizard(project_name: str = "MyS7Project", cpu_mlfb:
         f"2. Call s7_hw_configure_station to assemble Rack 0 (PS in Slot 1, CPU '{cpu_mlfb}' in Slot 2, "
         f"DI/DO/AI/AO modules in Slots 4+) and verify power budget & I/O addresses via s7_hw_validate_station.\n"
         f"3. Export the validated hardware configuration with s7_hw_export_cfg and, if live COM is active, "
-        f"call s7_com_create_project and s7_hw_import_cfg.\n"
+        f"call s7_com_create_project, s7_hw_import_cfg(push_to_com=True), and s7_com_import_symbols.\n"
         f"4. Create Data Blocks / UDTs via s7_create_udt and s7_create_data_block, write control logic in "
         f"LAD/FBD/SCL/GRAPH, and verify execution in VirtualS7PLC or S7-PLCSIM before downloading."
     )
@@ -361,7 +361,7 @@ def build_prompt_convert_and_verify_lad(block_name: str = "FC1") -> str:
     return (
         f"Convert and verify block '{block_name}' as 100% pure STEP 7 Classic LAD/KOP:\n"
         f"1. Read current source and record its content_hash.\n"
-        f"2. Run s7_convert_to_lad to normalize STL into pure LAD with valid BLD/NOP 0 structure.\n"
+        f"2. Run s7_convert_to_ladder to normalize STL into pure LAD with valid BLD/NOP 0 structure.\n"
         f"3. Verify with s7_validate_lad_compliance (must pass with 0 violations).\n"
         f"4. Write back passing expected_content_hash, then run a scan-cycle verification in VirtualS7PLC or PLCSIM."
     )

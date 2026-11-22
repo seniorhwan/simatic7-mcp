@@ -46,9 +46,14 @@ class FailureCategory(str, Enum):
 def resolve_access_mode(cli_mode: Optional[str] = None) -> AccessMode:
     """
     Resolves effective server access mode using precedence:
-    CLI argument > S7_MCP_MODE environment variable > default (READ_WRITE).
+    CLI argument > S7_ACCESS_MODE > S7_MCP_MODE > default (READ_WRITE).
     """
-    raw = (cli_mode or os.environ.get("S7_MCP_MODE") or AccessMode.READ_WRITE.value).strip().lower()
+    raw = (
+        cli_mode
+        or os.environ.get("S7_ACCESS_MODE")
+        or os.environ.get("S7_MCP_MODE")
+        or AccessMode.READ_WRITE.value
+    ).strip().lower()
     normalized = raw.replace("_", "-")
     aliases = {
         "ro": AccessMode.READ_ONLY,
