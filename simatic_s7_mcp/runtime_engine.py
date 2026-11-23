@@ -29,12 +29,17 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 # ---------------------------------------------------------------------------
 
 S7_AREA_CODES: Dict[str, int] = {
+    "PI": 0x80,
+    "PE": 0x80,
     "I": 0x81,
     "E": 0x81,
     "Q": 0x82,
     "A": 0x82,
     "M": 0x83,
     "DB": 0x84,
+    "PQ": 0x85,
+    "PA": 0x85,
+    "L": 0x86,
     "C": 0x1C,
     "Z": 0x1C,
     "T": 0x1D,
@@ -51,8 +56,8 @@ S7_TRANSPORT_SIZE_TIMER = 0x1D
 @dataclass(frozen=True)
 class ParsedS7Address:
     raw: str
-    area: str          # "I", "Q", "M", "DB", "T", "C"
-    area_code: int     # 0x81, 0x82, 0x83, 0x84, 0x1D, 0x1C
+    area: str          # "I", "Q", "M", "DB", "T", "C", "PI", "PQ", "L"
+    area_code: int     # 0x81, 0x82, 0x83, 0x84, 0x1D, 0x1C, 0x80, 0x85, 0x86
     db_number: int     # 0 for non-DB
     byte_offset: int
     bit_offset: int
@@ -60,23 +65,43 @@ class ParsedS7Address:
     byte_length: int
 
 
-_RE_BIT = re.compile(r"^([IEQAM])(\d+)\.([0-7])$", re.IGNORECASE)
-_RE_SCALAR = re.compile(r"^([IEQAM])([BWD])(\d+)$", re.IGNORECASE)
+_RE_BIT = re.compile(r"^([IEQAML])(\d+)\.([0-7])$", re.IGNORECASE)
+_RE_SCALAR = re.compile(r"^([IEQAML])([BWD])(\d+)$", re.IGNORECASE)
+_RE_PERIPH = re.compile(r"^(PI|PE|PQ|PA)([BWD])(\d+)$", re.IGNORECASE)
 _RE_DB_BIT = re.compile(r"^DB(\d+)\.DBX(\d+)\.([0-7])$", re.IGNORECASE)
 _RE_DB_SCALAR = re.compile(r"^DB(\d+)\.DB([BWD])(\d+)$", re.IGNORECASE)
+_RE_TC_Q = re.compile(r"^([TCZ])(\d+)\.Q$", re.IGNORECASE)
 _RE_TC = re.compile(r"^([TCZ])(\d+)$", re.IGNORECASE)
 
 
 def parse_s7_address(address: str, data_type: Optional[str] = None) -> ParsedS7Address:
-    """Parse classic STEP 7 absolute addresses including I/Q/M/DB/T/C (with or without internal spaces)."""
+    """Parse classic STEP 7 absolute addresses including I/Q/M/DB/T/C/PI/PQ/L (with or without internal spaces)."""
     raw = re.sub(r"\s+", "", (address or "").strip().upper())
     if not raw:
         raise ValueError("Empty S7 address")
 
+    m = _RE_PERIPH.match(raw)
+    if m:
+        p_area, width, offset_s = m.group(1), m.group(2), m.group(3)
+        area = "PI" if p_area in ("PI", "PE") else "PQ"
+        default_dt = {"B": "BYTE", "W": "INT", "D": "DWORD"}[width]
+        dt = (data_type or default_dt).upper()
+        length = {"B": 1, "W": 2, "D": 4}[width]
+        return ParsedS7Address(
+            raw=raw,
+            area=area,
+            area_code=S7_AREA_CODES[area],
+            db_number=0,
+            byte_offset=int(offset_s),
+            bit_offset=0,
+            data_type=dt,
+            byte_length=length,
+        )
+
     m = _RE_BIT.match(raw)
     if m:
         area_ch = m.group(1)
-        area = "I" if area_ch in ("I", "E") else ("Q" if area_ch in ("Q", "A") else "M")
+        area = "I" if area_ch in ("I", "E") else ("Q" if area_ch in ("Q", "A") else area_ch)
         return ParsedS7Address(
             raw=raw,
             area=area,
@@ -91,7 +116,7 @@ def parse_s7_address(address: str, data_type: Optional[str] = None) -> ParsedS7A
     m = _RE_SCALAR.match(raw)
     if m:
         area_ch, width, offset_s = m.group(1), m.group(2), m.group(3)
-        area = "I" if area_ch in ("I", "E") else ("Q" if area_ch in ("Q", "A") else "M")
+        area = "I" if area_ch in ("I", "E") else ("Q" if area_ch in ("Q", "A") else area_ch)
         default_dt = {"B": "BYTE", "W": "WORD", "D": "DWORD"}[width]
         dt = (data_type or default_dt).upper()
         length = {"B": 1, "W": 2, "D": 4}[width]
@@ -134,6 +159,21 @@ def parse_s7_address(address: str, data_type: Optional[str] = None) -> ParsedS7A
             bit_offset=0,
             data_type=dt,
             byte_length=length,
+        )
+
+    m = _RE_TC_Q.match(raw)
+    if m:
+        ch, num = m.group(1), int(m.group(2))
+        area = "T" if ch == "T" else "C"
+        return ParsedS7Address(
+            raw=raw,
+            area=area,
+            area_code=0x1D if area == "T" else 0x1C,
+            db_number=0,
+            byte_offset=num,
+            bit_offset=0,
+            data_type="BOOL",
+            byte_length=1,
         )
 
     m = _RE_TC.match(raw)
@@ -878,13 +918,18 @@ class VirtualS7PLC:
     """Deterministic in-memory Siemens S7-300/400 CPU simulator.
 
     Supports:
-    - Process images I, Q, M (64 KB each) + dynamic Data Blocks DB1..DB65535
-    - S7 Timers T0..T255 (SD, SE, SP, SS, SF with S5T# time literals & deterministic scan ticks)
-    - S7 Counters C0..C255 (CU, CD, S, R, L, LC)
-    - STL/LAD/FBD instruction subset: A, AN, O, ON, X, XN, A(, AN(, O(, ON(, ), NOT, SET, CLR,
-      FP, FN, =, S, R, L, T, +I, -I, *I, /I, +D, -D, +R, -R, *R, /R,
-      ==I, <>I, >I, >=I, <I, <=I, ==R, >R, <R, JU, JC, JCN, JNB, OPN, CALL, BEC, BEU, NOP
-    - CPU mode (RUN/STOP) & structured diagnostic buffer entries.
+    - Process images I, Q, M + Peripheral Analog/Digital PI/PQ (PIW/PQW) + Local Temp Stack (L) + DB1..DB65535
+    - S7 Timers T0..T255 (SD, SE, SP, SS, SF + German SI/SV/SE/SS/SA, FR, R, S5T# literals)
+    - S7 Counters C0..C255 / Z0..Z255 (CU/ZV, CD/ZR, S, R, FR, L, LC)
+    - Authentic 32-bit ACCU1/ACCU2 bit-pattern semantics for INT, DINT, WORD, DWORD, REAL,
+      ITD, DTR, RND, RND+, RND-, TRUNC, MOD, ABS, NEGI/D/R, SQR, SQRT, AW/OW/XOW/AD/OD/XOD,
+      INVI/INVD, SLW/SRW/SLD/SRD/SSI/SSD, INC/DEC, TAK/PUSH/POP
+    - Authentic S7 Status Word (RLO, /FC, OR, BR): SAVE, A BR, AN BR, JNB, JB, JBI, JNBI, BLD, NETWORK reset
+    - International AND German S7-300 mnemonics (A/AN/U/UN, JU/JC/JCN/JNB/SPA/SPB/SPBN/SPBNB, E/A/Z)
+    - Symbolic tags ("START_PB"), DATA_BLOCK initializers & symbolic DB fields (DB10.SpeedRpm),
+      modular CALL FC/FB with parameter bindings & write-back
+    - Direct execution of ALL IEC 61131-3 block types: STL/AWL, LAD/KOP, FBD/FUP, SCL (Structured Text),
+      S7-GRAPH (SFC), and DATA_BLOCK!
     """
 
     def __init__(self, order_number: str = "6ES7 315-2EH14-0AB0") -> None:
@@ -897,16 +942,137 @@ class VirtualS7PLC:
             "I": bytearray(4096),
             "Q": bytearray(4096),
             "M": bytearray(4096),
+            "PI": bytearray(4096),
+            "PQ": bytearray(4096),
         }
+        self._local_stack: List[bytearray] = [bytearray(512)]
         self.dbs: Dict[int, bytearray] = {1: bytearray(4096)}
+        self.db_layouts: Dict[int, Dict[str, Tuple[str, str]]] = {}  # db_num -> {FIELD_UP: (s7_addr, dtype)}
+        self.db_names: Dict[str, int] = {}  # SYMBOL_UP -> db_num
+        self.symbols: Dict[str, Tuple[str, Optional[str]]] = {}  # SYMBOL_UP -> (addr, dtype)
         self.timers: Dict[int, _S7TimerState] = {}
         self.counters: Dict[int, _S7CounterState] = {}
         self.blocks: Dict[str, List[str]] = {}
+        self.block_meta: Dict[str, Dict[str, Any]] = {}
+        self.fb_statics: Dict[str, Dict[str, Any]] = {}
+        self.sfc_states: Dict[str, Dict[str, Any]] = {}
+        self.last_unsupported_instructions: List[str] = []
         self.diagnostics: List[Dict[str, Any]] = [
             {"event_id": 0x4302, "priority_class": 0x01, "ob_number": 100, "info1": 0x0001, "info2": 0x00000000},
             {"event_id": 0x4304, "priority_class": 0x01, "ob_number": 1, "info1": 0x0008, "info2": 0x00000000},
         ]
         self._open_db: int = 1
+        self._current_tick_ms: int = 100
+
+    def reset(self, clear_blocks: bool = False, clear_symbols: bool = False) -> None:
+        with self._lock:
+            self.areas = {
+                "I": bytearray(4096),
+                "Q": bytearray(4096),
+                "M": bytearray(4096),
+                "PI": bytearray(4096),
+                "PQ": bytearray(4096),
+            }
+            self._local_stack = [bytearray(512)]
+            self.dbs = {1: bytearray(4096)}
+            self.timers.clear()
+            self.counters.clear()
+            self.fb_statics.clear()
+            self.sfc_states.clear()
+            self.scan_count = 0
+            self.sim_time_ms = 0
+            self.cpu_mode = "RUN"
+            self.last_unsupported_instructions = []
+            if clear_blocks:
+                self.blocks.clear()
+                self.block_meta.clear()
+                self.db_layouts.clear()
+                self.db_names.clear()
+            if clear_symbols:
+                self.symbols.clear()
+
+    def set_symbols(self, symbols: Any) -> int:
+        """Register symbol -> (address, data_type) mappings for symbolic program & scenario execution."""
+        with self._lock:
+            count = 0
+            if isinstance(symbols, dict):
+                for k, v in symbols.items():
+                    ks = str(k).strip().strip('"')
+                    if isinstance(v, str):
+                        vs = v.strip()
+                        # Support either {"START_PB": "I 0.0"} or {"I 0.0": "START_PB"}
+                        try:
+                            parse_s7_address(ks)
+                            # key is address, value is symbol/comment
+                            sym_tok = re.sub(r"[^A-Za-z0-9_]+", "_", vs).strip("_").upper()
+                            if sym_tok:
+                                self.symbols[sym_tok] = (ks, None)
+                                count += 1
+                        except Exception:
+                            self.symbols[ks.upper()] = (vs, None)
+                            m_db = re.fullmatch(r"DB\s*(\d+)", vs, re.IGNORECASE)
+                            if m_db:
+                                self.db_names[ks.upper()] = int(m_db.group(1))
+                            count += 1
+                    elif isinstance(v, dict) and "address" in v:
+                        addr_s = str(v["address"]).strip()
+                        dt_s = str(v.get("data_type") or "").strip().upper() or None
+                        self.symbols[ks.upper()] = (addr_s, dt_s)
+                        m_db = re.fullmatch(r"DB\s*(\d+)", addr_s, re.IGNORECASE)
+                        if m_db:
+                            self.db_names[ks.upper()] = int(m_db.group(1))
+                        count += 1
+            elif isinstance(symbols, list):
+                for item in symbols:
+                    if isinstance(item, dict) and item.get("symbol") and item.get("address"):
+                        ks = str(item["symbol"]).strip().strip('"').upper()
+                        addr_s = str(item["address"]).strip()
+                        dt_s = str(item.get("data_type") or "").strip().upper() or None
+                        self.symbols[ks] = (addr_s, dt_s)
+                        m_db = re.fullmatch(r"DB\s*(\d+)", addr_s, re.IGNORECASE)
+                        if m_db:
+                            self.db_names[ks] = int(m_db.group(1))
+                        count += 1
+            return count
+
+    def resolve_operand(self, ref: str, data_type: Optional[str] = None) -> Tuple[str, Optional[str]]:
+        """Resolve symbolic names, DB symbolic members ("MotorDB".Speed / DB10.Speed), or raw S7 addresses."""
+        s = (ref or "").strip()
+        if not s:
+            return s, data_type
+        unq = s.strip('"').strip()
+        up = unq.upper()
+
+        # 1. Exact symbol match (e.g. "START_PB" or START_PB)
+        if up in self.symbols:
+            addr_s, sym_dt = self.symbols[up]
+            return addr_s, data_type or sym_dt
+
+        # 2. Symbolic DB field: "MotorDB".SpeedRpm or DB10.SpeedRpm
+        if "." in s and not re.match(r"^(DB\d+\.DB[XBWD]|[IEQAML]\d+\.[0-7]|[TCZ]\d+\.Q)$", re.sub(r"\s+", "", up)):
+            left, right = s.split(".", 1)
+            left_clean = left.strip().strip('"').upper()
+            right_clean = right.strip().strip('"').upper()
+            db_num: Optional[int] = None
+            m_db = re.fullmatch(r"DB\s*(\d+)", left_clean)
+            if m_db:
+                db_num = int(m_db.group(1))
+            elif left_clean in self.db_names:
+                db_num = self.db_names[left_clean]
+            elif left_clean in self.symbols:
+                m_s = re.fullmatch(r"DB\s*(\d+)", self.symbols[left_clean][0], re.IGNORECASE)
+                if m_s:
+                    db_num = int(m_s.group(1))
+            if db_num is not None and db_num in self.db_layouts and right_clean in self.db_layouts[db_num]:
+                f_addr, f_dt = self.db_layouts[db_num][right_clean]
+                return f_addr, data_type or f_dt
+
+        # 3. Opened DB short syntax: DBX 0.0 / DBW 2 / DBD 4
+        compact = re.sub(r"\s+", "", up)
+        if compact.startswith(("DBX", "DBB", "DBW", "DBD")):
+            return f"DB{self._open_db}.{compact}", data_type
+
+        return unq, data_type
 
     def _ensure_db(self, db_num: int, min_size: int = 4096) -> bytearray:
         buf = self.dbs.get(db_num)
@@ -964,7 +1130,12 @@ class VirtualS7PLC:
     def _get_area_buffer(self, area_code: int, db_number: int, min_size: int) -> bytearray:
         if area_code == 0x84:
             return self._ensure_db(db_number, min_size)
-        name = {0x81: "I", 0x82: "Q", 0x83: "M"}.get(area_code)
+        if area_code == 0x86:
+            buf = self._local_stack[-1] if self._local_stack else bytearray(512)
+            if len(buf) < min_size:
+                buf.extend(bytearray(min_size - len(buf)))
+            return buf
+        name = {0x80: "PI", 0x81: "I", 0x82: "Q", 0x83: "M", 0x85: "PQ"}.get(area_code)
         if name is None:
             raise ValueError(f"Unsupported S7 area code: 0x{area_code:02X}")
         buf = self.areas[name]
@@ -973,14 +1144,26 @@ class VirtualS7PLC:
         return buf
 
     def read_address(self, address: str, data_type: Optional[str] = None) -> Any:
-        addr = parse_s7_address(address, data_type)
+        resolved, eff_dt = self.resolve_operand(address, data_type)
+        addr = parse_s7_address(resolved, eff_dt)
         if addr.data_type == "BOOL":
             return self.read_bit(addr.area_code, addr.db_number, addr.byte_offset, addr.bit_offset)
         raw = self.read_bytes(addr.area_code, addr.db_number, addr.byte_offset, addr.byte_length)
         return decode_s7_value(addr, raw)
 
     def write_address(self, address: str, value: Any, data_type: Optional[str] = None) -> None:
-        addr = parse_s7_address(address, data_type)
+        resolved, eff_dt = self.resolve_operand(address, data_type)
+        # Auto-infer signed/float encoding when caller passes Python float or negative int without explicit data_type
+        if eff_dt is None:
+            if isinstance(value, float):
+                eff_dt = "REAL"
+            elif isinstance(value, int) and not isinstance(value, bool) and value < 0:
+                tmp = parse_s7_address(resolved)
+                if tmp.byte_length == 2:
+                    eff_dt = "INT"
+                elif tmp.byte_length == 4:
+                    eff_dt = "DINT"
+        addr = parse_s7_address(resolved, eff_dt)
         if addr.data_type == "BOOL":
             self.write_bit(addr.area_code, addr.db_number, addr.byte_offset, addr.bit_offset, bool(value))
             return
@@ -990,7 +1173,7 @@ class VirtualS7PLC:
     def set_mode(self, mode: str) -> str:
         with self._lock:
             m = mode.strip().upper()
-            if m in ("RUN", "START", "WARM_RESTART", "RUN-P"):
+            if m in ("RUN", "START", "WARM_RESTART", "RUN-P", "RUN_P"):
                 self.cpu_mode = "RUN"
                 self.diagnostics.insert(0, {
                     "event_id": 0x4304, "priority_class": 0x01, "ob_number": 1, "info1": 0x0008, "info2": self.scan_count
@@ -1003,45 +1186,344 @@ class VirtualS7PLC:
             self.diagnostics = self.diagnostics[:32]
             return self.cpu_mode
 
-    def load_block(self, block_name: str, awl_source: str) -> Dict[str, Any]:
-        """Parse and load an AWL/STL/LAD block into virtual CPU memory."""
+    @staticmethod
+    def _detect_source_language(source: str, explicit: Optional[str] = None) -> str:
+        if explicit and explicit.strip().upper() not in ("", "AUTO"):
+            up = explicit.strip().upper()
+            if up in ("LAD", "KOP", "FBD", "FUP", "STL", "AWL"):
+                return "AWL"
+            return up
+        upper = source.upper()
+        if re.search(r"^\s*DATA_BLOCK\s+DB\s*\d+", upper, re.MULTILINE):
+            return "DB"
+        if re.search(r"\bINITIAL_STEP\b", upper) and re.search(r"\bTRANSITION\b", upper):
+            return "GRAPH"
+        # SCL indicators in body (after BEGIN, or standalone statements)
+        body_part = upper.split("BEGIN", 1)[1] if "BEGIN" in upper else upper
+        if re.search(r"\b(END_IF|END_CASE|END_FOR|END_WHILE|END_REPEAT)\b", body_part):
+            return "SCL"
+        if ":=" in body_part and not re.search(r"\bCALL\s+(?:FC|FB|SFC|SFB)\b", body_part):
+            return "SCL"
+        return "AWL"
+
+    def _load_data_block(self, block_name: str, source: str) -> Dict[str, Any]:
+        from .iec_languages import compute_s7_struct_layout
+
+        m_db = re.search(r"DATA_BLOCK\s+DB\s*(\d+)", source, re.IGNORECASE)
+        if m_db:
+            db_num = int(m_db.group(1))
+        else:
+            m_bn = re.search(r"(\d+)", block_name)
+            db_num = int(m_bn.group(1)) if m_bn else 1
+
+        # Parse optional TITLE = Name
+        m_title = re.search(r"^\s*TITLE\s*=\s*(.+)$", source, re.IGNORECASE | re.MULTILINE)
+        if m_title:
+            tname = m_title.group(1).strip().strip('"').upper()
+            if tname and re.fullmatch(r"[A-Z_][A-Z0-9_]*", tname):
+                self.db_names[tname] = db_num
+
+        # Parse STRUCT ... END_STRUCT fields
+        fields: List[Dict[str, Any]] = []
+        m_struct = re.search(r"\bSTRUCT\b([\s\S]*?)\bEND_STRUCT\b", source, re.IGNORECASE)
+        if m_struct:
+            for raw in m_struct.group(1).splitlines():
+                ln = raw.split("//", 1)[0].strip()
+                if not ln:
+                    continue
+                m_f = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*([A-Za-z0-9_]+)(?:\s*:=\s*(.+?))?\s*;?\s*$", ln)
+                if m_f:
+                    fields.append({
+                        "name": m_f.group(1),
+                        "type": m_f.group(2).upper(),
+                        "initial": (m_f.group(3) or "").strip(),
+                    })
+
+        layout_res = compute_s7_struct_layout(fields, db_number=db_num) if fields else {"layout": [], "total_bytes": 0}
+        layout = layout_res.get("layout", [])
+        total_bytes = int(layout_res.get("total_bytes", 0))
+        self._ensure_db(db_num, max(4096, total_bytes))
+        fmap: Dict[str, Tuple[str, str]] = {}
+        init_overrides: Dict[str, str] = {}
+
+        # Parse BEGIN ... END_DATA_BLOCK initial value assignments
+        m_begin = re.search(r"\bBEGIN\b([\s\S]*?)\bEND_DATA_BLOCK\b", source, re.IGNORECASE)
+        if m_begin:
+            for raw in m_begin.group(1).splitlines():
+                ln = raw.split("//", 1)[0].strip().rstrip(";")
+                if ":=" in ln:
+                    k, v = ln.split(":=", 1)
+                    init_overrides[k.strip().upper()] = v.strip()
+
+        for item in layout:
+            fname = item["name"]
+            ftype = item["type"].upper()
+            b_off = item["byte_offset"]
+            bit_off = item["bit_offset"]
+            if ftype == "BOOL":
+                s7_addr = f"DB{db_num}.DBX{b_off}.{bit_off}"
+            elif item["size_bytes"] == 1:
+                s7_addr = f"DB{db_num}.DBB{b_off}"
+            elif item["size_bytes"] == 2:
+                s7_addr = f"DB{db_num}.DBW{b_off}"
+            else:
+                s7_addr = f"DB{db_num}.DBD{b_off}"
+            fmap[fname.upper()] = (s7_addr, ftype)
+
+            raw_init = init_overrides.get(fname.upper(), item.get("initial") or "")
+            if raw_init:
+                val: Any = raw_init
+                up_i = raw_init.upper()
+                if up_i == "TRUE":
+                    val = True
+                elif up_i == "FALSE":
+                    val = False
+                elif re.fullmatch(r"[+-]?\d+\.\d+(?:[eE][+-]?\d+)?", raw_init):
+                    val = float(raw_init)
+                elif re.fullmatch(r"[+-]?\d+", raw_init):
+                    val = int(raw_init)
+                try:
+                    self.write_address(s7_addr, val, data_type=ftype)
+                except Exception:
+                    pass
+
+        self.db_layouts[db_num] = fmap
+        key = f"DB{db_num}"
+        self.block_meta[key] = {"language": "DB", "db_number": db_num, "fields": list(fmap.keys()), "total_bytes": total_bytes}
+        return {
+            "ok": True,
+            "block": key,
+            "language": "DB",
+            "detected_language": "DB",
+            "db_number": db_num,
+            "field_count": len(fmap),
+            "fields": {k: {"address": v[0], "type": v[1]} for k, v in fmap.items()},
+            "instruction_count": 0,
+            "unsupported_instructions": [],
+            "loaded_blocks": sorted(set(list(self.blocks.keys()) + list(self.block_meta.keys()))),
+        }
+
+    def load_block(
+        self,
+        block_name: str,
+        awl_source: str,
+        language: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Parse and load an AWL/STL/LAD/FBD, SCL, S7-GRAPH, or DATA_BLOCK into virtual CPU memory."""
+        from .scl_graph_sim import parse_graph_block, parse_scl_block
+
         with self._lock:
+            key = re.sub(r"\s+", "", block_name.strip().upper())
+            lang = self._detect_source_language(awl_source, language)
+
+            if lang == "DB":
+                return self._load_data_block(key, awl_source)
+
+            if lang == "SCL":
+                parsed_scl = parse_scl_block(key, awl_source)
+                self.blocks[key] = ["__SCL__"]
+                self.block_meta[key] = {
+                    "language": "SCL",
+                    "parsed_scl": parsed_scl,
+                    "var_decls": parsed_scl.var_decls,
+                }
+                return {
+                    "ok": True,
+                    "block": key,
+                    "language": "SCL",
+                    "detected_language": "SCL",
+                    "statement_count": len(parsed_scl.body_stmts),
+                    "instruction_count": len(parsed_scl.body_stmts),
+                    "unsupported_instructions": [],
+                    "loaded_blocks": sorted(self.blocks.keys()),
+                }
+
+            if lang == "GRAPH":
+                parsed_gr7 = parse_graph_block(key, awl_source)
+                self.blocks[key] = ["__GRAPH__"]
+                self.block_meta[key] = {
+                    "language": "GRAPH",
+                    "parsed_graph": parsed_gr7,
+                }
+                for old_k in [k for k in list(self.sfc_states.keys()) if k == key or k.startswith(f"{key}:")]:
+                    self.sfc_states.pop(old_k, None)
+                return {
+                    "ok": True,
+                    "block": key,
+                    "language": "GRAPH",
+                    "detected_language": "GRAPH",
+                    "step_count": len(parsed_gr7.steps),
+                    "transition_count": len(parsed_gr7.transitions),
+                    "initial_steps": parsed_gr7.initial_steps,
+                    "instruction_count": len(parsed_gr7.steps) + len(parsed_gr7.transitions),
+                    "unsupported_instructions": [],
+                    "loaded_blocks": sorted(self.blocks.keys()),
+                }
+
+            # Standard AWL / STL / LAD / FBD parsing (with VAR declarations & multiline CALL merging)
             instructions: List[str] = []
+            var_decls: Dict[str, Tuple[str, str]] = {}  # VAR_UPPER -> (section, dtype)
+            cur_var_sec: Optional[str] = None
             in_body = False
             saw_begin = False
+            pending_call: Optional[List[str]] = None
+
             for raw_line in awl_source.splitlines():
                 line = raw_line.split("//", 1)[0].strip()
                 if not line:
                     continue
                 upper = line.upper()
-                if upper in ("BEGIN", "NETWORK"):
+
+                if pending_call is not None:
+                    pending_call.append(line)
+                    if ")" in line:
+                        merged = " ".join(pending_call).rstrip(";").strip()
+                        instructions.append(merged)
+                        pending_call = None
+                    continue
+
+                if upper in ("VAR_INPUT", "VAR_OUTPUT", "VAR_IN_OUT", "VAR_TEMP", "VAR", "VAR_STAT"):
+                    cur_var_sec = upper
+                    continue
+                if upper == "END_VAR":
+                    cur_var_sec = None
+                    continue
+                if cur_var_sec and not in_body:
+                    m_decl = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*([A-Za-z0-9_]+)", line)
+                    if m_decl:
+                        var_decls[m_decl.group(1).upper()] = (cur_var_sec, m_decl.group(2).upper())
+                    continue
+
+                if upper == "BEGIN":
                     in_body = True
                     saw_begin = True
                     continue
-                if upper.startswith(("TITLE", "VERSION", "AUTHOR", "FAMILY", "NAME", "VAR", "END_VAR", "ORGANIZATION_BLOCK", "FUNCTION", "FUNCTION_BLOCK")):
+                if upper == "NETWORK":
+                    in_body = True
+                    saw_begin = True
+                    instructions.append("__NETWORK__")
+                    continue
+                if upper.startswith(("TITLE", "VERSION", "AUTHOR", "FAMILY", "NAME", "ORGANIZATION_BLOCK", "FUNCTION", "FUNCTION_BLOCK", "KNOW_HOW_PROTECT")):
                     continue
                 if upper.startswith("END_"):
                     in_body = False
                     continue
                 if in_body or not saw_begin:
-                    # Strip trailing semicolons
+                    # Multiline CALL FC 1 ( ... )
+                    if upper.startswith("CALL ") and "(" in line and ")" not in line:
+                        pending_call = [line]
+                        continue
                     stmt = line.rstrip(";").strip()
                     if stmt:
                         instructions.append(stmt)
-            key = block_name.strip().upper()
+
+            if pending_call:
+                instructions.append(" ".join(pending_call).rstrip(";").strip())
+
+            # Detect whether this AWL block uses German mnemonics
+            german_markers = 0
+            for ins in instructions:
+                if ins == "__NETWORK__":
+                    continue
+                tok0 = ins.split(None, 1)[0].upper()
+                if tok0 in ("U", "UN", "U(", "UN(", "SPA", "SPB", "SPBN", "SPBNB", "ZV", "ZR", "BEA", "BEB", "SI", "SV", "SA"):
+                    german_markers += 1
+            german_mode = german_markers > 0
+
+            # Pre-check unsupported opcodes so AI agents get immediate feedback
+            unsupported = self._find_unsupported_opcodes(instructions)
+
             self.blocks[key] = instructions
+            self.block_meta[key] = {
+                "language": "AWL",
+                "german_mode": german_mode,
+                "var_decls": var_decls,
+                "unsupported_instructions": unsupported,
+            }
             return {
                 "ok": True,
                 "block": key,
-                "instruction_count": len(instructions),
+                "language": "AWL",
+                "detected_language": "AWL",
+                "german_mnemonics": german_mode,
+                "instruction_count": sum(1 for x in instructions if x != "__NETWORK__"),
+                "unsupported_instructions": unsupported,
                 "loaded_blocks": sorted(self.blocks.keys()),
             }
 
     @staticmethod
+    def _known_opcodes() -> set:
+        return {
+            "__NETWORK__", "NOP", "BLD", "BEU", "BEC", "BEA", "BEB", "BE",
+            "SET", "CLR", "NOT", "SAVE", "OPN", "AUF", "CALL", "UC", "CC",
+            "A(", "AN(", "O(", "ON(", "X(", "XN(", "U(", "UN(", ")",
+            "A", "AN", "O", "ON", "X", "XN", "U", "UN",
+            "FP", "FN", "=", "S", "R", "FR",
+            "SD", "SS", "SP", "SE", "SF", "SI", "SV", "SA",
+            "CU", "CD", "ZV", "ZR",
+            "L", "LC", "T", "TAK", "PUSH", "POP",
+            "+I", "-I", "*I", "/I", "+D", "-D", "*D", "/D", "MOD",
+            "+R", "-R", "*R", "/R",
+            "ITD", "DTR", "RND", "RND+", "RND-", "TRUNC", "BTI", "ITB", "BTD", "DTB",
+            "NEGI", "NEGD", "NEGR", "INVI", "INVD", "ABS", "SQR", "SQRT",
+            "AW", "OW", "XOW", "AD", "OD", "XOD",
+            "SLW", "SRW", "SLD", "SRD", "SSI", "SSD", "INC", "DEC",
+            "==I", "<>I", ">I", ">=I", "<I", "<=I",
+            "==D", "<>D", ">D", ">=D", "<D", "<=D",
+            "==R", "<>R", ">R", ">=R", "<R", "<=R",
+            "JU", "JC", "JCN", "JNB", "JB", "JBI", "JNBI",
+            "SPA", "SPB", "SPBN", "SPBNB", "SPBI", "SPNBI",
+        }
+
+    def _find_unsupported_opcodes(self, instructions: Sequence[str]) -> List[str]:
+        known = self._known_opcodes()
+        unknown: List[str] = []
+        for raw in instructions:
+            if raw == "__NETWORK__":
+                continue
+            m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*)$", raw)
+            stmt = m.group(2).strip() if m else raw.strip()
+            if not stmt:
+                continue
+            op = stmt.split(None, 1)[0].upper()
+            if op not in known and op not in unknown:
+                unknown.append(op)
+        return unknown
+
+    # --- Authentic 32-bit S7 Accumulator Bit-Pattern Helpers ---
+    @staticmethod
+    def _i32_to_u32(val: int) -> int:
+        return int(val) & 0xFFFFFFFF
+
+    @staticmethod
+    def _u32_to_i16(u: int) -> int:
+        v = u & 0xFFFF
+        return v - 0x10000 if v >= 0x8000 else v
+
+    @staticmethod
+    def _u32_to_i32(u: int) -> int:
+        v = u & 0xFFFFFFFF
+        return v - 0x100000000 if v >= 0x80000000 else v
+
+    @staticmethod
+    def _f32_to_u32(f: float) -> int:
+        return struct.unpack(">I", struct.pack(">f", float(f)))[0]
+
+    @staticmethod
+    def _u32_to_f32(u: int) -> float:
+        return struct.unpack(">f", struct.pack(">I", u & 0xFFFFFFFF))[0]
+
+    @staticmethod
     def _parse_s5time_ms(token: str) -> int:
         tok = token.strip().upper()
-        if tok.startswith("S5T#"):
+        if tok.startswith("S5TIME#"):
+            tok = tok[7:]
+        elif tok.startswith("S5T#"):
             tok = tok[4:]
+        elif tok.startswith("TIME#"):
+            tok = tok[5:]
+        elif tok.startswith("T#"):
+            tok = tok[2:]
         total_ms = 0
         for num_s, unit in re.findall(r"(\d+(?:\.\d+)?)\s*(MS|S|M|H)", tok):
             num = float(num_s)
@@ -1051,44 +1533,110 @@ class VirtualS7PLC:
             total_ms = int(tok)
         return total_ms
 
-    def _parse_literal(self, operand: str) -> Tuple[Any, str]:
+    def _load_operand_u32(
+        self,
+        operand: str,
+        param_env: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[int, str]:
+        """Load literal or memory operand into an authentic 32-bit S7 ACCU1 uint32 bit-pattern."""
         op = operand.strip()
         up = op.upper()
-        if up.startswith("S5T#"):
-            return self._parse_s5time_ms(up), "S5TIME"
+        if up.startswith(("S5T#", "S5TIME#", "T#", "TIME#")):
+            return self._i32_to_u32(self._parse_s5time_ms(up)), "S5TIME"
         if up.startswith("C#"):
-            return int(up[2:]), "INT"
-        if up.startswith("W#16#") or up.startswith("DW#16#") or up.startswith("B#16#"):
-            return int(up.split("#")[-1], 16), "INT"
+            return self._i32_to_u32(int(up[2:])), "INT"
+        if up.startswith(("W#16#", "DW#16#", "B#16#", "16#")):
+            return self._i32_to_u32(int(up.split("#")[-1].replace("_", ""), 16)), "HEX"
+        if up.startswith("2#"):
+            return self._i32_to_u32(int(up[2:].replace("_", ""), 2)), "BIN"
         if up.startswith("L#"):
-            return int(up[2:]), "DINT"
+            return self._i32_to_u32(int(up[2:])), "DINT"
         if re.fullmatch(r"[+-]?\d+\.\d+(?:[eE][+-]?\d+)?", up):
-            return float(up), "REAL"
+            return self._f32_to_u32(float(up)), "REAL"
         if re.fullmatch(r"[+-]?\d+", up):
-            return int(up), "INT"
-        # Otherwise treat as address
-        if up.startswith("DBX") or up.startswith("DBB") or up.startswith("DBW") or up.startswith("DBD"):
-            full = f"DB{self._open_db}.{up}"
-            return self.read_address(full), "ADDR"
-        return self.read_address(up), "ADDR"
+            return self._i32_to_u32(int(up)), "INT"
 
-    def _eval_bit_operand(self, operand: str) -> bool:
-        op = re.sub(r"\s+", "", operand.strip().upper())
-        if op.startswith("DBX"):
-            op = f"DB{self._open_db}.{op}"
-        if op.startswith("T") and op[1:].isdigit():
-            t = self.timers.get(int(op[1:]))
+        # Local parameter (#Param)
+        if param_env is not None:
+            pk = op.lstrip("#").upper()
+            if pk in param_env:
+                pv = param_env[pk]
+                if isinstance(pv, float):
+                    return self._f32_to_u32(pv), "REAL"
+                return self._i32_to_u32(int(pv)), "PARAM"
+
+        resolved, _ = self.resolve_operand(op)
+        addr = parse_s7_address(resolved)
+        if addr.area in ("T", "C"):
+            raw = self.read_bytes(addr.area_code, 0, addr.byte_offset, 2)
+            return struct.unpack(">H", raw)[0], addr.area
+        raw = self.read_bytes(addr.area_code, addr.db_number, addr.byte_offset, addr.byte_length)
+        if addr.byte_length == 1:
+            return raw[0], "BYTE"
+        if addr.byte_length == 2:
+            return struct.unpack(">H", raw)[0], "WORD"
+        return struct.unpack(">I", raw[:4])[0], "DWORD"
+
+    def _store_u32_to_operand(
+        self,
+        operand: str,
+        accu1_u32: int,
+        param_env: Optional[Dict[str, Any]] = None,
+        param_types: Optional[Dict[str, str]] = None,
+    ) -> None:
+        op = operand.strip()
+        if param_env is not None:
+            pk = op.lstrip("#").upper()
+            if pk in param_env:
+                pt = (param_types or {}).get(pk, "INT").upper()
+                if pt == "REAL":
+                    param_env[pk] = self._u32_to_f32(accu1_u32)
+                elif pt == "INT":
+                    param_env[pk] = self._u32_to_i16(accu1_u32)
+                elif pt == "DINT":
+                    param_env[pk] = self._u32_to_i32(accu1_u32)
+                elif pt == "BOOL":
+                    param_env[pk] = bool(accu1_u32 & 1)
+                else:
+                    param_env[pk] = accu1_u32 & 0xFFFF
+                return
+
+        resolved, _ = self.resolve_operand(op)
+        addr = parse_s7_address(resolved)
+        if addr.byte_length == 1:
+            self.write_bytes(addr.area_code, addr.db_number, addr.byte_offset, bytes([accu1_u32 & 0xFF]))
+        elif addr.byte_length == 2:
+            self.write_bytes(addr.area_code, addr.db_number, addr.byte_offset, struct.pack(">H", accu1_u32 & 0xFFFF))
+        else:
+            self.write_bytes(addr.area_code, addr.db_number, addr.byte_offset, struct.pack(">I", accu1_u32 & 0xFFFFFFFF))
+
+    def _eval_bit_operand(self, operand: str, param_env: Optional[Dict[str, Any]] = None, br_bit: bool = False) -> bool:
+        raw = operand.strip()
+        if raw.upper() == "BR":
+            return bool(br_bit)
+        if param_env is not None:
+            pk = raw.lstrip("#").upper()
+            if pk in param_env:
+                return bool(param_env[pk])
+        resolved, _ = self.resolve_operand(raw)
+        compact = re.sub(r"\s+", "", resolved.upper())
+        if compact.startswith("T") and compact[1:].isdigit():
+            t = self.timers.get(int(compact[1:]))
             return bool(t.output) if t else False
-        if op.startswith(("C", "Z")) and op[1:].isdigit():
-            c = self.counters.get(int(op[1:]))
+        if compact.startswith(("C", "Z")) and compact[1:].isdigit():
+            c = self.counters.get(int(compact[1:]))
             return bool(c and c.value > 0)
-        return bool(self.read_address(op))
+        return bool(self.read_address(resolved, data_type="BOOL"))
 
-    def _write_bit_operand(self, operand: str, val: bool) -> None:
-        op = re.sub(r"\s+", "", operand.strip().upper())
-        if op.startswith("DBX"):
-            op = f"DB{self._open_db}.{op}"
-        self.write_address(op, bool(val), data_type="BOOL")
+    def _write_bit_operand(self, operand: str, val: bool, param_env: Optional[Dict[str, Any]] = None) -> None:
+        raw = operand.strip()
+        if param_env is not None:
+            pk = raw.lstrip("#").upper()
+            if pk in param_env:
+                param_env[pk] = bool(val)
+                return
+        resolved, _ = self.resolve_operand(raw)
+        self.write_address(resolved, bool(val), data_type="BOOL")
 
     def _advance_timers(self, tick_ms: int) -> None:
         for t in self.timers.values():
@@ -1104,17 +1652,108 @@ class VirtualS7PLC:
                     t.output = False
                     t.running = False
 
-    def _execute_block(self, block_name: str, depth: int = 0) -> None:
+    def _parse_call_statement(self, arg: str) -> Tuple[str, Optional[int], Dict[str, str]]:
+        """Parse 'FC 1 (Start := I 0.0, Motor := Q 0.0)' or 'FB 1, DB 1 (...)'."""
+        params: Dict[str, str] = {}
+        head = arg
+        if "(" in arg:
+            idx = arg.index("(")
+            head = arg[:idx].strip()
+            body = arg[idx + 1:].rsplit(")", 1)[0]
+            for piece in body.split(","):
+                if ":=" in piece:
+                    k, v = piece.split(":=", 1)
+                    params[k.strip().lstrip("#").upper()] = v.strip()
+        parts = [p.strip() for p in head.split(",") if p.strip()]
+        target = re.sub(r"\s+", "", parts[0].strip('"').upper()) if parts else ""
+        # Resolve symbolic block name if present
+        if target in self.symbols:
+            target = re.sub(r"\s+", "", self.symbols[target][0].upper())
+        inst_db: Optional[int] = None
+        if len(parts) > 1:
+            m_db = re.search(r"DB\s*(\d+)", parts[1], re.IGNORECASE)
+            if m_db:
+                inst_db = int(m_db.group(1))
+        return target, inst_db, params
+
+    def _execute_block(
+        self,
+        block_name: str,
+        depth: int = 0,
+        call_params: Optional[Dict[str, Any]] = None,
+        instance_db: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        from .scl_graph_sim import execute_graph_block, execute_scl_block
+
         if depth > 16:
-            return
-        instrs = self.blocks.get(block_name.upper(), [])
+            return {}
+        key = re.sub(r"\s+", "", block_name.strip().upper())
+        meta = self.block_meta.get(key, {})
+        lang = meta.get("language", "AWL")
+
+        # --- SCL Execution ---
+        if lang == "SCL" and meta.get("parsed_scl") is not None:
+            stat_key = f"{key}:DB{instance_db}" if instance_db else key
+            stat_store = self.fb_statics.setdefault(stat_key, {})
+
+            def _call_cb(callee: str, kw: Dict[str, Any]) -> Any:
+                out = self._execute_block(callee, depth=depth + 1, call_params=kw)
+                return out.get("__RETURN__", 0)
+
+            return execute_scl_block(
+                meta["parsed_scl"],
+                read_ref=lambda r: self.read_address(r),
+                write_ref=lambda r, v: self.write_address(r, v),
+                static_store=stat_store,
+                call_block_cb=_call_cb,
+                param_bindings=call_params,
+                parse_time_ms=self._parse_s5time_ms,
+            )
+
+        # --- S7-GRAPH (SFC) Execution ---
+        if lang == "GRAPH" and meta.get("parsed_graph") is not None:
+            st_key = f"{key}:DB{instance_db}" if instance_db else key
+            sfc_state = self.sfc_states.setdefault(st_key, {})
+            return execute_graph_block(
+                meta["parsed_graph"],
+                sfc_state=sfc_state,
+                read_ref=lambda r: self.read_address(r),
+                write_ref=lambda r, v: self.write_address(r, v),
+                tick_ms=self._current_tick_ms,
+            )
+
+        instrs = self.blocks.get(key, [])
         if not instrs:
-            return
+            return {}
+
+        # Prepare local temp frame + parameter bindings
+        self._local_stack.append(bytearray(512))
+        var_decls: Dict[str, Tuple[str, str]] = meta.get("var_decls") or {}
+        param_env: Dict[str, Any] = {}
+        param_types: Dict[str, str] = {}
+        stat_key = f"{key}:DB{instance_db}" if instance_db else key
+        stat_store = self.fb_statics.setdefault(stat_key, {})
+
+        for vname, (sec, vtype) in var_decls.items():
+            param_types[vname] = vtype
+            if sec in ("VAR", "VAR_STAT"):
+                if vname not in stat_store:
+                    stat_store[vname] = False if vtype == "BOOL" else (0.0 if vtype == "REAL" else 0)
+                param_env[vname] = stat_store[vname]
+            else:
+                param_env[vname] = False if vtype == "BOOL" else (0.0 if vtype == "REAL" else 0)
+        for pk, pv in (call_params or {}).items():
+            param_env[pk.lstrip("#").upper()] = pv
+
+        german_mode = bool(meta.get("german_mode", False))
 
         # Pre-index labels
         labels: Dict[str, int] = {}
         clean_instrs: List[str] = []
         for idx, raw in enumerate(instrs):
+            if raw == "__NETWORK__":
+                clean_instrs.append("__NETWORK__")
+                continue
             m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*)$", raw)
             if m:
                 labels[m.group(1).upper()] = idx
@@ -1123,282 +1762,553 @@ class VirtualS7PLC:
                 clean_instrs.append(raw)
 
         rlo = False
-        fc_bit = False  # First Check (/FC): False at start of logic chain
-        accu1: Any = 0
-        accu2: Any = 0
-        nest_stack: List[Tuple[str, bool, bool]] = []
+        fc_bit = False  # /FC: False at start of logic chain
+        or_bit = False  # S7 OR status bit for bare 'O' combiner
+        br_bit = False  # Binary Result (BR) status bit
+        accu1: int = 0  # Authentic 32-bit unsigned bit pattern
+        accu2: int = 0
+        accu3: int = 0
+        accu4: int = 0
+        nest_stack: List[Tuple[str, bool, bool, bool]] = []
+
+        def _flush_bare_or() -> None:
+            nonlocal rlo, or_bit
+            if or_bit:
+                rlo = rlo or or_bit
+                or_bit = False
 
         pc = 0
         steps = 0
-        max_steps = max(2000, len(clean_instrs) * 20)
+        max_steps = max(4000, len(clean_instrs) * 25)
 
-        while pc < len(clean_instrs) and steps < max_steps:
-            steps += 1
-            stmt = clean_instrs[pc]
-            pc += 1
-            if not stmt:
-                continue
+        try:
+            while pc < len(clean_instrs) and steps < max_steps:
+                steps += 1
+                stmt = clean_instrs[pc]
+                pc += 1
+                if not stmt:
+                    continue
+                if stmt == "__NETWORK__":
+                    rlo = False
+                    fc_bit = False
+                    or_bit = False
+                    nest_stack.clear()
+                    continue
 
-            parts = stmt.split(None, 1)
-            op = parts[0].upper()
-            arg = parts[1].strip() if len(parts) > 1 else ""
+                parts = stmt.split(None, 1)
+                op = parts[0].upper()
+                arg = parts[1].strip() if len(parts) > 1 else ""
 
-            if op == "NOP":
-                continue
-            if op == "BEU":
-                break
-            if op == "BEC":
-                if rlo:
+                # Normalize German mnemonics -> canonical International S7 opcodes
+                if op == "U":
+                    op = "A"
+                elif op == "UN":
+                    op = "AN"
+                elif op == "U(":
+                    op = "A("
+                elif op == "UN(":
+                    op = "AN("
+                elif op == "SPA":
+                    op = "JU"
+                elif op == "SPB":
+                    op = "JC"
+                elif op == "SPBN":
+                    op = "JCN"
+                elif op == "SPBNB":
+                    op = "JNB"
+                elif op == "SPBI":
+                    op = "JBI"
+                elif op == "SPNBI":
+                    op = "JNBI"
+                elif op == "ZV":
+                    op = "CU"
+                elif op == "ZR":
+                    op = "CD"
+                elif op == "BEA":
+                    op = "BEU"
+                elif op == "BEB":
+                    op = "BEC"
+                elif op == "AUF":
+                    op = "OPN"
+                elif op == "SI":
+                    op = "SP"
+                elif op == "SV":
+                    op = "SE"
+                elif op == "SA":
+                    op = "SF"
+                elif op == "SE" and german_mode:
+                    op = "SD"
+
+                if op in ("NOP", "BLD", "FR"):
+                    continue
+                if op in ("BEU", "BE"):
                     break
-                continue
-            if op == "SET":
-                rlo = True
-                fc_bit = False
-                continue
-            if op == "CLR":
-                rlo = False
-                fc_bit = False
-                continue
-            if op == "NOT":
-                rlo = not rlo
-                continue
-            if op == "SAVE":
-                continue
-            if op == "OPN":
-                m_db = re.match(r"^DB\s*(\d+)$", arg, re.IGNORECASE)
-                if m_db:
-                    self._open_db = int(m_db.group(1))
-                continue
-            if op == "CALL":
-                target = arg.split(",")[0].strip().upper()
-                self._execute_block(target, depth=depth + 1)
-                fc_bit = False
-                continue
+                if op == "BEC":
+                    _flush_bare_or()
+                    if rlo:
+                        break
+                    fc_bit = False
+                    continue
+                if op == "SET":
+                    rlo = True
+                    fc_bit = False
+                    or_bit = False
+                    continue
+                if op == "CLR":
+                    rlo = False
+                    fc_bit = False
+                    or_bit = False
+                    continue
+                if op == "NOT":
+                    rlo = not rlo
+                    continue
+                if op == "SAVE":
+                    _flush_bare_or()
+                    br_bit = rlo
+                    continue
+                if op == "OPN":
+                    m_db = re.match(r"^DB\s*(\d+)$", arg, re.IGNORECASE)
+                    if m_db:
+                        self._open_db = int(m_db.group(1))
+                    continue
+                if op in ("CALL", "UC", "CC"):
+                    if op == "CC":
+                        _flush_bare_or()
+                        if not rlo:
+                            fc_bit = False
+                            continue
+                    target_blk, inst_db, param_map = self._parse_call_statement(arg)
+                    bound_in: Dict[str, Any] = {}
+                    out_targets: Dict[str, str] = {}
+                    callee_decls = (self.block_meta.get(target_blk) or {}).get("var_decls") or {}
+                    for pname, pexpr in param_map.items():
+                        decl = callee_decls.get(pname)
+                        sec = decl[0] if decl else "VAR_INPUT"
+                        if sec in ("VAR_OUTPUT", "VAR_IN_OUT"):
+                            out_targets[pname] = pexpr
+                        if sec != "VAR_OUTPUT":
+                            try:
+                                if re.fullmatch(r"TRUE|FALSE", pexpr, re.IGNORECASE):
+                                    bound_in[pname] = pexpr.upper() == "TRUE"
+                                elif re.fullmatch(r"[+-]?\d+\.\d+", pexpr):
+                                    bound_in[pname] = float(pexpr)
+                                elif re.fullmatch(r"[+-]?\d+", pexpr):
+                                    bound_in[pname] = int(pexpr)
+                                elif pexpr.lstrip("#").upper() in param_env:
+                                    bound_in[pname] = param_env[pexpr.lstrip("#").upper()]
+                                else:
+                                    dt_hint = decl[1] if decl else None
+                                    bound_in[pname] = self.read_address(pexpr, data_type=dt_hint)
+                            except Exception:
+                                bound_in[pname] = 0
+                    callee_out = self._execute_block(target_blk, depth=depth + 1, call_params=bound_in, instance_db=inst_db)
+                    for pname, dest_expr in out_targets.items():
+                        if pname in callee_out:
+                            val_out = callee_out[pname]
+                            if dest_expr.lstrip("#").upper() in param_env:
+                                param_env[dest_expr.lstrip("#").upper()] = val_out
+                            else:
+                                decl = callee_decls.get(pname)
+                                dt_hint = decl[1] if decl else None
+                                self.write_address(dest_expr, val_out, data_type=dt_hint)
+                    fc_bit = False
+                    or_bit = False
+                    continue
 
-            # Parentheses nesting
-            if op in ("A(", "AN(", "O(", "ON(", "X(", "XN("):
-                nest_stack.append((op, rlo, fc_bit))
-                rlo = False
-                fc_bit = False
-                continue
-            if op == ")":
-                if nest_stack:
-                    n_op, prev_rlo, prev_fc = nest_stack.pop()
-                    val = not rlo if n_op in ("AN(", "ON(", "XN(") else rlo
-                    if not prev_fc:
+                # Parentheses nesting
+                if op in ("A(", "AN(", "O(", "ON(", "X(", "XN("):
+                    nest_stack.append((op, rlo, fc_bit, or_bit))
+                    rlo = False
+                    fc_bit = False
+                    or_bit = False
+                    continue
+                if op == ")":
+                    _flush_bare_or()
+                    if nest_stack:
+                        n_op, prev_rlo, prev_fc, prev_or = nest_stack.pop()
+                        val = not rlo if n_op in ("AN(", "ON(", "XN(") else rlo
+                        if not prev_fc:
+                            rlo = val
+                        elif n_op.startswith("A"):
+                            rlo = prev_rlo and val
+                        elif n_op.startswith("O"):
+                            rlo = prev_rlo or val
+                        else:
+                            rlo = prev_rlo ^ val
+                        or_bit = prev_or
+                        fc_bit = True
+                    continue
+
+                # Bare OR combiner (O with no argument in S7-300 STL: OR_bit = OR_bit | RLO, /FC = 0)
+                if op == "O" and not arg:
+                    or_bit = or_bit or rlo
+                    fc_bit = False
+                    continue
+
+                # Bit logic instructions
+                if op in ("A", "AN", "O", "ON", "X", "XN"):
+                    val = self._eval_bit_operand(arg, param_env=param_env, br_bit=br_bit)
+                    if op in ("AN", "ON", "XN"):
+                        val = not val
+                    if not fc_bit:
                         rlo = val
-                    elif n_op.startswith("A"):
-                        rlo = prev_rlo and val
-                    elif n_op.startswith("O"):
-                        rlo = prev_rlo or val
+                    elif op in ("A", "AN"):
+                        rlo = rlo and val
+                    elif op in ("O", "ON"):
+                        _flush_bare_or()
+                        rlo = rlo or val
                     else:
-                        rlo = prev_rlo ^ val
+                        _flush_bare_or()
+                        rlo = rlo ^ val
                     fc_bit = True
-                continue
+                    continue
 
-            # Bare OR combiner (O with no argument in STL = OR of two AND branches)
-            if op == "O" and not arg:
-                # Peek: save current branch via implicit OR-combine
-                nest_stack.append(("O(", rlo, True))
-                rlo = False
-                fc_bit = False
-                continue
+                # Edge detection
+                if op in ("FP", "FN"):
+                    _flush_bare_or()
+                    prev = self._eval_bit_operand(arg, param_env=param_env, br_bit=br_bit)
+                    self._write_bit_operand(arg, rlo, param_env=param_env)
+                    rlo = (rlo and not prev) if op == "FP" else ((not rlo) and prev)
+                    fc_bit = True
+                    continue
 
-            # Bit logic instructions
-            if op in ("A", "AN", "O", "ON", "X", "XN"):
-                val = self._eval_bit_operand(arg)
-                if op in ("AN", "ON", "XN"):
-                    val = not val
-                if not fc_bit:
-                    rlo = val
-                elif op in ("A", "AN"):
-                    rlo = rlo and val
-                elif op in ("O", "ON"):
-                    rlo = rlo or val
-                else:
-                    rlo = rlo ^ val
-                fc_bit = True
-                continue
+                # Output assignments terminate logic chain (/FC = 0)
+                if op == "=":
+                    _flush_bare_or()
+                    self._write_bit_operand(arg, rlo, param_env=param_env)
+                    fc_bit = False
+                    continue
+                if op == "S":
+                    _flush_bare_or()
+                    arg_c = re.sub(r"\s+", "", arg.upper())
+                    if arg_c.startswith(("C", "Z")) and arg_c[1:].isdigit():
+                        c = self.counters.setdefault(int(arg_c[1:]), _S7CounterState())
+                        if rlo:
+                            c.value = max(0, min(999, self._u32_to_i16(accu1)))
+                    elif rlo:
+                        self._write_bit_operand(arg, True, param_env=param_env)
+                    fc_bit = False
+                    continue
+                if op == "R":
+                    _flush_bare_or()
+                    arg_c = re.sub(r"\s+", "", arg.upper())
+                    if arg_c.startswith("T") and arg_c[1:].isdigit():
+                        t = self.timers.setdefault(int(arg_c[1:]), _S7TimerState())
+                        if rlo:
+                            t.running = False
+                            t.output = False
+                            t.remaining_ms = 0
+                    elif arg_c.startswith(("C", "Z")) and arg_c[1:].isdigit():
+                        c = self.counters.setdefault(int(arg_c[1:]), _S7CounterState())
+                        if rlo:
+                            c.value = 0
+                    elif rlo:
+                        self._write_bit_operand(arg, False, param_env=param_env)
+                    fc_bit = False
+                    continue
 
-            # Edge detection
-            if op in ("FP", "FN"):
-                prev = self._eval_bit_operand(arg)
-                self._write_bit_operand(arg, rlo)
-                rlo = (rlo and not prev) if op == "FP" else ((not rlo) and prev)
-                fc_bit = True
-                continue
-
-            # Output assignments terminate logic chain (/FC = 0)
-            if op == "=":
-                # Close any implicit bare-O branches
-                while nest_stack and nest_stack[-1][0] == "O(":
-                    _, prev_rlo, _ = nest_stack.pop()
-                    rlo = prev_rlo or rlo
-                self._write_bit_operand(arg, rlo)
-                fc_bit = False
-                continue
-            if op == "S":
-                arg_c = re.sub(r"\s+", "", arg.upper())
-                if arg_c.startswith(("C", "Z")) and arg_c[1:].isdigit():
-                    c = self.counters.setdefault(int(arg_c[1:]), _S7CounterState())
-                    if rlo:
-                        c.value = max(0, min(999, int(accu1)))
-                elif rlo:
-                    self._write_bit_operand(arg, True)
-                fc_bit = False
-                continue
-            if op == "R":
-                arg_c = re.sub(r"\s+", "", arg.upper())
-                if arg_c.startswith("T") and arg_c[1:].isdigit():
-                    t = self.timers.setdefault(int(arg_c[1:]), _S7TimerState())
-                    if rlo:
-                        t.running = False
-                        t.output = False
-                        t.remaining_ms = 0
-                elif arg_c.startswith(("C", "Z")) and arg_c[1:].isdigit():
-                    c = self.counters.setdefault(int(arg_c[1:]), _S7CounterState())
-                    if rlo:
-                        c.value = 0
-                elif rlo:
-                    self._write_bit_operand(arg, False)
-                fc_bit = False
-                continue
-
-            # S7 Timers (SD, SS, SP, SE, SF)
-            if op in ("SD", "SS", "SP", "SE", "SF"):
-                t_num = int(re.sub(r"[^0-9]", "", arg))
-                t = self.timers.setdefault(t_num, _S7TimerState())
-                t.mode = op
-                rising = rlo and not t.prev_rlo
-                falling = (not rlo) and t.prev_rlo
-                t.prev_rlo = rlo
-                preset = int(accu1) if isinstance(accu1, (int, float)) else 0
-                if op == "SD":
-                    if rising:
-                        t.preset_ms = preset
-                        t.remaining_ms = preset
-                        t.running = True
-                        t.output = preset == 0
-                    elif not rlo:
-                        t.running = False
-                        t.output = False
-                        t.remaining_ms = 0
-                elif op == "SS":
-                    if rising:
-                        t.preset_ms = preset
-                        t.remaining_ms = preset
-                        t.running = True
-                        if preset == 0:
+                # S7 Timers (SD, SS, SP, SE, SF)
+                if op in ("SD", "SS", "SP", "SE", "SF"):
+                    _flush_bare_or()
+                    resolved_t, _ = self.resolve_operand(arg)
+                    t_num = int(re.sub(r"[^0-9]", "", resolved_t))
+                    t = self.timers.setdefault(t_num, _S7TimerState())
+                    t.mode = op
+                    rising = rlo and not t.prev_rlo
+                    falling = (not rlo) and t.prev_rlo
+                    t.prev_rlo = rlo
+                    preset = max(0, self._u32_to_i32(accu1))
+                    if op == "SD":
+                        if rising:
+                            t.preset_ms = preset
+                            t.remaining_ms = preset
+                            t.running = True
+                            t.output = preset == 0
+                        elif not rlo:
+                            t.running = False
+                            t.output = False
+                            t.remaining_ms = 0
+                    elif op == "SS":
+                        if rising:
+                            t.preset_ms = preset
+                            t.remaining_ms = preset
+                            t.running = True
+                            if preset == 0:
+                                t.output = True
+                    elif op == "SP":
+                        if rising:
+                            t.preset_ms = preset
+                            t.remaining_ms = preset
+                            t.running = preset > 0
+                            t.output = preset > 0
+                        elif not rlo:
+                            t.running = False
+                            t.output = False
+                    elif op == "SE":
+                        if rising:
+                            t.preset_ms = preset
+                            t.remaining_ms = preset
+                            t.running = preset > 0
+                            t.output = preset > 0
+                    elif op == "SF":
+                        if rlo:
                             t.output = True
-                elif op == "SP":
-                    if rising:
-                        t.preset_ms = preset
-                        t.remaining_ms = preset
-                        t.running = preset > 0
-                        t.output = preset > 0
-                    elif not rlo:
-                        t.running = False
-                        t.output = False
-                elif op == "SE":
-                    if rising:
-                        t.preset_ms = preset
-                        t.remaining_ms = preset
-                        t.running = preset > 0
-                        t.output = preset > 0
-                elif op == "SF":
-                    if rlo:
-                        t.output = True
-                        t.running = False
-                        t.remaining_ms = preset
-                    elif falling:
-                        t.preset_ms = preset
-                        t.remaining_ms = preset
-                        t.running = preset > 0
-                        t.output = preset > 0
-                fc_bit = False
-                continue
+                            t.running = False
+                            t.remaining_ms = preset
+                        elif falling:
+                            t.preset_ms = preset
+                            t.remaining_ms = preset
+                            t.running = preset > 0
+                            t.output = preset > 0
+                    fc_bit = False
+                    continue
 
-            # S7 Counters
-            if op in ("CU", "CD"):
-                c_num = int(re.sub(r"[^0-9]", "", arg))
-                c = self.counters.setdefault(c_num, _S7CounterState())
-                if op == "CU":
-                    if rlo and not c.prev_cu:
-                        c.value = min(999, c.value + 1)
-                    c.prev_cu = rlo
-                else:
-                    if rlo and not c.prev_cd:
-                        c.value = max(0, c.value - 1)
-                    c.prev_cd = rlo
-                fc_bit = False
-                continue
+                # S7 Counters
+                if op in ("CU", "CD"):
+                    _flush_bare_or()
+                    resolved_c, _ = self.resolve_operand(arg)
+                    c_num = int(re.sub(r"[^0-9]", "", resolved_c))
+                    c = self.counters.setdefault(c_num, _S7CounterState())
+                    if op == "CU":
+                        if rlo and not c.prev_cu:
+                            c.value = min(999, c.value + 1)
+                        c.prev_cu = rlo
+                    else:
+                        if rlo and not c.prev_cd:
+                            c.value = max(0, c.value - 1)
+                        c.prev_cd = rlo
+                    fc_bit = False
+                    continue
 
-            # Load & Transfer
-            if op in ("L", "LC"):
-                accu2 = accu1
-                val, _ = self._parse_literal(arg)
-                accu1 = val
-                continue
-            if op == "T":
-                dest = arg.upper()
-                if dest.startswith(("DBB", "DBW", "DBD")):
-                    dest = f"DB{self._open_db}.{dest}"
-                dt = "REAL" if isinstance(accu1, float) else None
-                self.write_address(dest, accu1, data_type=dt)
-                continue
+                # Load, Transfer & Accumulator Stack
+                if op in ("L", "LC"):
+                    accu4, accu3, accu2 = accu3, accu2, accu1
+                    val_u32, _ = self._load_operand_u32(arg, param_env=param_env)
+                    accu1 = val_u32
+                    continue
+                if op == "T":
+                    self._store_u32_to_operand(arg, accu1, param_env=param_env, param_types=param_types)
+                    continue
+                if op == "TAK":
+                    accu1, accu2 = accu2, accu1
+                    continue
+                if op == "PUSH":
+                    accu4, accu3, accu2 = accu3, accu2, accu1
+                    continue
+                if op == "POP":
+                    accu1, accu2, accu3 = accu2, accu3, accu4
+                    continue
+                if op == "INC":
+                    delta = int(arg) if arg.isdigit() else 1
+                    accu1 = (accu1 & 0xFFFFFF00) | ((accu1 + delta) & 0xFF)
+                    continue
+                if op == "DEC":
+                    delta = int(arg) if arg.isdigit() else 1
+                    accu1 = (accu1 & 0xFFFFFF00) | ((accu1 - delta) & 0xFF)
+                    continue
 
-            # Arithmetic
-            if op in ("+I", "+D", "+R"):
-                accu1 = (float(accu2) + float(accu1)) if op == "+R" else (int(accu2) + int(accu1))
-                continue
-            if op in ("-I", "-D", "-R"):
-                accu1 = (float(accu2) - float(accu1)) if op == "-R" else (int(accu2) - int(accu1))
-                continue
-            if op in ("*I", "*D", "*R"):
-                accu1 = (float(accu2) * float(accu1)) if op == "*R" else (int(accu2) * int(accu1))
-                continue
-            if op in ("/I", "/D", "/R"):
-                if accu1 != 0:
-                    accu1 = (float(accu2) / float(accu1)) if op == "/R" else int(int(accu2) / int(accu1))
-                continue
+                # Type Conversions & Unary Math
+                if op == "ITD":
+                    accu1 = self._i32_to_u32(self._u32_to_i16(accu1))
+                    continue
+                if op == "DTR":
+                    accu1 = self._f32_to_u32(float(self._u32_to_i32(accu1)))
+                    continue
+                if op == "RND":
+                    accu1 = self._i32_to_u32(int(round(self._u32_to_f32(accu1))))
+                    continue
+                if op == "RND+":
+                    accu1 = self._i32_to_u32(int(math.ceil(self._u32_to_f32(accu1))))
+                    continue
+                if op == "RND-":
+                    accu1 = self._i32_to_u32(int(math.floor(self._u32_to_f32(accu1))))
+                    continue
+                if op == "TRUNC":
+                    accu1 = self._i32_to_u32(int(math.trunc(self._u32_to_f32(accu1))))
+                    continue
+                if op == "NEGI":
+                    accu1 = (accu1 & 0xFFFF0000) | ((-self._u32_to_i16(accu1)) & 0xFFFF)
+                    continue
+                if op == "NEGD":
+                    accu1 = self._i32_to_u32(-self._u32_to_i32(accu1))
+                    continue
+                if op == "NEGR":
+                    accu1 = self._f32_to_u32(-self._u32_to_f32(accu1))
+                    continue
+                if op == "INVI":
+                    accu1 = (accu1 & 0xFFFF0000) | ((~accu1) & 0xFFFF)
+                    continue
+                if op == "INVD":
+                    accu1 = (~accu1) & 0xFFFFFFFF
+                    continue
+                if op == "ABS":
+                    accu1 = self._f32_to_u32(abs(self._u32_to_f32(accu1)))
+                    continue
+                if op == "SQR":
+                    f = self._u32_to_f32(accu1)
+                    accu1 = self._f32_to_u32(f * f)
+                    continue
+                if op == "SQRT":
+                    f = self._u32_to_f32(accu1)
+                    accu1 = self._f32_to_u32(math.sqrt(f) if f >= 0.0 else 0.0)
+                    continue
 
-            # Comparators
-            if op in ("==I", "<>I", ">I", ">=I", "<I", "<=I", "==D", "<>D", ">D", ">=D", "<D", "<=D", "==R", "<>R", ">R", ">=R", "<R", "<=R"):
-                a, b = (float(accu2), float(accu1)) if op.endswith("R") else (int(accu2), int(accu1))
-                cmp_op = op[:-1]
-                rlo = {
-                    "==": a == b,
-                    "<>": a != b,
-                    ">": a > b,
-                    ">=": a >= b,
-                    "<": a < b,
-                    "<=": a <= b,
-                }[cmp_op]
-                fc_bit = True
-                continue
+                # Word / Double-Word Logic & Shifts
+                if op in ("AW", "OW", "XOW"):
+                    rhs = self._load_operand_u32(arg, param_env=param_env)[0] if arg else accu2
+                    lhs = accu1
+                    res_w = (lhs & rhs) if op == "AW" else ((lhs | rhs) if op == "OW" else (lhs ^ rhs))
+                    accu1 = (accu1 & 0xFFFF0000) | (res_w & 0xFFFF)
+                    continue
+                if op in ("AD", "OD", "XOD"):
+                    rhs = self._load_operand_u32(arg, param_env=param_env)[0] if arg else accu2
+                    lhs = accu1
+                    accu1 = ((lhs & rhs) if op == "AD" else ((lhs | rhs) if op == "OD" else (lhs ^ rhs))) & 0xFFFFFFFF
+                    continue
+                if op in ("SLW", "SRW", "SLD", "SRD", "SSI", "SSD"):
+                    n_bits = int(arg) if arg.isdigit() else (accu2 & 0xFF)
+                    if op == "SLW":
+                        accu1 = (accu1 & 0xFFFF0000) | (((accu1 & 0xFFFF) << n_bits) & 0xFFFF)
+                    elif op == "SRW":
+                        accu1 = (accu1 & 0xFFFF0000) | (((accu1 & 0xFFFF) >> n_bits) & 0xFFFF)
+                    elif op == "SLD":
+                        accu1 = (accu1 << n_bits) & 0xFFFFFFFF
+                    elif op == "SRD":
+                        accu1 = (accu1 >> n_bits) & 0xFFFFFFFF
+                    elif op == "SSI":
+                        accu1 = (accu1 & 0xFFFF0000) | ((self._u32_to_i16(accu1) >> n_bits) & 0xFFFF)
+                    elif op == "SSD":
+                        accu1 = self._i32_to_u32(self._u32_to_i32(accu1) >> n_bits)
+                    continue
 
-            # Jumps
-            if op == "JU":
-                lbl = arg.upper()
-                if lbl in labels:
-                    pc = labels[lbl]
-                fc_bit = False
-                continue
-            if op == "JC":
-                if rlo and arg.upper() in labels:
-                    pc = labels[arg.upper()]
-                fc_bit = False
-                continue
-            if op in ("JCN", "JNB"):
-                if (not rlo) and arg.upper() in labels:
-                    pc = labels[arg.upper()]
-                fc_bit = False
-                continue
+                # Arithmetic (16-bit INT, 32-bit DINT, 32-bit IEEE-754 REAL)
+                if op in ("+I", "-I", "*I", "/I"):
+                    a, b = self._u32_to_i16(accu2), self._u32_to_i16(accu1)
+                    if op == "+I":
+                        r16 = (a + b) & 0xFFFF
+                    elif op == "-I":
+                        r16 = (a - b) & 0xFFFF
+                    elif op == "*I":
+                        r16 = (a * b) & 0xFFFF
+                    else:
+                        r16 = (int(a / b) & 0xFFFF) if b != 0 else 0
+                    accu1 = (accu1 & 0xFFFF0000) | r16
+                    continue
+                if op in ("+D", "-D", "*D", "/D", "MOD"):
+                    a, b = self._u32_to_i32(accu2), self._u32_to_i32(accu1)
+                    if op == "+D":
+                        accu1 = self._i32_to_u32(a + b)
+                    elif op == "-D":
+                        accu1 = self._i32_to_u32(a - b)
+                    elif op == "*D":
+                        accu1 = self._i32_to_u32(a * b)
+                    elif op == "/D":
+                        accu1 = self._i32_to_u32(int(a / b)) if b != 0 else 0
+                    else:
+                        accu1 = self._i32_to_u32(a - int(a / b) * b) if b != 0 else 0
+                    continue
+                if op in ("+R", "-R", "*R", "/R"):
+                    a, b = self._u32_to_f32(accu2), self._u32_to_f32(accu1)
+                    if op == "+R":
+                        accu1 = self._f32_to_u32(a + b)
+                    elif op == "-R":
+                        accu1 = self._f32_to_u32(a - b)
+                    elif op == "*R":
+                        accu1 = self._f32_to_u32(a * b)
+                    else:
+                        accu1 = self._f32_to_u32(a / b) if b != 0.0 else 0
+                    continue
+
+                # Comparators (INT, DINT, REAL)
+                if op in ("==I", "<>I", ">I", ">=I", "<I", "<=I", "==D", "<>D", ">D", ">=D", "<D", "<=D", "==R", "<>R", ">R", ">=R", "<R", "<=R"):
+                    if op.endswith("I"):
+                        a, b = self._u32_to_i16(accu2), self._u32_to_i16(accu1)
+                    elif op.endswith("D"):
+                        a, b = self._u32_to_i32(accu2), self._u32_to_i32(accu1)
+                    else:
+                        a, b = self._u32_to_f32(accu2), self._u32_to_f32(accu1)
+                    cmp_op = op[:-1]
+                    rlo = {
+                        "==": a == b,
+                        "<>": a != b,
+                        ">": a > b,
+                        ">=": a >= b,
+                        "<": a < b,
+                        "<=": a <= b,
+                    }[cmp_op]
+                    fc_bit = True
+                    or_bit = False
+                    continue
+
+                # Jumps (with authentic S7 BR handling for JNB / JB / JBI / JNBI)
+                if op == "JU":
+                    lbl = arg.upper()
+                    if lbl in labels:
+                        pc = labels[lbl]
+                    fc_bit = False
+                    or_bit = False
+                    continue
+                if op == "JC":
+                    _flush_bare_or()
+                    if rlo and arg.upper() in labels:
+                        pc = labels[arg.upper()]
+                    fc_bit = False
+                    continue
+                if op == "JB":
+                    _flush_bare_or()
+                    br_bit = rlo
+                    if rlo and arg.upper() in labels:
+                        pc = labels[arg.upper()]
+                    fc_bit = False
+                    continue
+                if op == "JCN":
+                    _flush_bare_or()
+                    if (not rlo) and arg.upper() in labels:
+                        pc = labels[arg.upper()]
+                    fc_bit = False
+                    continue
+                if op == "JNB":
+                    _flush_bare_or()
+                    br_bit = rlo
+                    if (not rlo) and arg.upper() in labels:
+                        pc = labels[arg.upper()]
+                    fc_bit = False
+                    continue
+                if op == "JBI":
+                    if br_bit and arg.upper() in labels:
+                        pc = labels[arg.upper()]
+                    fc_bit = False
+                    or_bit = False
+                    continue
+                if op == "JNBI":
+                    if (not br_bit) and arg.upper() in labels:
+                        pc = labels[arg.upper()]
+                    fc_bit = False
+                    or_bit = False
+                    continue
+
+                # Record any unrecognized opcode instead of failing silently
+                if op not in self.last_unsupported_instructions:
+                    self.last_unsupported_instructions.append(op)
+        finally:
+            if len(self._local_stack) > 1:
+                self._local_stack.pop()
+            for vname, (sec, _) in var_decls.items():
+                if sec in ("VAR", "VAR_STAT") and vname in param_env:
+                    stat_store[vname] = param_env[vname]
+
+        return {
+            vname: param_env[vname]
+            for vname, (sec, _) in var_decls.items()
+            if sec in ("VAR_OUTPUT", "VAR_IN_OUT") and vname in param_env
+        }
 
     def step(self, cycles: int = 1, tick_ms: int = 100, entry_block: str = "OB1") -> Dict[str, Any]:
-        """Execute ``cycles`` deterministic OB1 scan cycles advancing S7 timers by ``tick_ms`` per cycle."""
+        """Execute ``cycles`` deterministic scan cycles advancing S7 timers by ``tick_ms`` per cycle."""
         with self._lock:
             executed = 0
+            self.last_unsupported_instructions = []
+            self._current_tick_ms = max(0, int(tick_ms))
             if self.cpu_mode != "RUN":
                 return {
                     "ok": True,
@@ -1409,18 +2319,80 @@ class VirtualS7PLC:
                     "warning": "CPU is in STOP mode; no scan cycles executed.",
                 }
             for _ in range(max(1, int(cycles))):
-                self.sim_time_ms += max(0, int(tick_ms))
-                self._advance_timers(max(0, int(tick_ms)))
+                self.sim_time_ms += self._current_tick_ms
+                self._advance_timers(self._current_tick_ms)
                 self._execute_block(entry_block)
                 self.scan_count += 1
                 executed += 1
-            return {
+            res: Dict[str, Any] = {
                 "ok": True,
                 "cpu_mode": self.cpu_mode,
                 "executed_cycles": executed,
                 "scan_count": self.scan_count,
                 "sim_time_ms": self.sim_time_ms,
                 "entry_block": entry_block.upper(),
+            }
+            if self.last_unsupported_instructions:
+                res["unsupported_instructions"] = list(self.last_unsupported_instructions)
+            if self.sfc_states:
+                res["sfc_active_steps"] = {k: list(v.get("active_steps", [])) for k, v in self.sfc_states.items()}
+            return res
+
+    def inspect_state(self, max_bytes_scan: int = 256) -> Dict[str, Any]:
+        """Return a compact, AI-friendly snapshot of VirtualS7PLC memory, timers, counters, and loaded blocks."""
+        with self._lock:
+            active_io: Dict[str, Dict[str, Any]] = {}
+            for area_name in ("I", "Q", "M", "PI", "PQ"):
+                buf = self.areas[area_name]
+                limit = min(len(buf), max_bytes_scan)
+                non_zero: Dict[str, Any] = {}
+                if area_name in ("PI", "PQ"):
+                    for b in range(0, min(len(buf), 512), 2):
+                        w = struct.unpack(">h", buf[b:b + 2])[0]
+                        if w != 0:
+                            non_zero[f"{area_name}W{b}"] = w
+                else:
+                    for b in range(limit):
+                        val = buf[b]
+                        if val != 0:
+                            bits = [f"{area_name}{b}.{bit}" for bit in range(8) if (val >> bit) & 1]
+                            non_zero[f"{area_name}B{b}"] = {"byte": val, "active_bits": bits}
+                active_io[area_name] = non_zero
+
+            timers_view = {
+                f"T{num}": {
+                    "mode": t.mode,
+                    "preset_ms": t.preset_ms,
+                    "remaining_ms": t.remaining_ms,
+                    "running": t.running,
+                    "output": t.output,
+                }
+                for num, t in sorted(self.timers.items())
+            }
+            counters_view = {f"C{num}": c.value for num, c in sorted(self.counters.items())}
+            db_view: Dict[str, Any] = {}
+            for db_num, fields in sorted(self.db_layouts.items()):
+                db_view[f"DB{db_num}"] = {
+                    fname: self.read_address(addr, data_type=ftype)
+                    for fname, (addr, ftype) in fields.items()
+                }
+            return {
+                "ok": True,
+                "order_number": self.order_number,
+                "cpu_mode": self.cpu_mode,
+                "scan_count": self.scan_count,
+                "sim_time_ms": self.sim_time_ms,
+                "loaded_blocks": {
+                    k: (self.block_meta.get(k) or {}).get("language", "AWL")
+                    for k in sorted(set(list(self.blocks.keys()) + list(self.block_meta.keys())))
+                },
+                "symbol_count": len(self.symbols),
+                "timers": timers_view,
+                "counters": counters_view,
+                "sfc_active_steps": {k: list(v.get("active_steps", [])) for k, v in self.sfc_states.items()},
+                "active_memory": active_io,
+                "data_blocks": db_view,
+                "unsupported_instructions": list(self.last_unsupported_instructions),
             }
 
 

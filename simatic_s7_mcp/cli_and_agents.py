@@ -369,11 +369,15 @@ def build_prompt_convert_and_verify_lad(block_name: str = "FC1") -> str:
 
 def build_prompt_plcsim_automated_test(block_name: str = "OB1") -> str:
     return (
-        f"Run an automated closed-loop simulation test on '{block_name}':\n"
-        f"1. Load logic into VirtualS7PLC (s7_virtual_plc_load) or connect S7-PLCSIM (s7_plcsim_control).\n"
-        f"2. Drive deterministic input sequences (start/stop, fault injection, analog ramps), step scan cycles, "
-        f"and assert expected outputs (Q bits, M markers, DB values, timers, counters).\n"
-        f"3. Report pass/fail per scenario step with exact observed vs expected values."
+        f"Write and run an automated closed-loop S7-300 simulation test for '{block_name}':\n"
+        f"1. Define symbols, Data Blocks (s7_create_data_block), and control logic in LAD/FBD/STL "
+        f"(s7_validate_program + s7_convert_to_ladder), SCL (s7_write_scl_block), or S7-GRAPH (s7_write_graph_block).\n"
+        f"2. Load all DBs, FCs, FBs, and '{block_name}' into VirtualS7PLC via s7_virtual_plc_load "
+        f"(pass symbols and set reset_memory=True on the first block) or connect Windows S7-PLCSIM via s7_plcsim_control.\n"
+        f"3. Execute deterministic multi-step scenarios via s7_plcsim_run_scenario (start/stop, interlocks, "
+        f"S5 timers, counters, PIW/PQW analog ramps, fault/E-stop injection, recovery) with watch & expect assertions.\n"
+        f"4. If any assertion fails, call s7_virtual_plc_inspect to inspect I/Q/M/PI/PQ/DB/Timer/Counter/SFC state, "
+        f"fix the logic, re-run until 100% of steps pass, and report observed vs expected values."
     )
 
 

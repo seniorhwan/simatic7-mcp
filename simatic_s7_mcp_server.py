@@ -4088,6 +4088,8 @@ class S7RuntimeClient:
     """
 
     AREA_MAP = {
+        "PI": 0x80,
+        "PQ": 0x85,
         "I": 0x81,
         "E": 0x81,
         "Q": 0x82,
@@ -4240,7 +4242,28 @@ class S7RuntimeClient:
                 "byte_length": 1,
             }
 
-        # 3. Byte/Word/DWord addressing: IB/IW/ID/QB/QW/QD/MB/MW/MD <byte>
+        # 3a. Peripheral Analog/Digital I/O: PIB/PIW/PID/PEB/PEW/PED, PQB/PQW/PQD/PAB/PAW/PAD
+        m_periph = re.match(r"^P([IEQA])([BWD])(\d+)$", s)
+        if m_periph:
+            dir_ch = m_periph.group(1)
+            w_ch = m_periph.group(2)
+            byte_off = int(m_periph.group(3))
+            area_key = "PI" if dir_ch in ("I", "E") else "PQ"
+            dsize, blen = {"B": ("BYTE", 1), "W": ("INT", 2), "D": ("DINT", 4)}[w_ch]
+            if default_dtype in ("WORD", "INT", "DWORD", "DINT", "REAL") and blen in (2, 4):
+                dsize = default_dtype
+            return {
+                "canonical": f"{area_key}{w_ch} {byte_off}",
+                "area": area_key,
+                "area_code": self.AREA_MAP[area_key],
+                "db_number": 0,
+                "data_size": dsize,
+                "byte_offset": byte_off,
+                "bit_offset": 0,
+                "byte_length": blen,
+            }
+
+        # 3b. Byte/Word/DWord addressing: IB/IW/ID/QB/QW/QD/MB/MW/MD <byte>
         m_val = re.match(r"^([IEQAM])([BWD])(\d+)$", s)
         if m_val:
             area_ch = {"E": "I", "A": "Q"}.get(m_val.group(1), m_val.group(1))
@@ -4260,20 +4283,21 @@ class S7RuntimeClient:
                 "byte_length": blen,
             }
 
-        # 4. Timers (T n) and Counters (C n / Z n)
-        m_tc = re.match(r"^([TCZ])(\d+)$", s)
+        # 4. Timers (T n / T n.Q) and Counters (C n / Z n / C n.Q)
+        m_tc = re.match(r"^([TCZ])(\d+)(\.Q)?$", s)
         if m_tc:
             tc_ch = "C" if m_tc.group(1) in ("C", "Z") else "T"
             tc_num = int(m_tc.group(2))
+            is_q = bool(m_tc.group(3))
             return {
-                "canonical": f"{tc_ch} {tc_num}",
+                "canonical": f"{tc_ch} {tc_num}.Q" if is_q else f"{tc_ch} {tc_num}",
                 "area": tc_ch,
                 "area_code": self.AREA_MAP[tc_ch],
                 "db_number": 0,
-                "data_size": "WORD",
+                "data_size": "BIT" if is_q else "WORD",
                 "byte_offset": tc_num,
                 "bit_offset": 0,
-                "byte_length": 2,
+                "byte_length": 1 if is_q else 2,
             }
 
         return None
@@ -5961,10 +5985,18 @@ class SimaticManagerController:
 mcp = FastMCP(
     "simatic7-mcp",
     instructions=(
-        "Siemens SIMATIC STEP 7 Classic (v5.x / SIMATIC Manager) offline and online ladder/STL editing "
-        "for S7-300, S7-400, and WinAC PLCs (specifically NOT for TIA Portal). "
-        "Always pre-validate with s7_validate_program, generate verified AWL/STL sources, and report SUCCESS "
-        "only after backup, compile, check, and exact readback verification. Never transfers to live PLC without review."
+        "Siemens SIMATIC STEP 7 Classic (v5.x / SIMATIC Manager) engineering & S7-300/400/WinAC PLC simulation server "
+        "(specifically NOT for TIA Portal). "
+        "PROGRAMMING & SIMULATION GOLDEN PATH FOR S7-300 CASES: "
+        "(1) Design I/O symbols, DBs (s7_create_data_block), and control logic in LAD/FBD/STL (s7_validate_program + "
+        "s7_convert_to_ladder), SCL (s7_write_scl_block), or S7-GRAPH (s7_write_graph_block). "
+        "(2) Simulate immediately cross-platform using VirtualS7PLC: load every DB/FC/FB/OB with s7_virtual_plc_load "
+        "(accepts source_code, networks, or awl_source_path plus symbols; supports AWL/LAD/FBD/SCL/GRAPH/DB, PIW/PQW analog I/O, "
+        "32-bit INT/DINT/REAL math, S5 timers, counters, CALL params, and German mnemonics). "
+        "(3) Verify full industrial scenarios with s7_plcsim_run_scenario(target='virtual', reset_memory=True, steps=[...]) "
+        "or step-by-step with s7_virtual_plc_step, and inspect live CPU state via s7_virtual_plc_inspect whenever debugging. "
+        "(4) On Windows with STEP 7 + PLCSIM installed, compile/download via s7_com_* and run the exact same scenario against target='plcsim'. "
+        "Never transfer to a physical live PLC without explicit operator review and dual-guard confirmation."
     ),
 )
 
@@ -8616,24 +8648,135 @@ def s7_plcsim_snapshot(
     return json.dumps(res, indent=2)
 
 
+def _parse_virtual_read_spec(item: Any) -> Tuple[str, str, Optional[str]]:
+    """Normalizes a read address specification for VirtualS7PLC tools.
+
+    Accepts:
+      - ``"Q0.0"`` -> label="Q0.0", addr="Q0.0", dtype=None
+      - ``"MD20:REAL"`` -> label="MD20:REAL", addr="MD20", dtype="REAL"
+      - ``{"address": "MD20", "data_type": "REAL", "alias": "TempC"}``
+    """
+    if isinstance(item, dict):
+        addr = str(item.get("address") or "").strip()
+        dtype = str(item.get("data_type")).upper() if item.get("data_type") else None
+        label = str(item.get("alias") or addr)
+        return label, addr, dtype
+    raw = str(item or "").strip()
+    if ":" in raw and not raw.upper().startswith(("S5T#", "T#", "L#", "P#")):
+        left, right = raw.rsplit(":", 1)
+        right_up = right.strip().upper()
+        if right_up in ("BOOL", "BIT", "BYTE", "WORD", "INT", "DWORD", "DINT", "REAL", "S5TIME"):
+            return raw, left.strip(), right_up
+    return raw, raw, None
+
+
+def _read_virtual_with_expected_hint(addr: str, expected: Any = None, explicit_dtype: Optional[str] = None) -> Any:
+    """Reads from VIRTUAL_PLC inferring S7 data type from expected assertion type when not specified."""
+    dtype = explicit_dtype
+    target_addr = addr.strip()
+    if dtype is None and expected is not None:
+        if isinstance(expected, bool):
+            # Allow asserting {"T1": True} or {"C1": True} naturally against Timer/Counter Q bit
+            m_tc = re.match(r"^\s*([TCZ])\s*(\d+)\s*$", target_addr, re.IGNORECASE)
+            if m_tc:
+                target_addr = f"{m_tc.group(1).upper()}{m_tc.group(2)}.Q"
+                dtype = "BOOL"
+        elif isinstance(expected, float):
+            dtype = "REAL"
+        elif isinstance(expected, int):
+            # Signed negative expectations on W/D registers decode as INT/DINT
+            if expected < 0:
+                resolved, _ = VIRTUAL_PLC.resolve_operand(target_addr)
+                compact = re.sub(r"\s+", "", resolved.upper())
+                if any(tok in compact for tok in ("DBD", "MD", "ID", "QD", "PID", "PQD", "LD")):
+                    dtype = "DINT"
+                else:
+                    dtype = "INT"
+    return VIRTUAL_PLC.read_address(target_addr, data_type=dtype)
+
+
 @mcp.tool(annotations=make_tool_annotations(read_only=False, title="Load Block into Virtual S7 PLC"))
 def s7_virtual_plc_load(
     block_name: str = "OB1",
     source_code: str = "",
+    networks: Optional[List[Dict[str, Any]]] = None,
+    awl_source_path: Optional[str] = None,
+    symbols: Optional[Any] = None,
+    language: str = "AUTO",
     reset_memory: bool = False,
+    clear_blocks: bool = False,
 ) -> str:
     """
-    Loads an AWL/STL/LAD block into the built-in deterministic Virtual S7-300/400 PLC simulator
-    for cross-platform closed-loop testing without requiring physical hardware or Windows PLCSIM.
+    Loads an S7-300/400 block (AWL/STL, pure LAD, FBD, SCL, S7-GRAPH, or DATA_BLOCK) into the built-in
+    deterministic Virtual S7-300 PLC simulator for instant cross-platform closed-loop testing.
+
+    Flexible input modes:
+      - Pass `source_code` directly (AWL, LAD-compliant AWL, SCL, S7-GRAPH .gr7, or DATA_BLOCK source)
+      - OR pass structured `networks` (same format as `s7_validate_program` / `s7_generate_awl`)
+      - OR pass `awl_source_path` pointing to an `.awl` / `.scl` / `.gr7` file on disk
+      - Pass `symbols` (dict or symbol-entry list) to register symbolic names (`"START_PB"` -> `"I 0.0"`)
+      - Set `reset_memory=True` to zero I/Q/M/PI/PQ/DB/Timers/Counters before loading (`clear_blocks=True` also clears previously loaded blocks).
     """
     if reset_memory:
-        VIRTUAL_PLC.areas = {"I": bytearray(4096), "Q": bytearray(4096), "M": bytearray(4096)}
-        VIRTUAL_PLC.dbs = {1: bytearray(4096)}
-        VIRTUAL_PLC.timers.clear()
-        VIRTUAL_PLC.counters.clear()
-        VIRTUAL_PLC.scan_count = 0
-        VIRTUAL_PLC.sim_time_ms = 0
-    res = VIRTUAL_PLC.load_block(block_name=block_name, awl_source=source_code)
+        VIRTUAL_PLC.reset(clear_blocks=clear_blocks, clear_symbols=False)
+
+    symbols_registered = 0
+    if symbols:
+        symbols_registered = VIRTUAL_PLC.set_symbols(symbols)
+
+    code = source_code or ""
+    if not code.strip() and awl_source_path:
+        src_p = Path(awl_source_path)
+        if not src_p.is_file():
+            return json.dumps(
+                {
+                    "success": False,
+                    "ok": False,
+                    "error": f"Source file not found: {awl_source_path}",
+                },
+                indent=2,
+            )
+        code = src_p.read_text(encoding="utf-8", errors="replace")
+
+    if not code.strip() and networks is not None:
+        m_blk = re.match(r"^(OB|FC|FB|DB)\s*(\d+)$", block_name.strip().upper())
+        blk_type = m_blk.group(1) if m_blk else "OB"
+        blk_num = int(m_blk.group(2)) if m_blk else 1
+        val_report = validate_and_analyze_program(networks, symbols_input=symbols)
+        if not val_report.valid:
+            return json.dumps(
+                {
+                    "success": False,
+                    "ok": False,
+                    "block": block_name,
+                    "error": "Validation failed while generating AWL from networks.",
+                    "errors": val_report.errors,
+                    "warnings": val_report.warnings,
+                },
+                indent=2,
+            )
+        code = generate_s7_awl_source(
+            networks=val_report.normalized_networks,
+            block_type=blk_type,
+            block_number=blk_num,
+            symbols=symbols,
+        )
+
+    if not code.strip():
+        return json.dumps(
+            {
+                "success": False,
+                "ok": False,
+                "error": "Provide `source_code`, `networks`, or `awl_source_path` to load a block.",
+            },
+            indent=2,
+        )
+
+    res = VIRTUAL_PLC.load_block(block_name=block_name, awl_source=code, language=language)
+    if symbols_registered:
+        res["symbols_registered"] = symbols_registered
+    res["loaded_blocks"] = sorted(VIRTUAL_PLC.blocks.keys())
+    res["loaded_dbs"] = sorted(VIRTUAL_PLC.dbs.keys())
     res["success"] = bool(res.get("ok"))
     return json.dumps(res, indent=2)
 
@@ -8644,21 +8787,45 @@ def s7_virtual_plc_step(
     tick_ms: int = 100,
     entry_block: str = "OB1",
     write_inputs: Optional[Dict[str, Any]] = None,
-    read_addresses: Optional[List[str]] = None,
+    read_addresses: Optional[List[Any]] = None,
+    symbols: Optional[Any] = None,
 ) -> str:
     """
-    Drives optional input/marker/DB values into the Virtual S7 PLC, executes `cycles` deterministic scan cycles
-    advancing S7 timers by `tick_ms` per scan, and reads back requested outputs/markers/timers/counters/DBs.
+    Drives optional inputs/markers/analog PIW/DB values (by direct S7 address, symbol name, or DB field)
+    into the Virtual S7-300 PLC, executes `cycles` deterministic scan cycles advancing S7 timers by
+    `tick_ms` per scan, and reads back requested outputs/markers/timers/counters/DBs.
+
+    `read_addresses` entries may be strings (`"Q0.0"`, `"MD20:REAL"`, `"MW10:INT"`, `"T1.Q"`, `"START_PB"`)
+    or dicts (`{"address": "MD20", "data_type": "REAL", "alias": "TempC"}`).
     """
+    if symbols:
+        VIRTUAL_PLC.set_symbols(symbols)
     for addr, val in (write_inputs or {}).items():
-        VIRTUAL_PLC.write_address(addr, val)
+        if isinstance(val, dict) and "value" in val:
+            VIRTUAL_PLC.write_address(addr, val["value"], data_type=val.get("data_type"))
+        else:
+            VIRTUAL_PLC.write_address(addr, val)
     step_res = VIRTUAL_PLC.step(cycles=cycles, tick_ms=tick_ms, entry_block=entry_block)
     observed: Dict[str, Any] = {}
-    for addr in read_addresses or []:
-        observed[addr] = VIRTUAL_PLC.read_address(addr)
+    for item in read_addresses or []:
+        label, addr, dtype = _parse_virtual_read_spec(item)
+        observed[label] = VIRTUAL_PLC.read_address(addr, data_type=dtype)
     step_res["observed"] = observed
     step_res["success"] = bool(step_res.get("ok"))
     return json.dumps(step_res, indent=2)
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, title="Inspect Virtual S7-300 CPU State"))
+def s7_virtual_plc_inspect(max_bytes_scan: int = 256) -> str:
+    """
+    Returns a complete structured diagnostic snapshot of the Virtual S7-300 CPU:
+    mode, scan count, simulated time (ms), loaded blocks & languages, registered symbols,
+    non-zero I/Q/M/PI/PQ bytes, DB non-zero bytes & field layouts, active timers, counters,
+    S7-GRAPH active SFC steps, and any unsupported instructions or runtime diagnostics.
+    """
+    state = VIRTUAL_PLC.inspect_state(max_bytes_scan=max_bytes_scan)
+    state["success"] = True
+    return json.dumps(state, indent=2)
 
 
 @mcp.tool(annotations=make_tool_annotations(read_only=False, title="Run Automated Simulation Scenario"))
@@ -8666,17 +8833,36 @@ def s7_plcsim_run_scenario(
     steps: List[Dict[str, Any]],
     target: str = "virtual",
     entry_block: str = "OB1",
+    symbols: Optional[Any] = None,
+    reset_memory: bool = False,
 ) -> str:
     """
-    Executes a multi-step automated closed-loop test scenario against either `virtual` (VirtualS7PLC)
+    Executes a multi-step automated closed-loop S7-300 test scenario against either `virtual` (VirtualS7PLC)
     or `plcsim` (live S7-PLCSIM via S7ProSim).
 
     Each step supports:
-      {"name": "Start motor", "inputs": {"I0.0": True}, "cycles": 2, "tick_ms": 100, "expect": {"Q0.0": True}}
+      {
+        "name": "Start motor & ramp analog",
+        "inputs": {"START_PB": True, "PIW256": 13824},
+        "cycles": 5,
+        "tick_ms": 100,
+        "watch": ["MD20:REAL", "T1", "PQW256:INT"],
+        "expect": {
+          "Q0.0": True,
+          "T1": True,
+          "MD20": {"value": 50.0, "data_type": "REAL", "tolerance": 0.1}
+        }
+      }
     """
     report_steps: List[Dict[str, Any]] = []
     all_passed = True
     use_virtual = target.strip().lower() == "virtual"
+
+    if use_virtual:
+        if reset_memory:
+            VIRTUAL_PLC.reset(clear_blocks=False, clear_symbols=False)
+        if symbols:
+            VIRTUAL_PLC.set_symbols(symbols)
 
     for idx, st in enumerate(steps, start=1):
         name = str(st.get("name") or f"Step {idx}")
@@ -8684,32 +8870,81 @@ def s7_plcsim_run_scenario(
         cycles = max(1, int(st.get("cycles", 1)))
         tick_ms = max(0, int(st.get("tick_ms", 100)))
         expects = st.get("expect") or {}
+        watches = st.get("watch") or []
         step_mismatches: List[Dict[str, Any]] = []
         observed: Dict[str, Any] = {}
+        watched: Dict[str, Any] = {}
+        step_meta: Dict[str, Any] = {}
 
         if use_virtual:
-            for addr, val in inputs.items():
-                VIRTUAL_PLC.write_address(addr, val)
-            VIRTUAL_PLC.step(cycles=cycles, tick_ms=tick_ms, entry_block=entry_block)
-            for addr, expected in expects.items():
-                actual = VIRTUAL_PLC.read_address(addr)
-                observed[addr] = actual
-                if isinstance(expected, float):
-                    ok_val = abs(float(actual) - expected) <= 1e-3
-                else:
-                    ok_val = actual == expected
-                if not ok_val:
-                    step_mismatches.append({"address": addr, "expected": expected, "actual": actual})
+            try:
+                for addr, val in inputs.items():
+                    if isinstance(val, dict) and "value" in val:
+                        VIRTUAL_PLC.write_address(addr, val["value"], data_type=val.get("data_type"))
+                    else:
+                        VIRTUAL_PLC.write_address(addr, val)
+                step_run = VIRTUAL_PLC.step(cycles=cycles, tick_ms=tick_ms, entry_block=entry_block)
+                step_meta["sim_time_ms"] = step_run.get("sim_time_ms")
+                step_meta["scan_count"] = step_run.get("scan_count")
+                if step_run.get("unsupported_instructions"):
+                    step_meta["unsupported_instructions"] = step_run["unsupported_instructions"]
+                if not step_run.get("ok"):
+                    step_mismatches.append({"address": entry_block, "error": step_run.get("error", "Step failed")})
+
+                for w_item in watches:
+                    w_label, w_addr, w_dtype = _parse_virtual_read_spec(w_item)
+                    watched[w_label] = VIRTUAL_PLC.read_address(w_addr, data_type=w_dtype)
+
+                for addr, expected_spec in expects.items():
+                    exp_dtype: Optional[str] = None
+                    tol: float = 1e-3
+                    if isinstance(expected_spec, dict) and "value" in expected_spec:
+                        expected = expected_spec["value"]
+                        exp_dtype = str(expected_spec["data_type"]).upper() if expected_spec.get("data_type") else None
+                        tol = float(expected_spec.get("tolerance", 1e-3))
+                    else:
+                        expected = expected_spec
+                    _, parsed_addr, inline_dtype = _parse_virtual_read_spec(addr)
+                    actual = _read_virtual_with_expected_hint(parsed_addr, expected=expected, explicit_dtype=exp_dtype or inline_dtype)
+                    observed[addr] = actual
+                    if isinstance(expected, float) or (exp_dtype or inline_dtype) == "REAL":
+                        ok_val = actual is not None and abs(float(actual) - float(expected)) <= tol
+                    elif isinstance(expected, bool):
+                        ok_val = bool(actual) is expected if isinstance(actual, bool) else (actual == expected)
+                    else:
+                        ok_val = actual == expected
+                    if not ok_val:
+                        step_mismatches.append({"address": addr, "expected": expected, "actual": actual})
+
+                if VIRTUAL_PLC.sfc_states:
+                    step_meta["sfc_active_steps"] = {
+                        blk: list(st_obj.get("active_steps", [])) if isinstance(st_obj, dict) else sorted(getattr(st_obj, "active_steps", []))
+                        for blk, st_obj in VIRTUAL_PLC.sfc_states.items()
+                    }
+            except Exception as exc:
+                step_mismatches.append({"address": entry_block, "error": str(exc)})
         else:
             for addr, val in inputs.items():
-                spec, err = runtime_client.resolve_address(addr)
+                raw_val = val["value"] if isinstance(val, dict) and "value" in val else val
+                spec, err = runtime_client.resolve_address(addr, symbols=symbols)
                 if err or spec is None:
                     step_mismatches.append({"address": addr, "error": err})
                 else:
-                    runtime_client._plcsim_write(spec, val)
+                    runtime_client._plcsim_write(spec, raw_val)
             runtime_client.com_bridge.worker.call("plcsim_step_scan", {"cycles": cycles}, timeout_s=15.0)
-            for addr, expected in expects.items():
-                spec, err = runtime_client.resolve_address(addr)
+            for w_item in watches:
+                w_label, w_addr, _ = _parse_virtual_read_spec(w_item)
+                spec, err = runtime_client.resolve_address(w_addr, symbols=symbols)
+                if not err and spec is not None:
+                    watched[w_label] = runtime_client._plcsim_read(spec).get("value")
+            for addr, expected_spec in expects.items():
+                tol = 1e-3
+                if isinstance(expected_spec, dict) and "value" in expected_spec:
+                    expected = expected_spec["value"]
+                    tol = float(expected_spec.get("tolerance", 1e-3))
+                else:
+                    expected = expected_spec
+                spec, err = runtime_client.resolve_address(addr, symbols=symbols)
                 if err or spec is None:
                     step_mismatches.append({"address": addr, "error": err})
                     continue
@@ -8717,7 +8952,7 @@ def s7_plcsim_run_scenario(
                 actual = rd.get("value")
                 observed[addr] = actual
                 if isinstance(expected, float):
-                    ok_val = actual is not None and abs(float(actual) - expected) <= 1e-3
+                    ok_val = actual is not None and abs(float(actual) - expected) <= tol
                 else:
                     ok_val = actual == expected
                 if not ok_val:
@@ -8726,13 +8961,17 @@ def s7_plcsim_run_scenario(
         passed = len(step_mismatches) == 0
         if not passed:
             all_passed = False
-        report_steps.append({
+        step_entry: Dict[str, Any] = {
             "step": idx,
             "name": name,
             "passed": passed,
             "observed": observed,
             "mismatches": step_mismatches,
-        })
+        }
+        if watched:
+            step_entry["watched"] = watched
+        step_entry.update(step_meta)
+        report_steps.append(step_entry)
 
     return json.dumps(
         {

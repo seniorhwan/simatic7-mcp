@@ -723,5 +723,456 @@ class TestAuditRemediationsAndAnnotations(unittest.TestCase):
         self.assertEqual(missing, [], f"Tools missing MCP ToolAnnotations: {missing}")
 
 
+class TestS7300EndToEndSimulationCases(unittest.TestCase):
+    """Realistic S7-300 industrial control cases executed end-to-end through the MCP tools."""
+
+    def setUp(self) -> None:
+        SERVER.VIRTUAL_PLC.reset(clear_blocks=True, clear_symbols=True)
+
+    def test_case1_star_delta_motor_starter_converted_to_pure_lad(self):
+        """Write Star-Delta networks -> convert via s7_convert_to_ladder -> load & simulate full cycle."""
+        symbols = {
+            "START_PB": "I 0.0",
+            "STOP_NC": "I 0.1",
+            "OL_NC": "I 0.2",
+            "KM_MAIN": "Q 0.0",
+            "KM_STAR": "Q 0.1",
+            "KM_DELTA": "Q 0.2",
+        }
+        networks = [
+            {
+                "title": "Main Contactor Latch",
+                "instructions": [
+                    "O I 0.0",
+                    "O Q 0.0",
+                    "A I 0.1",
+                    "A I 0.2",
+                    "= Q 0.0",
+                ],
+            },
+            {
+                "title": "Star-Delta Changeover Timer (500ms)",
+                "instructions": [
+                    "A Q 0.0",
+                    "L S5T#500MS",
+                    "SD T 1",
+                ],
+            },
+            {
+                "title": "Star Contactor (Mutually Interlocked)",
+                "instructions": [
+                    "A Q 0.0",
+                    "AN T 1",
+                    "AN Q 0.2",
+                    "= Q 0.1",
+                ],
+            },
+            {
+                "title": "Delta Contactor (Mutually Interlocked)",
+                "instructions": [
+                    "A Q 0.0",
+                    "A T 1",
+                    "AN Q 0.1",
+                    "= Q 0.2",
+                ],
+            },
+        ]
+        # Validate and convert to pure STEP 7 Classic LAD (uses BLD, NOP 0, L-stack & BR)
+        val = json.loads(SERVER.s7_validate_program(networks=networks, symbols=symbols))
+        self.assertTrue(val["valid"], val)
+        gen_awl = SERVER.generate_s7_awl_source(
+            networks=[
+                SERVER.S7NetworkSpec(title=n["title"], comment="", instructions=n["instructions"])
+                for n in networks
+            ],
+            block_type="OB",
+            block_number=1,
+        )
+        conv = json.loads(SERVER.s7_convert_to_ladder(gen_awl))
+        self.assertTrue(conv["success"], conv)
+        lad_src = conv["converted_code"]
+
+        loaded = json.loads(SERVER.s7_virtual_plc_load(
+            block_name="OB1",
+            source_code=lad_src,
+            symbols=symbols,
+            reset_memory=True,
+            clear_blocks=True,
+        ))
+        self.assertTrue(loaded["success"], loaded)
+        self.assertEqual(loaded["unsupported_instructions"], [])
+
+        scenario = json.loads(SERVER.s7_plcsim_run_scenario(
+            target="virtual",
+            entry_block="OB1",
+            steps=[
+                {
+                    "name": "Idle with NC Stop & Overload healthy",
+                    "inputs": {"START_PB": False, "STOP_NC": True, "OL_NC": True},
+                    "cycles": 1,
+                    "tick_ms": 100,
+                    "expect": {"KM_MAIN": False, "KM_STAR": False, "KM_DELTA": False},
+                },
+                {
+                    "name": "Press Start -> Main + Star energized, Delta OFF",
+                    "inputs": {"START_PB": True},
+                    "cycles": 2,
+                    "tick_ms": 100,
+                    "watch": ["T1"],
+                    "expect": {"KM_MAIN": True, "KM_STAR": True, "KM_DELTA": False, "T1": False},
+                },
+                {
+                    "name": "Release Start (latched) & complete 500ms changeover -> Delta ON, Star OFF",
+                    "inputs": {"START_PB": False},
+                    "cycles": 5,
+                    "tick_ms": 100,
+                    "expect": {"KM_MAIN": True, "T1": True, "KM_STAR": False, "KM_DELTA": True},
+                },
+                {
+                    "name": "Thermal overload trips -> all contactors de-energize",
+                    "inputs": {"OL_NC": False},
+                    "cycles": 2,
+                    "tick_ms": 100,
+                    "expect": {"KM_MAIN": False, "KM_STAR": False, "KM_DELTA": False, "T1": False},
+                },
+            ],
+        ))
+        self.assertTrue(scenario["success"], scenario)
+        self.assertEqual(scenario["passed_steps"], 4)
+
+    def test_case2_analog_temperature_controller_piw_real_pqw_and_signed_int(self):
+        """S7-300 PIW256 (0..27648) -> REAL 0..100.0 C -> hysteresis heater Q0.0 + PQW256 + negative INT."""
+        awl = """
+ORGANIZATION_BLOCK OB 1
+TITLE = "Analog Temp Controller"
+VERSION : 0.1
+BEGIN
+NETWORK
+TITLE = "Scale PIW 256 (0..27648) to 0.0..100.0 C in MD 20"
+  L PIW 256
+  ITD
+  DTR
+  L 100.0
+  *R
+  L 27648.0
+  /R
+  T MD 20
+
+NETWORK
+TITLE = "Heater hysteresis: ON below 40.0 C, OFF above 60.0 C"
+  L MD 20
+  L 40.0
+  <R
+  S Q 0.0
+  L MD 20
+  L 60.0
+  >R
+  R Q 0.0
+
+NETWORK
+TITLE = "Analog Valve Output PQW 256 = 27648 when Heater ON else 0"
+  A Q 0.0
+  JCN M_OFF
+  L 27648
+  T PQW 256
+  JU M_ERR
+M_OFF: L 0
+  T PQW 256
+
+NETWORK
+TITLE = "Signed INT deviation MW 10 = TempInt - 50 (tests negative INT)"
+M_ERR: L MD 20
+  RND
+  L 50
+  -I
+  T MW 10
+END_ORGANIZATION_BLOCK
+"""
+        loaded = json.loads(SERVER.s7_virtual_plc_load(
+            block_name="OB1",
+            source_code=awl,
+            reset_memory=True,
+            clear_blocks=True,
+        ))
+        self.assertTrue(loaded["success"], loaded)
+        self.assertEqual(loaded["unsupported_instructions"], [])
+
+        scenario = json.loads(SERVER.s7_plcsim_run_scenario(
+            target="virtual",
+            steps=[
+                {
+                    "name": "Cold 25.0 C (PIW256=6912) -> Heater ON, PQW256=27648, Deviation=-25",
+                    "inputs": {"PIW256": 6912},
+                    "cycles": 1,
+                    "tick_ms": 50,
+                    "watch": ["MD20:REAL", "PQW256:INT", "MW10:INT"],
+                    "expect": {
+                        "MD20": {"value": 25.0, "data_type": "REAL", "tolerance": 0.05},
+                        "Q0.0": True,
+                        "PQW256": 27648,
+                        "MW10": -25,
+                    },
+                },
+                {
+                    "name": "Midband 50.0 C (PIW256=13824) -> Hysteresis holds Heater ON, Deviation=0",
+                    "inputs": {"PIW256": 13824},
+                    "cycles": 1,
+                    "tick_ms": 50,
+                    "expect": {
+                        "MD20": 50.0,
+                        "Q0.0": True,
+                        "PQW256": 27648,
+                        "MW10": 0,
+                    },
+                },
+                {
+                    "name": "Hot 75.0 C (PIW256=20736) -> Heater OFF, PQW256=0, Deviation=+25",
+                    "inputs": {"PIW256": 20736},
+                    "cycles": 1,
+                    "tick_ms": 50,
+                    "expect": {
+                        "MD20": 75.0,
+                        "Q0.0": False,
+                        "PQW256": 0,
+                        "MW10": 25,
+                    },
+                },
+            ],
+        ))
+        self.assertTrue(scenario["success"], scenario)
+        # Verify S7RuntimeClient host="virtual" also reads PIW/PQW cleanly
+        rd_piw = json.loads(SERVER.s7_runtime_read("PIW 256", data_type="INT", host="virtual"))
+        self.assertTrue(rd_piw["success"], rd_piw)
+        self.assertEqual(rd_piw["value"], 20736)
+
+    def test_case3_modular_ob_fc_db_symbols_german_mnemonics_and_inspect(self):
+        """OB1 calls FC1 with VAR_INPUT/VAR_OUTPUT + DB10 initial values + German U/UN/E/A + s7_virtual_plc_inspect."""
+        db10 = """
+DATA_BLOCK DB 10
+TITLE = "Pump Parameters"
+VERSION : 0.1
+STRUCT
+  AutoMode : BOOL := TRUE;
+  MaxSpeed : INT := 1500;
+  ActualSpeed : INT := 0;
+END_STRUCT ;
+BEGIN
+  AutoMode := TRUE;
+  MaxSpeed := 1500;
+  ActualSpeed := 0;
+END_DATA_BLOCK
+"""
+        fc1 = """
+FUNCTION FC 1 : VOID
+VAR_INPUT
+  Enable : BOOL ;
+  TargetSpd : INT ;
+END_VAR
+VAR_OUTPUT
+  Running : BOOL ;
+  OutSpd : INT ;
+END_VAR
+BEGIN
+NETWORK
+TITLE = "German Mnemonics Motor Interlock & Speed Pass-through"
+  U #Enable
+  = #Running
+  SPBN M_STOP
+  L #TargetSpd
+  T #OutSpd
+  SPA M_END
+M_STOP: L 0
+  T #OutSpd
+M_END: NOP 0
+END_FUNCTION
+"""
+        ob1 = """
+ORGANIZATION_BLOCK OB 1
+BEGIN
+NETWORK
+TITLE = "Call FC 1 with Symbolic & DB Field Parameters"
+  CALL FC 1 (
+    Enable := "PUMP_CMD",
+    TargetSpd := DB10.MaxSpeed,
+    Running := "PUMP_RUN",
+    OutSpd := DB10.ActualSpeed
+  )
+END_ORGANIZATION_BLOCK
+"""
+        symbols = {"PUMP_CMD": "E 0.0", "PUMP_RUN": "A 0.0", "PumpDB": "DB 10"}
+        r_db = json.loads(SERVER.s7_virtual_plc_load("DB10", db10, symbols=symbols, reset_memory=True, clear_blocks=True))
+        self.assertTrue(r_db["success"], r_db)
+        r_fc = json.loads(SERVER.s7_virtual_plc_load("FC1", fc1))
+        self.assertTrue(r_fc["success"], r_fc)
+        r_ob = json.loads(SERVER.s7_virtual_plc_load("OB1", ob1))
+        self.assertTrue(r_ob["success"], r_ob)
+
+        step1 = json.loads(SERVER.s7_virtual_plc_step(
+            cycles=1,
+            tick_ms=100,
+            write_inputs={"PUMP_CMD": True},
+            read_addresses=["PUMP_RUN", "DB10.ActualSpeed", "DB10.AutoMode"],
+        ))
+        self.assertTrue(step1["success"], step1)
+        self.assertTrue(step1["observed"]["PUMP_RUN"])
+        self.assertEqual(step1["observed"]["DB10.ActualSpeed"], 1500)
+        self.assertTrue(step1["observed"]["DB10.AutoMode"])
+
+        insp = json.loads(SERVER.s7_virtual_plc_inspect())
+        self.assertTrue(insp["success"], insp)
+        self.assertIn("OB1", insp["loaded_blocks"])
+        self.assertIn("FC1", insp["loaded_blocks"])
+        self.assertIn("DB10", insp["data_blocks"])
+        self.assertEqual(insp["unsupported_instructions"], [])
+
+    def test_case4_scl_tank_batching_sequencer(self):
+        """SCL block with CASE, IF/ELSIF, FOR loop loaded & simulated directly in VirtualS7PLC."""
+        scl_ob1 = """
+ORGANIZATION_BLOCK OB1
+VAR_TEMP
+  i : INT;
+  acc : INT;
+END_VAR
+BEGIN
+  IF I0.0 THEN
+    MW0 := 1;
+  ELSIF I0.1 THEN
+    MW0 := 2;
+  ELSE
+    MW0 := 0;
+  END_IF;
+
+  CASE MW0 OF
+    1:
+      Q0.0 := TRUE;
+      Q0.1 := FALSE;
+      acc := 0;
+      FOR i := 1 TO 4 DO
+        acc := acc + i;
+      END_FOR;
+      MW2 := acc;
+    2:
+      Q0.0 := FALSE;
+      Q0.1 := TRUE;
+      MW2 := 100;
+    ELSE
+      Q0.0 := FALSE;
+      Q0.1 := FALSE;
+      MW2 := 0;
+  END_CASE;
+END_ORGANIZATION_BLOCK
+"""
+        loaded = json.loads(SERVER.s7_virtual_plc_load(
+            block_name="OB1",
+            source_code=scl_ob1,
+            language="SCL",
+            reset_memory=True,
+            clear_blocks=True,
+        ))
+        self.assertTrue(loaded["success"], loaded)
+        self.assertEqual(loaded["language"], "SCL")
+
+        scenario = json.loads(SERVER.s7_plcsim_run_scenario(
+            target="virtual",
+            steps=[
+                {
+                    "name": "Fill state (I0.0=True) computes FOR sum 1+2+3+4=10",
+                    "inputs": {"I0.0": True, "I0.1": False},
+                    "cycles": 1,
+                    "expect": {"MW0": 1, "Q0.0": True, "Q0.1": False, "MW2": 10},
+                },
+                {
+                    "name": "Drain state (I0.1=True) sets Q0.1 and MW2=100",
+                    "inputs": {"I0.0": False, "I0.1": True},
+                    "cycles": 1,
+                    "expect": {"MW0": 2, "Q0.0": False, "Q0.1": True, "MW2": 100},
+                },
+                {
+                    "name": "Idle state clears outputs",
+                    "inputs": {"I0.0": False, "I0.1": False},
+                    "cycles": 1,
+                    "expect": {"MW0": 0, "Q0.0": False, "Q0.1": False, "MW2": 0},
+                },
+            ],
+        ))
+        self.assertTrue(scenario["success"], scenario)
+
+    def test_case5_s7_graph_packaging_line_sequencer(self):
+        """Generate S7-GRAPH .gr7 via s7_write_graph_block -> load & simulate SFC step transitions."""
+        gr7_res = json.loads(SERVER.s7_write_graph_block(
+            fb_number=5,
+            steps=[
+                {"number": 1, "name": "S_IDLE", "initial": True, "actions": [{"qualifier": "N", "operand": "Q 0.0"}]},
+                {"number": 2, "name": "S_FILL", "actions": [{"qualifier": "N", "operand": "Q 0.1"}]},
+                {"number": 3, "name": "S_SEAL", "actions": [{"qualifier": "N", "operand": "Q 0.2"}]},
+            ],
+            transitions=[
+                {"number": 1, "name": "T_START", "from_step": 1, "to_step": 2, "condition": "I 0.0"},
+                {"number": 2, "name": "T_FULL", "from_step": 2, "to_step": 3, "condition": "I 0.1"},
+                {"number": 3, "name": "T_DONE", "from_step": 3, "to_step": 1, "condition": "I 0.2"},
+            ],
+        ))
+        self.assertTrue(gr7_res["success"], gr7_res)
+        gr7_src = gr7_res["gr7_source"]
+
+        loaded_fb = json.loads(SERVER.s7_virtual_plc_load(
+            block_name="FB5",
+            source_code=gr7_src,
+            reset_memory=True,
+            clear_blocks=True,
+        ))
+        self.assertTrue(loaded_fb["success"], loaded_fb)
+        self.assertEqual(loaded_fb["language"], "GRAPH")
+
+        loaded_ob = json.loads(SERVER.s7_virtual_plc_load(
+            block_name="OB1",
+            source_code="ORGANIZATION_BLOCK OB 1\nBEGIN\nNETWORK\n  CALL FB 5, DB 5\nEND_ORGANIZATION_BLOCK\n",
+        ))
+        self.assertTrue(loaded_ob["success"], loaded_ob)
+
+        scenario = json.loads(SERVER.s7_plcsim_run_scenario(
+            target="virtual",
+            steps=[
+                {
+                    "name": "Initial step S_IDLE active -> Q0.0 ON",
+                    "inputs": {"I0.0": False, "I0.1": False, "I0.2": False},
+                    "cycles": 1,
+                    "expect": {"Q0.0": True, "Q0.1": False, "Q0.2": False},
+                },
+                {
+                    "name": "Trigger Start (I0.0) -> transitions S_IDLE -> S_FILL -> Q0.1 ON",
+                    "inputs": {"I0.0": True},
+                    "cycles": 2,
+                    "expect": {"Q0.0": False, "Q0.1": True, "Q0.2": False},
+                },
+                {
+                    "name": "Level Full (I0.1) -> transitions S_FILL -> S_SEAL -> Q0.2 ON",
+                    "inputs": {"I0.0": False, "I0.1": True},
+                    "cycles": 2,
+                    "expect": {"Q0.0": False, "Q0.1": False, "Q0.2": True},
+                },
+                {
+                    "name": "Seal Done (I0.2) -> returns to S_IDLE -> Q0.0 ON",
+                    "inputs": {"I0.1": False, "I0.2": True},
+                    "cycles": 2,
+                    "expect": {"Q0.0": True, "Q0.1": False, "Q0.2": False},
+                },
+            ],
+        ))
+        self.assertTrue(scenario["success"], scenario)
+        self.assertEqual(scenario["steps"][-1]["sfc_active_steps"]["FB5:DB5"], ["S_IDLE"])
+
+        # Also verify s7_virtual_plc_load(networks=...) direct structured-network loading shortcut
+        direct_net = json.loads(SERVER.s7_virtual_plc_load(
+            block_name="OB1",
+            networks=[{"title": "Direct Rung", "instructions": ["A I 0.0", "= Q 0.7"]}],
+            reset_memory=True,
+            clear_blocks=True,
+        ))
+        self.assertTrue(direct_net["success"], direct_net)
+        st = json.loads(SERVER.s7_virtual_plc_step(write_inputs={"I0.0": True}, read_addresses=["Q0.7"]))
+        self.assertTrue(st["observed"]["Q0.7"])
+
+
 if __name__ == "__main__":
     unittest.main()
