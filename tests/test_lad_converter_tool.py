@@ -5,7 +5,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from lad_converter import (
-    LADViolation,
     convert_awl_to_pure_lad,
     evaluate_stl_rlo,
     parse_awl_networks,

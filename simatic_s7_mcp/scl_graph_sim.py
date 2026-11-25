@@ -632,7 +632,14 @@ def execute_scl_block(
                 return bi_val
             if call_block_cb:
                 kw_args = {(k or f"ARG{i}").upper(): _eval(ex) for i, (k, ex) in enumerate(raw_args)}
-                return call_block_cb(fn_name, kw_args)
+                res_call = call_block_cb(fn_name, kw_args)
+                if isinstance(res_call, dict):
+                    out_map = res_call.get("__OUTPUTS__") or {}
+                    for k, ex in raw_args:
+                        if k and k.upper() in out_map and ex[0] == "VAR":
+                            _set(ex[1], out_map[k.upper()])
+                    return res_call.get("__RETURN__", 0)
+                return res_call
         return 0
 
     def _exec_list(stmts: List[Any]) -> Optional[str]:
@@ -653,7 +660,12 @@ def execute_scl_block(
                 fn_name, raw_args = st[1], st[2]
                 if call_block_cb:
                     kw_args = {(k or f"ARG{i}").upper(): _eval(ex) for i, (k, ex) in enumerate(raw_args)}
-                    call_block_cb(fn_name, kw_args)
+                    res_call = call_block_cb(fn_name, kw_args)
+                    if isinstance(res_call, dict):
+                        out_map = res_call.get("__OUTPUTS__") or {}
+                        for k, ex in raw_args:
+                            if k and k.upper() in out_map and ex[0] == "VAR":
+                                _set(ex[1], out_map[k.upper()])
             elif sk == "IF":
                 _, cond, then_b, elifs, else_b = st
                 if bool(_eval(cond)):

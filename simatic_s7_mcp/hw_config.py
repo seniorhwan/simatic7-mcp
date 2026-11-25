@@ -206,6 +206,95 @@ S7_HARDWARE_CATALOG: Tuple[S7HardwareCatalogItem, ...] = (
         interfaces=("MPI/DP", "PROFIBUS_DP", "PROFINET"),
         aliases=("CPU319", "CPU 319-3 PN/DP", "CPU3193PNDP"),
     ),
+    # --- Classic V1.x / V2.x S7-300 CPUs ---
+    S7HardwareCatalogItem(
+        mlfb="6ES7 312-1AD10-0AB0",
+        short_name="CPU 312",
+        family="S7-300",
+        category="CPU",
+        description="Classic CPU 312, 16 KB Work Memory, MPI (V2.0)",
+        firmware="V2.0",
+        backplane_ma=600,
+        interfaces=("MPI",),
+        aliases=("CPU312_V2", "312-1AD10"),
+    ),
+    S7HardwareCatalogItem(
+        mlfb="6ES7 313-1AD03-0AB0",
+        short_name="CPU 313",
+        family="S7-300",
+        category="CPU",
+        description="Classic CPU 313, 12 KB Work Memory, MPI (V1.2)",
+        firmware="V1.2",
+        backplane_ma=650,
+        interfaces=("MPI",),
+        aliases=("CPU313_V1", "313-1AD03"),
+    ),
+    S7HardwareCatalogItem(
+        mlfb="6ES7 314-1AE04-0AB0",
+        short_name="CPU 314",
+        family="S7-300",
+        category="CPU",
+        description="Classic CPU 314, 24 KB Work Memory, MPI (V1.2)",
+        firmware="V1.2",
+        backplane_ma=700,
+        interfaces=("MPI",),
+        aliases=("CPU314_V1", "314-1AE04"),
+    ),
+    S7HardwareCatalogItem(
+        mlfb="6ES7 314-1AF11-0AB0",
+        short_name="CPU 314",
+        family="S7-300",
+        category="CPU",
+        description="Classic CPU 314, 48 KB Work Memory, MPI (V2.6)",
+        firmware="V2.6",
+        backplane_ma=700,
+        interfaces=("MPI",),
+        aliases=("CPU314_V2", "314-1AF11"),
+    ),
+    S7HardwareCatalogItem(
+        mlfb="6ES7 315-2AF03-0AB0",
+        short_name="CPU 315-2 DP",
+        family="S7-300",
+        category="CPU",
+        description="Classic CPU 315-2 DP, 64 KB Work Memory, MPI + PROFIBUS DP (V1.2)",
+        firmware="V1.2",
+        backplane_ma=800,
+        interfaces=("MPI", "PROFIBUS_DP"),
+        aliases=("CPU3152DP_V1", "315-2AF03"),
+    ),
+    S7HardwareCatalogItem(
+        mlfb="6ES7 315-2AG10-0AB0",
+        short_name="CPU 315-2 DP",
+        family="S7-300",
+        category="CPU",
+        description="Classic CPU 315-2 DP, 128 KB Work Memory, MPI + PROFIBUS DP (V2.6)",
+        firmware="V2.6",
+        backplane_ma=800,
+        interfaces=("MPI", "PROFIBUS_DP"),
+        aliases=("CPU3152DP_V2", "315-2AG10"),
+    ),
+    S7HardwareCatalogItem(
+        mlfb="6ES7 315-2EG10-0AB0",
+        short_name="CPU 315-2 PN/DP",
+        family="S7-300",
+        category="CPU",
+        description="Classic CPU 315-2 PN/DP, 128 KB Work Memory, MPI/DP + PROFINET (V2.3)",
+        firmware="V2.3",
+        backplane_ma=850,
+        interfaces=("MPI/DP", "PROFINET"),
+        aliases=("CPU3152PNDP_V2", "315-2EG10"),
+    ),
+    S7HardwareCatalogItem(
+        mlfb="6ES7 317-2AJ10-0AB0",
+        short_name="CPU 317-2 DP",
+        family="S7-300",
+        category="CPU",
+        description="Classic CPU 317-2 DP, 512 KB Work Memory, MPI/DP + PROFIBUS DP (V2.6)",
+        firmware="V2.6",
+        backplane_ma=900,
+        interfaces=("MPI/DP", "PROFIBUS_DP"),
+        aliases=("CPU3172DP_V2", "317-2AJ10"),
+    ),
     # --- S7-400 CPUs ---
     S7HardwareCatalogItem(
         mlfb="6ES7 412-2EK06-0AB0",
@@ -935,7 +1024,15 @@ class StationHardwareConfig:
         }
 
     def generate_cfg(self) -> str:
-        """Generates a compliant Siemens STEP 7 Classic HW Config ASCII .cfg station file."""
+        """Generates a compliant Siemens STEP 7 Classic HW Config ASCII .cfg station file.
+
+        Follows the authentic STEP 7 V5.x flat top-level block grammar verified against
+        `Simatic.Simatic` COM `Stations.Import` / `Station.Export`:
+          - `STATION S7300 , "SIMATIC 300(1)"` closed with its own `BEGIN ... END`
+          - Top-level `SUBNET ...` blocks
+          - Top-level `RACK 0, "6ES7 390-1???0-0AA0", "UR"` closed with `BEGIN ... END`
+          - Top-level `RACK 0, SLOT n, "<MLFB>" "<FW>", "<Name>"` with quoted firmware string
+        """
         station_kind = {
             "S7-300": "S7300",
             "S7-400": "S7400",
@@ -947,9 +1044,16 @@ class StationHardwareConfig:
             f"#STEP7_VERSION {self.step7_version}",
             '#CREATED "SIMATIC STEP 7 Classic MCP Server"',
             "",
+            f'STATION {station_kind} , "{self.station_name}"',
+            "BEGIN",
+            '  OBJECT_REMOVEABLE "1"',
+            '  POS_X "0"',
+            '  POS_Y "0"',
+            "END",
+            "",
         ]
 
-        # Emit Subnets
+        # Emit top-level Subnets
         eff_subnets = list(self.subnets)
         if not eff_subnets:
             eff_subnets.append(SubnetSpec(name="MPI(1)", subnet_type="MPI", baudrate="187.5K"))
@@ -968,67 +1072,62 @@ class StationHardwareConfig:
                 "",
             ])
 
-        lines.append(f'STATION {station_kind} , "{self.station_name}"')
-        lines.append("BEGIN")
-        lines.append('  OBJECT_REMOVEABLE "1"')
-        lines.append('  POS_X "0"')
-        lines.append('  POS_Y "0"')
-
-        # Emit Rack declarations
+        # Emit top-level Rack declarations (STEP 7 Classic universal rail wildcard for S7-300)
         racks = sorted({m.rack for m in self.modules}) or [0]
-        rack_mlfb = "6ES7 390-1AF30-0AA0" if station_kind == "S7300" else "6ES7 400-1JA01-0AA0"
+        rack_mlfb = "6ES7 390-1???0-0AA0" if station_kind == "S7300" else "6ES7 400-1JA01-0AA0"
         rack_desc = "UR" if station_kind == "S7300" else "UR2"
         for r in racks:
             lines.extend([
-                f'  RACK {r}, "{rack_mlfb}", "{rack_desc}"',
-                "  BEGIN",
-                f'    RACK_NO "{r}"',
-                "  END",
+                f'RACK {r}, "{rack_mlfb}", "{rack_desc}"',
+                "BEGIN",
+                f'  RACK_NO "{r}"',
+                "END",
+                "",
             ])
 
-        # Emit Modules
+        # Emit top-level Module slot declarations with quoted firmware version
         for m in self.modules:
-            fw_comment = f" {m.firmware}" if m.firmware else ""
-            lines.append(f'  RACK {m.rack}, SLOT {m.slot}, "{m.mlfb}"{fw_comment}, "{m.name}"')
-            lines.append("  BEGIN")
+            fw_str = m.firmware.strip().strip('"') if m.firmware else ""
+            fw_part = f' "{fw_str}"' if fw_str else ""
+            lines.append(f'RACK {m.rack}, SLOT {m.slot}, "{m.mlfb}"{fw_part}, "{m.name}"')
+            lines.append("BEGIN")
             if m.category == "CPU":
-                lines.append('    CPU_NO "1"')
-                lines.append('    STARTUP_AFTER_POWER_ON "WARM_RESTART"')
+                lines.append('  CPU_NO "1"')
+                lines.append('  STARTUP_AFTER_POWER_ON "WARM_RESTART"')
             if m.input_bytes > 0 and m.input_start is not None:
-                lines.append(f"    LOCAL_IN_ADDRESSES ADDRESS {m.input_start}, 0, {m.input_bytes}, 0, 0, 0")
+                lines.append(f"  LOCAL_IN_ADDRESSES ADDRESS {m.input_start}, 0, {m.input_bytes}, 0, 0, 0")
             if m.output_bytes > 0 and m.output_start is not None:
-                lines.append(f"    LOCAL_OUT_ADDRESSES ADDRESS {m.output_start}, 0, {m.output_bytes}, 0, 0, 0")
+                lines.append(f"  LOCAL_OUT_ADDRESSES ADDRESS {m.output_start}, 0, {m.output_bytes}, 0, 0, 0")
             if m.mpi_address is not None:
                 lines.extend([
-                    "    INTERFACE 1",
-                    "    BEGIN",
-                    f'      SUBNET_REF "{m.subnet_ref or "MPI(1)"}"',
-                    f'      NODE_ADDRESS "{m.mpi_address}"',
-                    "    END",
+                    "  INTERFACE 1",
+                    "  BEGIN",
+                    f'    SUBNET_REF "{m.subnet_ref or "MPI(1)"}"',
+                    f'    NODE_ADDRESS "{m.mpi_address}"',
+                    "  END",
                 ])
             if m.profibus_address is not None:
                 lines.extend([
-                    "    INTERFACE 2",
-                    "    BEGIN",
-                    f'      SUBNET_REF "{m.subnet_ref or "PROFIBUS(1)"}"',
-                    f'      NODE_ADDRESS "{m.profibus_address}"',
-                    "    END",
+                    "  INTERFACE 2",
+                    "  BEGIN",
+                    f'    SUBNET_REF "{m.subnet_ref or "PROFIBUS(1)"}"',
+                    f'    NODE_ADDRESS "{m.profibus_address}"',
+                    "  END",
                 ])
             if m.ip_address:
                 lines.extend([
-                    "    INTERFACE 3",
-                    "    BEGIN",
-                    f'      SUBNET_REF "{m.subnet_ref or "Ethernet(1)"}"',
-                    f'      IP_ADDRESS "{m.ip_address}"',
-                    f'      SUBNET_MASK "{m.subnet_mask or "255.255.255.0"}"',
-                    "    END",
+                    "  INTERFACE 3",
+                    "  BEGIN",
+                    f'    SUBNET_REF "{m.subnet_ref or "Ethernet(1)"}"',
+                    f'    IP_ADDRESS "{m.ip_address}"',
+                    f'    SUBNET_MASK "{m.subnet_mask or "255.255.255.0"}"',
+                    "  END",
                 ])
             for pk, pv in sorted(m.parameters.items()):
-                lines.append(f'    {pk.upper()} "{pv}"')
-            lines.append("  END")
+                lines.append(f'  {pk.upper()} "{pv}"')
+            lines.append("END")
+            lines.append("")
 
-        lines.append("END")
-        lines.append("")
         return "\n".join(lines)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -1133,14 +1232,14 @@ def parse_station_cfg(cfg_text: str) -> StationHardwareConfig:
                 i = j
         elif re.match(r"^RACK\s+\d+\s*,\s*SLOT\s+\d+", ln):
             m_mod = re.match(
-                r'^RACK\s+(\d+)\s*,\s*SLOT\s+(\d+)\s*,\s*"([^"]+)"(?:\s+([^,]+))?\s*,\s*"([^"]+)"',
+                r'^RACK\s+(\d+)\s*,\s*SLOT\s+(\d+)\s*,\s*"([^"]+)"(?:\s+"?([^",]+)"?)?\s*,\s*"([^"]+)"',
                 ln,
             )
             if m_mod:
                 rack_n = int(m_mod.group(1))
                 slot_n = int(m_mod.group(2))
                 mlfb = m_mod.group(3).strip()
-                fw = (m_mod.group(4) or "").strip()
+                fw = (m_mod.group(4) or "").strip().strip('"')
                 name = m_mod.group(5).strip()
                 cat = resolve_catalog_module(mlfb) or resolve_catalog_module(name)
                 mod = ModuleSlot(

@@ -67,22 +67,22 @@ Running via Antigravity or VS Code MCP Configuration:
 from __future__ import annotations
 
 import argparse
-import base64
 import csv
 import ctypes
 import datetime
 import difflib
 import fnmatch
-import hashlib
 import io
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -94,11 +94,12 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Un
 from simatic_s7_mcp import (
     AccessMode,
     AuditLogger,
-    EnhancedS7LoopbackServer,
     FailureCategory,
+    PLCDataCollector,
     PersistentComWorker,
     S7ConnectionPool,
     S7_HARDWARE_CATALOG,
+    S7_STDLIB_SCHEMAS,
     STEP7_BLKLANG_CODES,
     StationHardwareConfig,
     VirtualS7PLC,
@@ -118,7 +119,7 @@ from simatic_s7_mcp import (
     make_tool_annotations,
     parse_station_cfg,
     resolve_access_mode,
-    resolve_catalog_module,
+    run_closed_loop_plant_sim,
     run_doctor,
     search_hardware_catalog,
     validate_and_generate_graph_sfc,
@@ -383,17 +384,30 @@ def find_step7_hwcnf_exe() -> Optional[Path]:
     return None
 
 
-def spawn_detached_siemens_process(cmd: str) -> bool:
+def spawn_detached_siemens_process(cmd: Union[str, Sequence[str]]) -> bool:
     """
     Spawns a detached process using WMI (Win32_Process.Create) to avoid
-    Windows Job Object restrictions and sandbox termination. Falls back to subprocess.
+    Windows Job Object restrictions and sandbox termination. Falls back to
+    subprocess.Popen with shell=False and safely tokenized argv.
     """
+    if isinstance(cmd, str):
+        raw_cmd = cmd.strip()
+        if not raw_cmd:
+            return False
+        argv = [tok.strip('"') for tok in shlex.split(raw_cmd, posix=(sys.platform != "win32"))]
+        cmdline = raw_cmd
+    else:
+        argv = [str(part) for part in cmd if str(part)]
+        if not argv:
+            return False
+        cmdline = subprocess.list2cmdline(argv)
+
     if sys.platform == "win32":
         try:
             import win32com.client
             wmi = win32com.client.GetObject("winmgmts:\\\\.\\root\\cimv2")
             proc = wmi.Get("Win32_Process")
-            res, _ = proc.Create(CommandLine=cmd)
+            res, _ = proc.Create(CommandLine=cmdline)
             if res == 0:
                 return True
         except Exception:
@@ -402,9 +416,9 @@ def spawn_detached_siemens_process(cmd: str) -> bool:
         flags = 0
         if sys.platform == "win32":
             flags = 0x00000200 | 0x00000008  # CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS
-        subprocess.Popen(cmd, creationflags=flags, shell=isinstance(cmd, str))
+        subprocess.Popen(argv, creationflags=flags, shell=False)
         return True
-    except Exception:
+    except (OSError, ValueError):
         return False
 
 
@@ -2992,17 +3006,19 @@ def inspect_project_blocks(project_dir_or_file: Optional[Path] = None) -> Dict[s
 
 
 def perform_deep_program_analysis(
-    networks: List[Dict[str, Any]],
+    networks: Optional[List[Dict[str, Any]]],
     profile: S7PLCProfile,
     symbols: Optional[Any] = None,
+    blocks: Optional[Dict[str, List[Dict[str, Any]]]] = None,
 ) -> Dict[str, Any]:
     """
-    Performs comprehensive static safety analysis on candidate S7 Statement List (AWL/STL) code.
+    Performs comprehensive static safety analysis on candidate S7 Statement List (AWL/STL) code
+    across either a single block (`networks`) or multiple program blocks (`blocks`).
     Evaluates:
       - Star-Delta contactor switching hazards
       - Duplicate output coil assignments
-      - Unpaired SET/RESET operations
-      - Timers & counters initialization and contact hygiene
+      - Unpaired SET/RESET operations (resolved across all provided blocks!)
+      - Timers & counters initialization and contact hygiene (resolved across all provided blocks!)
       - Direct peripheral I/O access hazards
       - Parenthetical nesting stack depth (<= 7)
       - Execution sweep time estimation in microseconds
@@ -3011,123 +3027,136 @@ def perform_deep_program_analysis(
     _, symbol_entries = _validate_symbol_map(symbols) if symbols else ([], [])
     sym_to_addr = {e.symbol.upper(): canonical_s7_address(e.address) for e in symbol_entries}
 
+    block_items: List[Tuple[str, List[Dict[str, Any]]]] = []
+    if blocks:
+        for bname, bnets in blocks.items():
+            block_items.append((str(bname).strip(), list(bnets or [])))
+    elif networks:
+        block_items.append(("", list(networks)))
+    multi_block = bool(blocks)
+
     hazards: List[str] = []
     warnings: List[str] = []
     recommendations: List[str] = []
 
-    assigned_coils: Dict[str, List[int]] = {}
-    set_coils: Dict[str, List[int]] = {}
-    reset_coils: Dict[str, List[int]] = {}
+    assigned_coils: Dict[str, List[Any]] = {}
+    set_coils: Dict[str, List[Any]] = {}
+    reset_coils: Dict[str, List[Any]] = {}
     timers_started: Set[str] = set()
     timers_read: Set[str] = set()
     peripheral_accesses: List[str] = []
 
     star_coils: Set[str] = set()
     delta_coils: Set[str] = set()
-    star_networks: Set[int] = set()
-    delta_networks: Set[int] = set()
-    network_interlocks: Dict[int, Set[str]] = {}
+    star_networks: Set[Any] = set()
+    delta_networks: Set[Any] = set()
+    network_interlocks: Dict[Any, Set[str]] = {}
 
     bit_ops_count = 0
     word_ops_count = 0
     timer_ops_count = 0
     call_ops_count = 0
     max_nesting_depth = 0
+    total_networks = 0
 
-    for net_idx, net in enumerate(networks, start=1):
-        net_title = net.get("title", "")
-        net_comment = net.get("comment", "")
-        instructions = net.get("instructions", [])
-        nesting_stack = 0
+    for blk_name, blk_nets in block_items:
+        for net_idx, net in enumerate(blk_nets, start=1):
+            total_networks += 1
+            net_ref: Any = f"{blk_name}:N{net_idx}" if (multi_block and blk_name) else net_idx
+            net_label = f"{blk_name} Network {net_idx}" if (multi_block and blk_name) else f"Network {net_idx}"
+            net_title = net.get("title", "")
+            net_comment = net.get("comment", "")
+            instructions = net.get("instructions", [])
+            nesting_stack = 0
 
-        for inst in instructions:
-            clean = inst.split("//", 1)[0].strip()
-            if clean.endswith(";"):
-                clean = clean[:-1].strip()
-            m_lbl = re.match(r"^([A-Za-z_][A-Za-z0-9_]{0,15})\s*:\s*(.*)$", clean)
-            if m_lbl:
-                clean = m_lbl.group(2).strip()
-            if not clean:
-                continue
-            tokens = clean.split(maxsplit=1)
-            opcode = tokens[0].upper()
-            operand = tokens[1].strip() if len(tokens) > 1 else ""
+            for inst in instructions:
+                clean = inst.split("//", 1)[0].strip()
+                if clean.endswith(";"):
+                    clean = clean[:-1].strip()
+                m_lbl = re.match(r"^([A-Za-z_][A-Za-z0-9_]{0,15})\s*:\s*(.*)$", clean)
+                if m_lbl:
+                    clean = m_lbl.group(2).strip()
+                if not clean:
+                    continue
+                tokens = clean.split(maxsplit=1)
+                opcode = tokens[0].upper()
+                operand = tokens[1].strip() if len(tokens) > 1 else ""
 
-            # Nesting depth check
-            if opcode in ("A(", "AN(", "O(", "ON(", "X(", "XN(", "U(", "UN("):
-                nesting_stack += 1
-                if nesting_stack > max_nesting_depth:
-                    max_nesting_depth = nesting_stack
-            elif opcode == ")":
-                if nesting_stack <= 0:
-                    hazards.append(f"Network {net_idx}: Unmatched closing parenthesis ')' with no open nesting stack.")
-                else:
-                    nesting_stack -= 1
+                # Nesting depth check
+                if opcode in ("A(", "AN(", "O(", "ON(", "X(", "XN(", "U(", "UN("):
+                    nesting_stack += 1
+                    if nesting_stack > max_nesting_depth:
+                        max_nesting_depth = nesting_stack
+                elif opcode == ")":
+                    if nesting_stack <= 0:
+                        hazards.append(f"{net_label}: Unmatched closing parenthesis ')' with no open nesting stack.")
+                    else:
+                        nesting_stack -= 1
 
-            # Instruction category for timing estimation
-            if opcode in ("A", "AN", "O", "ON", "X", "XN", "U", "UN", "=", "S", "R", "NOT", "SET", "CLR"):
-                bit_ops_count += 1
-            elif opcode in (
-                "L", "T", "+I", "-I", "*I", "/I", "+D", "-D", "*D", "/D", "MOD",
-                "+R", "-R", "*R", "/R", "ABS", "SQR", "SQRT", "EXP", "LN", "SIN", "COS", "TAN",
-                "==I", "<>I", ">I", "<I", ">=I", "<=I",
-                "==D", "<>D", ">D", "<D", ">=D", "<=D",
-                "==R", "<>R", ">R", "<R", ">=R", "<=R",
-                "AW", "OW", "XOW", "AD", "OD", "XOD",
-                "SLW", "SRW", "SLD", "SRD", "SSI", "SSD", "RLD", "RRD",
-                "BTI", "ITB", "BTD", "DTB", "ITD", "DTR", "ROUND", "TRUNC", "NEGI", "NEGD", "NEGR",
-                "LAR1", "LAR2", "TAR1", "TAR2",
-            ):
-                word_ops_count += 1
-            elif opcode in ("SP", "SE", "SD", "SS", "SF", "SI", "SV", "SA", "CU", "CD", "ZV", "ZR"):
-                timer_ops_count += 1
-            elif opcode in ("CALL", "UC", "CC"):
-                call_ops_count += 1
+                # Instruction category for timing estimation
+                if opcode in ("A", "AN", "O", "ON", "X", "XN", "U", "UN", "=", "S", "R", "NOT", "SET", "CLR"):
+                    bit_ops_count += 1
+                elif opcode in (
+                    "L", "T", "+I", "-I", "*I", "/I", "+D", "-D", "*D", "/D", "MOD",
+                    "+R", "-R", "*R", "/R", "ABS", "SQR", "SQRT", "EXP", "LN", "SIN", "COS", "TAN",
+                    "==I", "<>I", ">I", "<I", ">=I", "<=I",
+                    "==D", "<>D", ">D", "<D", ">=D", "<=D",
+                    "==R", "<>R", ">R", "<R", ">=R", "<=R",
+                    "AW", "OW", "XOW", "AD", "OD", "XOD",
+                    "SLW", "SRW", "SLD", "SRD", "SSI", "SSD", "RLD", "RRD",
+                    "BTI", "ITB", "BTD", "DTB", "ITD", "DTR", "ROUND", "TRUNC", "NEGI", "NEGD", "NEGR",
+                    "LAR1", "LAR2", "TAR1", "TAR2",
+                ):
+                    word_ops_count += 1
+                elif opcode in ("SP", "SE", "SD", "SS", "SF", "SI", "SV", "SA", "CU", "CD", "ZV", "ZR"):
+                    timer_ops_count += 1
+                elif opcode in ("CALL", "UC", "CC"):
+                    call_ops_count += 1
 
-            # Resolve address
-            canon = ""
-            if operand:
-                m_sym = S7_NAMED_SYMBOL_REGEX.fullmatch(operand)
-                sym_k = m_sym.group(1).upper() if m_sym else ""
-                if sym_k and sym_k in sym_to_addr:
-                    canon = sym_to_addr[sym_k]
-                else:
-                    canon = canonical_s7_address(operand)
+                # Resolve address
+                canon = ""
+                if operand:
+                    m_sym = S7_NAMED_SYMBOL_REGEX.fullmatch(operand)
+                    sym_k = m_sym.group(1).upper() if m_sym else ""
+                    if sym_k and sym_k in sym_to_addr:
+                        canon = sym_to_addr[sym_k]
+                    else:
+                        canon = canonical_s7_address(operand)
 
-            # Duplicate coil tracking
-            if opcode == "=" and canon:
-                assigned_coils.setdefault(canon, []).append(net_idx)
-            elif opcode == "S" and canon:
-                set_coils.setdefault(canon, []).append(net_idx)
-            elif opcode == "R" and canon:
-                reset_coils.setdefault(canon, []).append(net_idx)
+                # Duplicate coil tracking
+                if opcode == "=" and canon:
+                    assigned_coils.setdefault(canon, []).append(net_ref)
+                elif opcode == "S" and canon:
+                    set_coils.setdefault(canon, []).append(net_ref)
+                elif opcode == "R" and canon:
+                    reset_coils.setdefault(canon, []).append(net_ref)
 
-            # Timers
-            if opcode in ("SP", "SE", "SD", "SS", "SF", "SI", "SV", "SA") and canon:
-                timers_started.add(canon)
-            elif opcode in ("A", "AN", "O", "ON", "U", "UN") and canon.startswith("T "):
-                timers_read.add(canon)
+                # Timers
+                if opcode in ("SP", "SE", "SD", "SS", "SF", "SI", "SV", "SA") and canon:
+                    timers_started.add(canon)
+                elif opcode in ("A", "AN", "O", "ON", "U", "UN") and canon.startswith("T "):
+                    timers_read.add(canon)
 
-            # Peripheral I/O
-            if canon and any(canon.startswith(p) for p in ("PIB", "PIW", "PID", "PQB", "PQW", "PQD")):
-                peripheral_accesses.append(f"Network {net_idx}: {opcode} {canon}")
+                # Peripheral I/O
+                if canon and any(canon.startswith(p) for p in ("PIB", "PIW", "PID", "PQB", "PQW", "PQD")):
+                    peripheral_accesses.append(f"{net_label}: {opcode} {canon}")
 
-            # Star / Delta interlock tracking
-            line_upper = f"{net_title} {net_comment} {clean}".upper()
-            if any(term in line_upper for term in ("STAR", "STERN", "KM2", "K2M", "_Y")) and opcode in ("=", "S"):
-                star_networks.add(net_idx)
-                if canon:
-                    star_coils.add(canon)
-            if any(term in line_upper for term in ("DELTA", "DREIECK", "KM3", "K3M", "_D")) and opcode in ("=", "S"):
-                delta_networks.add(net_idx)
-                if canon:
-                    delta_coils.add(canon)
+                # Star / Delta interlock tracking
+                line_upper = f"{net_title} {net_comment} {clean}".upper()
+                if any(term in line_upper for term in ("STAR", "STERN", "KM2", "K2M", "_Y")) and opcode in ("=", "S"):
+                    star_networks.add(net_ref)
+                    if canon:
+                        star_coils.add(canon)
+                if any(term in line_upper for term in ("DELTA", "DREIECK", "KM3", "K3M", "_D")) and opcode in ("=", "S"):
+                    delta_networks.add(net_ref)
+                    if canon:
+                        delta_coils.add(canon)
 
-            if opcode in ("AN", "UN") and canon:
-                network_interlocks.setdefault(net_idx, set()).add(canon)
+                if opcode in ("AN", "UN") and canon:
+                    network_interlocks.setdefault(net_ref, set()).add(canon)
 
-        if nesting_stack != 0:
-            hazards.append(f"Network {net_idx}: Unbalanced parentheses; nesting stack remains open at network end.")
+            if nesting_stack != 0:
+                hazards.append(f"{net_label}: Unbalanced parentheses; nesting stack remains open at network end.")
 
     # Check 1: Star-Delta reciprocal contactor interlocks
     if star_coils and delta_coils:
@@ -3154,16 +3183,17 @@ def perform_deep_program_analysis(
                 f"in networks {net_list}. The final network will overwrite previous assignments."
             )
 
-    # Check 3: Unpaired SET/RESET
+    # Check 3: Unpaired SET/RESET (resolved across all provided blocks!)
+    scope_desc = "the analyzed program blocks" if multi_block else "this block"
     for coil, net_list in set_coils.items():
         if coil not in reset_coils and not coil.startswith("L "):
             warnings.append(
-                f"UNPAIRED SET COIL: Device '{coil}' is SET in networks {net_list} but never RESET (R) in this block."
+                f"UNPAIRED SET COIL: Device '{coil}' is SET in networks {net_list} but never RESET (R) in {scope_desc}."
             )
     for coil, net_list in reset_coils.items():
         if coil not in set_coils and not coil.startswith("L "):
             warnings.append(
-                f"UNPAIRED RESET COIL: Device '{coil}' is RESET in networks {net_list} but never SET (S) in this block."
+                f"UNPAIRED RESET COIL: Device '{coil}' is RESET in networks {net_list} but never SET (S) in {scope_desc}."
             )
 
     # Check 4: Nesting depth limit
@@ -3172,7 +3202,7 @@ def perform_deep_program_analysis(
             f"NESTING STACK OVERFLOW: Logic nesting depth {max_nesting_depth} exceeds Siemens hardware limit of 7."
         )
 
-    # Check 5: Timers started but never read
+    # Check 5: Timers started but never read (resolved across all provided blocks!)
     unreferenced_timers = timers_started - timers_read
     if unreferenced_timers:
         for t in sorted(unreferenced_timers):
@@ -3204,14 +3234,15 @@ def perform_deep_program_analysis(
     if max_nesting_depth > 4:
         recommendations.append("Consider decomposing deeply nested logic rungs into intermediate marker bits.")
 
-    return {
+    result: Dict[str, Any] = {
         "safety_score": safety_score,
         "status": "PASSED" if safety_score >= 80 else ("WARNING" if safety_score >= 50 else "FAILED"),
         "hazards": hazards,
         "warnings": warnings,
         "recommendations": recommendations,
         "metrics": {
-            "network_count": len(networks),
+            "network_count": total_networks,
+            "block_count": len(block_items),
             "bit_operations": bit_ops_count,
             "word_operations": word_ops_count,
             "timer_operations": timer_ops_count,
@@ -3220,6 +3251,9 @@ def perform_deep_program_analysis(
             "estimated_sweep_time_us": round(estimated_sweep_us, 3),
         },
     }
+    if multi_block:
+        result["analyzed_blocks"] = [b for b, _ in block_items]
+    return result
 
 
 def detect_simatic_environment() -> Dict[str, Any]:
@@ -3550,11 +3584,15 @@ class SimaticComBridge:
             "if (-not $__jsonLine) { $__jsonLine = [string]($__lines | Select-Object -Last 1) }\n"
             "[System.IO.File]::WriteAllText($__outFile, [string]$__jsonLine, [System.Text.Encoding]::UTF8)\n"
         )
-        encoded = base64.b64encode(wrapped_script.encode("utf-16le")).decode("ascii")
+        script_path: Optional[Path] = None
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if sys.platform == "win32" else 0
         try:
+            fd, tmp_ps1 = tempfile.mkstemp(prefix="s7_ps32_", suffix=".ps1")
+            os.close(fd)
+            script_path = Path(tmp_ps1)
+            script_path.write_text(wrapped_script, encoding="utf-8-sig")
             proc = subprocess.Popen(
-                [str(self.ps32_exe), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
+                [str(self.ps32_exe), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(script_path)],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -3577,11 +3615,12 @@ class SimaticComBridge:
         except Exception as exc:
             return {"ok": False, "error": f"32-bit COM bridge execution failed: {exc}"}
         finally:
-            try:
-                if out_json_file.exists():
-                    out_json_file.unlink()
-            except Exception:
-                pass
+            for cleanup_p in (out_json_file, script_path):
+                if cleanup_p is not None:
+                    try:
+                        cleanup_p.unlink(missing_ok=True)
+                    except OSError:
+                        pass
 
     def list_projects(self) -> Tuple[bool, List[Dict[str, Any]], str]:
         res = self.worker.call("list_projects")
@@ -3629,8 +3668,16 @@ class SimaticComBridge:
         if isinstance(blocks, dict):
             blocks = [blocks]
         for b in blocks:
-            if not b.get("language"):
-                b["language"] = "SDB" if b.get("concrete_type") == 1138955 else "STL"
+            bname = str(b.get("name") or "").upper()
+            ctype = b.get("concrete_type")
+            if ctype == 1138947 or re.match(r"^DB\d+$", bname):
+                b["language"] = "DB"
+            elif ctype == 1138955 or re.match(r"^SDB", bname):
+                b["language"] = "SDB"
+            elif re.match(r"^UDT\d+$", bname):
+                b["language"] = "UDT"
+            elif not b.get("language"):
+                b["language"] = "STL"
             b["project_name"] = res.get("project_name")
         return True, blocks, f"Listed {len(blocks)} blocks in project '{res.get('project_name')}'."
 
@@ -3812,25 +3859,50 @@ class SimaticComBridge:
             return False, res.get("error", "COM export_station_cfg failed."), res
         return True, str(p), res
 
+    def get_pgpc_interface(self) -> Dict[str, Any]:
+        """Inspect the active Windows Siemens PG/PC Interface (S7ONLINE) used for physical PLC & PLCSIM downloads."""
+        if sys.platform != "win32":
+            return {
+                "ok": False,
+                "detected": False,
+                "platform": sys.platform,
+                "access_point": "S7ONLINE",
+                "note": "STEP 7 COM / PG-PC Interface requires Windows; S7comm TCP/IP monitoring works cross-platform.",
+            }
+        res = self.worker.call("get_pgpc_interface", {}, timeout_s=8.0)
+        if not res.get("ok"):
+            return {"ok": False, "detected": False, "error": res.get("error", "get_pgpc_interface failed.")}
+        pgpc = dict(res.get("pgpc_interface") or {})
+        pgpc["ok"] = True
+        return pgpc
+
     def download_blocks(
         self,
         block_names: Sequence[str],
         project_name: Optional[str] = None,
         overwrite: bool = True,
+        download_target: str = "blocks",
+        timeout_s: float = 90.0,
     ) -> Tuple[bool, str, Dict[str, Any]]:
         cleaned = [re.sub(r"\s+", "", b.strip().upper()) for b in block_names]
+        target_norm = (download_target or "blocks").strip().lower()
+        if target_norm not in ("blocks", "program", "station"):
+            target_norm = "blocks"
+        eff_timeout = max(10.0, min(float(timeout_s), 300.0))
         res = self.worker.call(
             "download_blocks",
             {
                 "project_name": (project_name or "").strip(),
                 "blocks": cleaned,
                 "overwrite": bool(overwrite),
+                "download_target": target_norm,
             },
-            timeout_s=30.0,
+            timeout_s=eff_timeout,
         )
         if not res.get("ok"):
             return False, res.get("error", "COM download_blocks failed."), res
-        return True, f"Downloaded {len(cleaned) if cleaned else 'all'} block(s).", res
+        scope_desc = "station (HW + blocks)" if target_norm == "station" else f"{len(cleaned) if cleaned else 'all'} block(s)"
+        return True, f"Downloaded {scope_desc} via {res.get('method', 'COM')}.", res
 
     def upload_station(
         self,
@@ -4938,6 +5010,279 @@ class S7RuntimeClient:
             return res
         return self.pool.cpu_control(host=host, action=action, port=port, rack=rack, slot=slot)
 
+    def list_online_blocks(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 102,
+        rack: int = 0,
+        slot: int = 2,
+        include_block_numbers: bool = True,
+        connection_type: str = "AUTO",
+    ) -> Dict[str, Any]:
+        """List blocks currently loaded in a live physical PLC (over S7comm TCP) or VirtualS7PLC."""
+        h_low = host.strip().lower()
+        if h_low == "virtual":
+            inv: Dict[str, List[int]] = {k: [] for k in ("OB", "DB", "SDB", "FC", "SFC", "FB", "SFB")}
+            with VIRTUAL_PLC._lock:
+                for bname in set(list(VIRTUAL_PLC.blocks.keys()) + list(VIRTUAL_PLC.block_meta.keys())):
+                    m = re.match(r"^(OB|FB|FC|DB|SDB|SFB|SFC)(\d+)$", bname.strip().upper())
+                    if m:
+                        inv[m.group(1)].append(int(m.group(2)))
+                for db_num in VIRTUAL_PLC.dbs.keys():
+                    if int(db_num) not in inv["DB"]:
+                        inv["DB"].append(int(db_num))
+            counts = {k: len(set(v)) for k, v in inv.items()}
+            blocks = {k: sorted(set(v)) for k, v in inv.items()}
+            block_names = [f"{k}{n}" for k, nums in blocks.items() for n in nums]
+            return {
+                "ok": True,
+                "transport": "virtual_s7_plc",
+                "host": "virtual",
+                "port": 0,
+                "counts": counts,
+                "total_blocks": sum(counts.values()),
+                "blocks": blocks if include_block_numbers else {},
+                "block_names": block_names if include_block_numbers else [],
+                "latency_ms": 0.1,
+            }
+        res = self.pool.list_online_blocks(
+            host=host,
+            port=port,
+            rack=rack,
+            slot=slot,
+            include_block_numbers=include_block_numbers,
+            connection_type=connection_type,
+        )
+        res["transport"] = "s7comm_iso_tcp"
+        return res
+
+    def connection_check(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 102,
+        rack: int = 0,
+        slot: int = 2,
+        connection_type: str = "AUTO",
+    ) -> Dict[str, Any]:
+        """Comprehensive pre-flight check for physical PLC monitoring, live writes, and program download."""
+        t0 = time.perf_counter()
+        env_writes = os.environ.get("S7_WRITES_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+        access_mode_val = ACTIVE_ACCESS_MODE.value
+        is_full_mode = ACTIVE_ACCESS_MODE == AccessMode.FULL
+        h_low = host.strip().lower()
+
+        pgpc_info = self.com_bridge.get_pgpc_interface()
+        com_available = sys.platform == "win32"
+
+        report: Dict[str, Any] = {
+            "ok": False,
+            "host": host,
+            "port": port,
+            "rack": rack,
+            "slot": slot,
+            "platform": sys.platform,
+            "access_mode": access_mode_val,
+            "s7_writes_enabled_env": env_writes,
+            "pgpc_interface": pgpc_info,
+            "capabilities": {
+                "can_monitor_and_gather_data": False,
+                "can_write_memory": False,
+                "can_download_program_via_com": False,
+            },
+            "actionable_notes": [],
+        }
+
+        if h_low == "virtual":
+            diag = self.read_cpu_diagnostics(host="virtual")
+            blks = self.list_online_blocks(host="virtual")
+            report["ok"] = True
+            report["transport"] = "virtual_s7_plc"
+            report["cpu"] = {
+                "order_number": diag.get("order_number"),
+                "cpu_mode": diag.get("cpu_mode"),
+                "scan_count": diag.get("scan_count"),
+            }
+            report["online_blocks"] = blks.get("counts")
+            report["capabilities"]["can_monitor_and_gather_data"] = True
+            report["capabilities"]["can_write_memory"] = True
+            report["latency_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
+            return report
+
+        # 1. Test RFC1006 / ISO-on-TCP + COTP + S7 Setup Comm
+        try:
+            conn = self.pool.acquire(
+                host=host,
+                port=port,
+                rack=rack,
+                slot=slot,
+                timeout_s=3.0,
+                connection_type=connection_type,
+            )
+            report["tcp_s7comm"] = {
+                "connected": True,
+                "connection_type": conn.connection_type,
+                "negotiated_pdu": conn.negotiated_pdu,
+            }
+            report["capabilities"]["can_monitor_and_gather_data"] = True
+            report["capabilities"]["can_write_memory"] = is_full_mode and env_writes
+
+            # 2. Query CPU SZL identity & RUN/STOP mode
+            diag = self.pool.read_szl_diagnostics(
+                host=host, port=port, rack=rack, slot=slot, timeout_s=3.0, connection_type=conn.connection_type
+            )
+            report["cpu"] = {
+                "order_number": diag.get("order_number"),
+                "cpu_mode": diag.get("cpu_mode"),
+                "diagnostics_count": diag.get("diagnostics_count", 0),
+                "szl_errors": diag.get("szl_errors"),
+            }
+
+            # 3. Query online block counts on the physical PLC
+            try:
+                blks = self.pool.list_online_blocks(
+                    host=host,
+                    port=port,
+                    rack=rack,
+                    slot=slot,
+                    include_block_numbers=True,
+                    timeout_s=3.0,
+                    connection_type=conn.connection_type,
+                )
+                report["online_blocks"] = {
+                    "counts": blks.get("counts"),
+                    "total_blocks": blks.get("total_blocks"),
+                    "block_names": blks.get("block_names"),
+                }
+            except Exception as blk_exc:
+                report["online_blocks"] = {"error": str(blk_exc)}
+
+            report["ok"] = True
+        except Exception as exc:
+            report["tcp_s7comm"] = {
+                "connected": False,
+                "error": str(exc),
+            }
+            report["actionable_notes"].append(
+                f"Cannot reach S7comm ISO-on-TCP at {host}:{port} (rack={rack}, slot={slot}). "
+                "Verify PLC Ethernet/PROFINET/CP343-1 IP, firewall TCP port 102, and rack/slot (S7-300 CPU is typically rack=0, slot=2; S7-400 is often rack=0, slot=3)."
+            )
+
+        # 4. Evaluate physical PLC download readiness via Windows STEP 7 COM
+        com_ready = com_available and is_full_mode and env_writes
+        if com_available and pgpc_info.get("is_plcsim"):
+            report["actionable_notes"].append(
+                f"Windows PG/PC Interface 'S7ONLINE' is set to '{pgpc_info.get('device_name')}' (PLCSIM). "
+                "Switch S7ONLINE in Windows 'Set PG/PC Interface' to TCP/IP or your MPI/PROFIBUS PC Adapter before downloading to a physical PLC."
+            )
+            com_ready = False
+        if not com_available:
+            report["actionable_notes"].append(
+                "Program download (s7_com_download_blocks) uses Siemens STEP 7 Command Interface (32-bit Windows COM). "
+                "Run this MCP server on the Windows engineering workstation with STEP 7 Classic installed to download programs; "
+                "live monitoring and data gathering over S7comm TCP port 102 work on any OS."
+            )
+        if not is_full_mode:
+            report["actionable_notes"].append(
+                f"Server is in '--mode {access_mode_val}'. Start with '--mode full' (or S7_ACCESS_MODE=full) to enable PLC program downloads and live writes."
+            )
+        if not env_writes:
+            report["actionable_notes"].append(
+                "Environment variable S7_WRITES_ENABLED is not 'true'. Set S7_WRITES_ENABLED=true and pass confirm_live_write=True for live PLC downloads/writes."
+            )
+        report["capabilities"]["can_download_program_via_com"] = com_ready
+        report["latency_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
+        return report
+
+    def collect_data(
+        self,
+        tags: Sequence[Any],
+        host: str = "127.0.0.1",
+        port: int = 102,
+        rack: int = 0,
+        slot: int = 2,
+        samples: int = 20,
+        interval_ms: int = 200,
+        duration_s: Optional[float] = None,
+        symbol_table: Optional[Dict[str, str]] = None,
+        project_name: Optional[str] = None,
+        thresholds: Optional[Dict[str, Dict[str, Any]]] = None,
+        export_format: Optional[str] = None,
+        dataset_name: Optional[str] = None,
+        include_raw_samples: bool = True,
+    ) -> Dict[str, Any]:
+        """Gather time-series data from a physical PLC, PLCSIM, or VirtualS7PLC with analytics & optional CSV/JSONL export."""
+        # Build merged symbol table (explicit overrides + active project symbol table)
+        merged_syms: Dict[str, Tuple[str, Optional[str]]] = {}
+        sym_file = find_default_symbol_table_file(project_name)
+        if sym_file and sym_file.is_file():
+            parsed = parse_s7_symbol_table(sym_file)
+            for entry in parsed.get("symbols", []):
+                merged_syms[entry["symbol"].strip().upper()] = (
+                    entry["address"].strip(),
+                    entry.get("data_type", "").strip().upper() or None,
+                )
+        for k, v in (symbol_table or {}).items():
+            if isinstance(v, str):
+                merged_syms[k.strip().upper()] = (v.strip(), None)
+            elif isinstance(v, dict) and v.get("address"):
+                merged_syms[k.strip().upper()] = (str(v["address"]).strip(), v.get("data_type"))
+
+        resolved_tags: List[Dict[str, Any]] = []
+        for t in tags:
+            if isinstance(t, str):
+                raw_name, dt, sym = t.strip(), None, None
+            else:
+                raw_name = str(t.get("address") or t.get("symbol") or "").strip()
+                dt = t.get("data_type")
+                sym = t.get("symbol")
+            if raw_name.upper() in merged_syms:
+                mapped_addr, mapped_dt = merged_syms[raw_name.upper()]
+                resolved_tags.append({
+                    "address": mapped_addr,
+                    "data_type": dt or mapped_dt,
+                    "symbol": sym or raw_name,
+                })
+            else:
+                resolved_tags.append({"address": raw_name, "data_type": dt, "symbol": sym})
+
+        def _read_batch(tag_items: List[Dict[str, Any]]) -> Dict[str, Any]:
+            clean_items = [
+                {"address": ti["address"], "data_type": ti.get("data_type"), "symbol": ti.get("symbol")}
+                for ti in tag_items
+            ]
+            return self.batch_read(
+                items=clean_items,
+                host=host,
+                port=port,
+                rack=rack,
+                slot=slot,
+                project_name=project_name,
+            )
+
+        out = PLCDataCollector.collect(
+            read_fn=_read_batch,
+            tags=resolved_tags,
+            samples=samples,
+            interval_ms=interval_ms,
+            duration_s=duration_s,
+            thresholds=thresholds,
+            export_format=export_format,
+            export_dir=WORKSPACE_DIR / "Datasets",
+            dataset_name=dataset_name,
+            include_raw_samples=include_raw_samples,
+        )
+        h_low = host.strip().lower()
+        out["host"] = host
+        out["port"] = 0 if h_low in ("virtual", "plcsim", "prosim") else port
+        out["rack"] = rack
+        out["slot"] = slot
+        out["transport"] = (
+            "virtual_s7_plc"
+            if h_low == "virtual"
+            else ("plcsim_s7prosim_com" if h_low in ("plcsim", "prosim") else "s7comm_iso_tcp")
+        )
+        return out
+
 
 
 # ============================================================================
@@ -4959,16 +5304,35 @@ class SimaticManagerController:
         self.editor_app: Optional[Any] = None
         self.editor_win: Optional[Any] = None
         self.project_name: Optional[str] = None
+        self.project_dir: Optional[Path] = None
         self.is_offline_project: bool = False
         self.import_started: bool = False
         self._last_confirmation: List[str] = []
         self.com_bridge: SimaticComBridge = SimaticComBridge()
 
+    def _resolve_project_dir(self, proj: Optional[str] = None) -> Optional[Path]:
+        eff_proj = (proj or self.project_name or "").strip()
+        if self.project_dir is not None and self.project_dir.is_dir():
+            if not eff_proj or (self.project_name and eff_proj.lower() == self.project_name.lower()):
+                return self.project_dir
+            if self.project_dir.name.lower() == eff_proj.lower():
+                return self.project_dir
+        if not eff_proj:
+            return None
+        cand = Path(eff_proj).expanduser()
+        if cand.is_dir():
+            return cand.resolve()
+        ws_cand = WORKSPACE_DIR / "Projects" / eff_proj
+        if ws_cand.is_dir():
+            return ws_cand
+        return ws_cand
+
     def _is_offline_workspace_project(self, proj: Optional[str] = None, gui_title: str = "") -> bool:
         eff_proj = (proj or self.project_name or "").strip()
         if not eff_proj:
             return False
-        offline_meta = WORKSPACE_DIR / "Projects" / eff_proj / "project.json"
+        proj_dir = self._resolve_project_dir(eff_proj)
+        offline_meta = (proj_dir / "project.json") if proj_dir else (WORKSPACE_DIR / "Projects" / eff_proj / "project.json")
         if not offline_meta.is_file():
             return False
         if self.is_offline_project:
@@ -5143,7 +5507,11 @@ class SimaticManagerController:
 
         target_cpu = cpu_type.strip() if cpu_type and cpu_type.strip() else profile.typical_cpu
         target_station = station_name.strip() if station_name and station_name.strip() else profile.station_type
-        proj_dir = Path(project_path).expanduser().resolve() if project_path else (WORKSPACE_DIR / "Projects" / project_name)
+        if project_path:
+            base_dir = Path(project_path).expanduser().resolve()
+            proj_dir = base_dir if base_dir.name.lower() == project_name.lower() else (base_dir / project_name)
+        else:
+            proj_dir = WORKSPACE_DIR / "Projects" / project_name
 
         # 1. Try native GUI automation if explicitly requested
         ok, title = self.connect()
@@ -5299,7 +5667,9 @@ class SimaticManagerController:
             initial_csv.write_text('"Symbol","Address","Data type","Comment"\r\n', encoding="utf-8")
 
         self.project_name = project_name
+        self.project_dir = proj_dir
         self.is_offline_project = not gui_created
+        meta["project_dir"] = str(proj_dir)
         mode_str = "natively via SIMATIC Manager GUI" if gui_created else "offline STEP 7 workspace"
         msg = f"Created project '{project_name}' for {profile.name} ({target_cpu}) {mode_str}."
         return True, msg, meta
@@ -5332,10 +5702,16 @@ class SimaticManagerController:
                 target_dir = cand
 
         if not target_dir or not target_dir.is_dir():
-            return False, f"Could not find project directory for '{project_path_or_name}'.", {}
+            if self.project_dir and self.project_dir.is_dir() and self.project_name and self.project_name.lower() == project_path_or_name.strip().lower():
+                target_dir = self.project_dir
+                s7ps = list(target_dir.glob("*.s7p"))
+                target_s7p = s7ps[0] if s7ps else None
+            else:
+                return False, f"Could not find project directory for '{project_path_or_name}'.", {}
 
         proj_name = target_s7p.stem if target_s7p else target_dir.name
         self.project_name = proj_name
+        self.project_dir = target_dir
 
         meta_file = target_dir / "project.json"
         self.is_offline_project = meta_file.is_file() and not launch_if_closed
@@ -5371,7 +5747,7 @@ class SimaticManagerController:
         """
         blk_clean = re.sub(r"\s+", "", block_name.strip().upper())
         proj = project_name or self.project_name
-        proj_dir = (WORKSPACE_DIR / "Projects" / proj) if proj else None
+        proj_dir = self._resolve_project_dir(proj)
         cand_path = None
         if proj_dir and proj_dir.is_dir():
             for cand in [proj_dir / "Blocks" / f"{blk_clean}.awl", proj_dir / f"{blk_clean}.awl"]:
@@ -6671,7 +7047,7 @@ def s7_read_program(block_name: str = "OB1") -> str:
 
     blk_clean = block_name.strip().upper()
     proj = controller.project_name
-    proj_dir = (WORKSPACE_DIR / "Projects" / proj) if proj else None
+    proj_dir = controller._resolve_project_dir(proj)
     blk_file = None
     if proj_dir and proj_dir.is_dir():
         for cand in [proj_dir / "Blocks" / f"{blk_clean}.awl", proj_dir / f"{blk_clean}.awl"]:
@@ -6779,8 +7155,12 @@ def s7_write_symbol_table(
 
     return json.dumps(
         {
+            "success": True,
             "status": "SUCCESS",
             "symbol_count": len(symbol_entries),
+            "asc_path": str(asc_path),
+            "sdf_path": str(sdf_path),
+            "csv_path": str(csv_path),
             "symbol_asc_path": str(asc_path),
             "symbol_sdf_path": str(sdf_path),
             "symbol_csv_path": str(csv_path),
@@ -7101,9 +7481,9 @@ def s7_get_cross_references(
                 return json.dumps({"success": False, "error": parsed["error"]}, indent=2)
             nets_to_use = parsed.get("networks", [])
         else:
-            proj = controller.project_name
-            if proj:
-                cand = WORKSPACE_DIR / "Projects" / proj / "Blocks" / f"{block_name.upper()}.awl"
+            proj_dir = controller._resolve_project_dir(controller.project_name)
+            if proj_dir and proj_dir.is_dir():
+                cand = proj_dir / "Blocks" / f"{block_name.upper()}.awl"
                 if cand.is_file():
                     parsed = parse_s7_awl_source(cand)
                     nets_to_use = parsed.get("networks", [])
@@ -7159,9 +7539,9 @@ def s7_get_memory_usage_map(
                 return json.dumps({"success": False, "error": parsed["error"]}, indent=2)
             nets_to_use = parsed.get("networks", [])
         else:
-            proj = controller.project_name
-            if proj:
-                cand = WORKSPACE_DIR / "Projects" / proj / "Blocks" / f"{block_name.upper()}.awl"
+            proj_dir = controller._resolve_project_dir(controller.project_name)
+            if proj_dir and proj_dir.is_dir():
+                cand = proj_dir / "Blocks" / f"{block_name.upper()}.awl"
                 if cand.is_file():
                     parsed = parse_s7_awl_source(cand)
                     nets_to_use = parsed.get("networks", [])
@@ -7198,27 +7578,63 @@ def s7_analyze_program(
     awl_source_path: Optional[str] = None,
     symbols: Optional[Any] = None,
     plc_type: str = "S7-300",
+    blocks: Optional[Dict[str, Any]] = None,
+    awl_source_paths: Optional[List[str]] = None,
 ) -> str:
     """
-    Performs comprehensive static safety analysis on SIMATIC S7 Statement List (AWL/STL) code:
+    Performs comprehensive static safety analysis on SIMATIC S7 Statement List (AWL/STL) code
+    across either a single block or multiple blocks simultaneously:
       - Star-Delta contactor switching hazards (interlock + dead-time delay)
       - Duplicate coil assignments (=)
-      - Unpaired SET/RESET coils
-      - Timer/Counter initialization and evaluation hygiene
+      - Unpaired SET/RESET coils (resolved across all supplied blocks)
+      - Timer/Counter initialization and evaluation hygiene (resolved across all supplied blocks)
       - Direct peripheral I/O access hazards (PIB/PQB)
       - Nesting stack depth verification (<= 7)
       - Estimated CPU scan sweep time in microseconds
       - Overall safety score (0-100) and actionable recommendations
 
     Args:
-        networks: Candidate networks list.
-        awl_source_path: Optional path to an AWL source file.
+        networks: Candidate networks list for single-block analysis.
+        awl_source_path: Optional path to a single AWL source file.
         symbols: Optional symbol mappings.
         plc_type: Target PLC family: 'S7-300', 'S7-400', or 'WinAC'.
+        blocks: Optional mapping of block_name -> list of network dicts or raw AWL string for multi-block analysis.
+        awl_source_paths: Optional list of AWL source file paths for multi-block program analysis.
     """
     profile, profile_err = resolve_s7_plc_profile(plc_type)
     if profile_err or profile is None:
         return json.dumps({"success": False, "error": profile_err}, indent=2)
+
+    blocks_map: Dict[str, List[Dict[str, Any]]] = {}
+    if blocks:
+        for bname, bval in blocks.items():
+            if isinstance(bval, list):
+                blocks_map[str(bname)] = bval
+            elif isinstance(bval, str):
+                tmp_path = save_s7_artifact(bval, new_s7_artifact_path(f"analyze-{re.sub(r'[^A-Za-z0-9_]+', '_', str(bname))}"))
+                try:
+                    parsed = parse_s7_awl_source(tmp_path)
+                    if parsed.get("error"):
+                        return json.dumps({"success": False, "error": f"{bname}: {parsed['error']}"}, indent=2)
+                    blocks_map[str(bname)] = parsed.get("networks", [])
+                finally:
+                    tmp_path.unlink(missing_ok=True)
+    if awl_source_paths:
+        for sp in awl_source_paths:
+            p = Path(sp).expanduser()
+            if not p.is_file():
+                return json.dumps({"success": False, "error": f"File not found: {sp}"}, indent=2)
+            parsed = parse_s7_awl_source(p)
+            if parsed.get("error"):
+                return json.dumps({"success": False, "error": f"{sp}: {parsed['error']}"}, indent=2)
+            bkey = str(parsed.get("block_name") or p.stem)
+            blocks_map[bkey] = parsed.get("networks", [])
+
+    if blocks_map:
+        res = perform_deep_program_analysis(None, profile=profile, symbols=symbols, blocks=blocks_map)
+        res["success"] = True
+        res["plc_type"] = profile.name
+        return json.dumps(res, indent=2)
 
     nets_to_use = networks
     if nets_to_use is None and awl_source_path:
@@ -7412,6 +7828,7 @@ def s7_com_read_block(
     parsed["mode"] = "native_com"
     parsed["exported_awl_path"] = str(export_path)
     parsed["content_hash"] = compute_content_hash("awl", raw_awl)
+    parsed["awl_source"] = raw_awl
     parsed["raw_awl"] = raw_awl
     return json.dumps(parsed, indent=2)
 
@@ -8132,10 +8549,12 @@ def s7_write_scl_block(
     block_name: str = "FC1",
     project_name: Optional[str] = None,
     project_s7p_path: Optional[str] = None,
+    compile_via_com: bool = False,
 ) -> str:
     """
-    Validates Siemens SCL (Structured Text) source, writes a verified `.scl` artifact, and compiles via
-    STEP 7 SCL Compiler (`S7SC.exe`) or COM if available (sets BLKLANG='00004').
+    Validates Siemens SCL (Structured Text) source, writes a verified `.scl` artifact, and optionally
+    compiles via STEP 7 SCL Compiler (`S7SC.exe`) or COM when `compile_via_com=True` or `project_name`
+    is explicitly provided (sets BLKLANG='00004').
     """
     denied = _check_access_mode("s7_write_scl_block", AccessMode.READ_WRITE)
     if denied:
@@ -8176,7 +8595,8 @@ def s7_write_scl_block(
             indent=2,
         )
 
-    if controller.com_bridge.is_available():
+    should_compile_com = bool(compile_via_com or (project_name and project_name.strip()))
+    if should_compile_com and controller.com_bridge.is_available():
         ok_com, com_msg, meta = controller.com_bridge.import_and_compile_awl(
             awl_path=scl_path,
             block_name=blk_clean,
@@ -8238,8 +8658,9 @@ def s7_write_graph_block(
     transitions: List[Dict[str, Any]],
     title: str = "S7-GRAPH Sequencer",
     project_name: Optional[str] = None,
+    compile_via_com: bool = False,
 ) -> str:
-    """Validates and generates a Siemens S7-GRAPH `.gr7` source file (and compiles via COM if active, BLKLANG='00005')."""
+    """Validates and generates a Siemens S7-GRAPH `.gr7` source file (and compiles via COM only when `compile_via_com=True` or `project_name` is explicitly provided, BLKLANG='00005')."""
     denied = _check_access_mode("s7_write_graph_block", AccessMode.READ_WRITE)
     if denied:
         return denied
@@ -8258,7 +8679,8 @@ def s7_write_graph_block(
         )
     blk_clean = f"FB{fb_number}"
     gr7_path = save_s7_artifact(res["gr7_source"], new_s7_artifact_path(f"{blk_clean.lower()}-graph", suffix=".gr7"))
-    if controller.com_bridge.is_available():
+    should_compile_com = bool(compile_via_com or (project_name and project_name.strip()))
+    if should_compile_com and controller.com_bridge.is_available():
         ok_com, com_msg, meta = controller.com_bridge.import_and_compile_awl(
             awl_path=gr7_path, block_name=blk_clean, project_name=project_name, target_language="GRAPH"
         )
@@ -8273,6 +8695,8 @@ def s7_write_graph_block(
                 "content_hash": res["content_hash"],
                 "message": com_msg,
                 "details": meta,
+                "warnings": res["warnings"],
+                "gr7_source": res["gr7_source"],
             },
             indent=2,
         )
@@ -8387,7 +8811,10 @@ def s7_com_create_project(
         station_type=station_type,
         create_station=create_station,
     )
-    return json.dumps({"success": ok, "message": msg, "details": meta}, indent=2)
+    payload: Dict[str, Any] = {"success": ok, "message": msg, "details": meta}
+    if not ok and isinstance(meta, dict) and meta.get("failure_category"):
+        payload["failure_category"] = meta["failure_category"]
+    return json.dumps(payload, indent=2)
 
 
 @mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, title="Browse Project Tree"))
@@ -8443,9 +8870,20 @@ def s7_com_download_blocks(
     blocks: List[str],
     project_name: Optional[str] = None,
     overwrite: bool = True,
+    download_target: str = "blocks",
+    verify_host: Optional[str] = None,
+    verify_port: int = 102,
+    rack: int = 0,
+    slot: int = 2,
+    timeout_s: float = 90.0,
     confirm_live_write: bool = False,
 ) -> str:
-    """Downloads compiled blocks (or all program blocks when blocks is empty/['*']) to the online PLC / S7-PLCSIM target via COM (requires full mode + dual guard)."""
+    """
+    Downloads compiled blocks, full program, or entire station (HW Config SDBs + blocks) to a physical PLC or S7-PLCSIM
+    via 32-bit STEP 7 COM (`download_target`: 'blocks' | 'program' | 'station'). Requires `--mode full` +
+    `S7_WRITES_ENABLED=true` + `confirm_live_write=True`. Optionally verifies online blocks via S7comm TCP when
+    `verify_host` is specified.
+    """
     denied = _check_access_mode("s7_com_download_blocks", AccessMode.FULL)
     if denied:
         return denied
@@ -8455,13 +8893,52 @@ def s7_com_download_blocks(
                 "success": False,
                 "status": "WRITE_GUARDRAIL_BLOCKED",
                 "failure_category": FailureCategory.WRITE_GUARDRAIL_BLOCKED.value,
-                "error": "Downloading blocks requires BOTH confirm_live_write=True AND S7_WRITES_ENABLED=true.",
+                "error": (
+                    "Downloading blocks to a PLC requires ALL THREE safety prerequisites: "
+                    "(1) server started with '--mode full' (or S7_ACCESS_MODE=full), "
+                    "(2) environment variable S7_WRITES_ENABLED=true, and "
+                    "(3) confirm_live_write=True."
+                ),
             },
             indent=2,
         )
-    ok, msg, meta = controller.com_bridge.download_blocks(block_names=blocks, project_name=project_name, overwrite=overwrite)
-    AUDIT_LOGGER.record(tool="s7_com_download_blocks", action="download", target=f"{project_name}:{','.join(blocks)}", success=ok, status="SUCCESS" if ok else "FAILED")
-    return json.dumps({"success": ok, "message": msg, "details": meta}, indent=2)
+    ok, msg, meta = controller.com_bridge.download_blocks(
+        block_names=blocks,
+        project_name=project_name,
+        overwrite=overwrite,
+        download_target=download_target,
+        timeout_s=timeout_s,
+    )
+    online_verification: Optional[Dict[str, Any]] = None
+    if ok and verify_host:
+        try:
+            diag = runtime_client.read_cpu_diagnostics(host=verify_host, port=verify_port, rack=rack, slot=slot)
+            online_blks = runtime_client.list_online_blocks(
+                host=verify_host, port=verify_port, rack=rack, slot=slot, include_block_numbers=True
+            )
+            online_verification = {
+                "ok": True,
+                "host": verify_host,
+                "port": verify_port,
+                "cpu_mode": diag.get("cpu_mode"),
+                "order_number": diag.get("order_number"),
+                "online_block_counts": online_blks.get("counts"),
+                "online_block_names": online_blks.get("block_names"),
+            }
+        except Exception as ver_exc:
+            online_verification = {"ok": False, "host": verify_host, "error": str(ver_exc)}
+
+    AUDIT_LOGGER.record(
+        tool="s7_com_download_blocks",
+        action=f"download_{download_target}",
+        target=f"{project_name}:{','.join(blocks) if blocks else '*'}",
+        success=ok,
+        status="SUCCESS" if ok else "FAILED",
+    )
+    payload: Dict[str, Any] = {"success": ok, "message": msg, "details": meta}
+    if online_verification is not None:
+        payload["online_verification"] = online_verification
+    return json.dumps(payload, indent=2)
 
 
 @mcp.tool(annotations=make_tool_annotations(read_only=False, title="Upload Station from PLC"))
@@ -8985,6 +9462,49 @@ def s7_plcsim_run_scenario(
     )
 
 
+@mcp.tool(annotations=make_tool_annotations(read_only=False, title="Run Closed-Loop Plant Simulation"))
+def s7_run_closed_loop_sim(
+    duration_ms: int = 10000,
+    tick_ms: int = 100,
+    entry_block: str = "OB1",
+    initial_plc_inputs: Optional[Dict[str, Any]] = None,
+    plant_states: Optional[List[Dict[str, Any]]] = None,
+    sensor_links: Optional[List[Dict[str, Any]]] = None,
+    events: Optional[List[Dict[str, Any]]] = None,
+    watch: Optional[List[str]] = None,
+    assertions: Optional[List[Dict[str, Any]]] = None,
+    sample_every_scans: int = 5,
+    reset_memory: bool = False,
+) -> str:
+    """
+    Runs a deterministic closed-loop PLC + physical plant simulation against `VirtualS7PLC`
+    with full Siemens S7-300 standard library support (SFB0-SFB5 IEC timers/counters, FC105 SCALE,
+    FC106 UNSCALE, FB41 CONT_C PID, SFC20 BLKMOV, SFC21 FILL, SFC64 TIME_TCK) and periodic OB35 execution.
+    """
+    try:
+        res = run_closed_loop_plant_sim(
+            VIRTUAL_PLC,
+            duration_ms=duration_ms,
+            tick_ms=tick_ms,
+            entry_block=entry_block,
+            initial_plc_inputs=initial_plc_inputs,
+            plant_states=plant_states,
+            sensor_links=sensor_links,
+            events=events,
+            watch=watch,
+            assertions=assertions,
+            sample_every_scans=sample_every_scans,
+            reset_memory=reset_memory,
+        )
+        res["supported_stdlib_blocks"] = sorted(S7_STDLIB_SCHEMAS.keys())
+        return json.dumps(res, indent=2)
+    except Exception as exc:
+        return json.dumps(
+            {"success": False, "ok": False, "error": str(exc)},
+            indent=2,
+        )
+
+
 # --- High-Speed Pooled Monitoring, Watch Tables & CPU Diagnostics ---
 
 @mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, title="High-Speed Batch Read"))
@@ -9071,17 +9591,29 @@ def s7_monitor_watch_table(
     slot: int = 2,
     table_id: str = "VAT1",
     symbol_table: Optional[Dict[str, str]] = None,
+    project_name: Optional[str] = None,
     samples: int = 1,
     interval_ms: int = 100,
 ) -> str:
     """
     Monitors a named STEP 7 Watch Table (VAT) over pooled S7comm multi-item PDUs, VirtualS7PLC (`host='virtual'`),
-    or S7-PLCSIM (`host='plcsim'`), returning symbolic values, delta changes vs previous snapshot, and optional polling.
+    or S7-PLCSIM (`host='plcsim'`), returning symbolic values, delta changes vs previous snapshot, and optional polling
+    (up to 100 samples). Automatically loads the active project's symbol table when `symbol_table` is omitted.
     """
     try:
+        effective_sym_table: Dict[str, str] = {}
+        if symbol_table is None:
+            sym_file = find_default_symbol_table_file(project_name)
+            if sym_file and sym_file.is_file():
+                parsed = parse_s7_symbol_table(sym_file)
+                for entry in parsed.get("symbols", []):
+                    effective_sym_table[entry["symbol"].strip()] = entry["address"].strip()
+        else:
+            effective_sym_table = dict(symbol_table)
+
         h_low = host.strip().lower()
         if h_low in ("virtual", "plcsim", "prosim"):
-            sym_lookup = {k.strip().upper(): v.strip() for k, v in (symbol_table or {}).items()}
+            sym_lookup = {k.strip().upper(): v.strip() for k, v in effective_sym_table.items()}
             resolved_tags: List[Dict[str, Any]] = []
             for t in tags:
                 if isinstance(t, str):
@@ -9097,7 +9629,7 @@ def s7_monitor_watch_table(
                     addr = addr_or_sym
                 resolved_tags.append({"address": addr, "data_type": dt, "symbol": sym})
 
-            sample_count = max(1, min(int(samples), 20))
+            sample_count = max(1, min(int(samples), 100))
             all_samples: List[Dict[str, Any]] = []
             key = f"{table_id}@{h_low}:0"
             for idx in range(sample_count):
@@ -9146,7 +9678,7 @@ def s7_monitor_watch_table(
             host=host,
             tags=tags,
             table_id=table_id,
-            symbol_table=symbol_table,
+            symbol_table=effective_sym_table,
             port=port,
             rack=rack,
             slot=slot,
@@ -9172,6 +9704,109 @@ def s7_runtime_cpu_diagnostics(
     """Queries live S7-300/400 CPU MLFB order number (SZL 0x0011), operating mode (RUN/STOP, SZL 0x0424), and diagnostic buffer (SZL 0x00A0)."""
     try:
         res = runtime_client.read_cpu_diagnostics(host=host, port=port, rack=rack, slot=slot)
+        res["success"] = bool(res.get("ok"))
+        return json.dumps(res, indent=2)
+    except Exception as exc:
+        return json.dumps(
+            {"success": False, "failure_category": FailureCategory.TRANSPORT_ERROR.value, "error": str(exc)},
+            indent=2,
+        )
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, open_world=True, title="Check Physical PLC Connection & Readiness"))
+def s7_plc_connection_check(
+    host: str = "127.0.0.1",
+    port: int = 102,
+    rack: int = 0,
+    slot: int = 2,
+    connection_type: str = "AUTO",
+) -> str:
+    """
+    Runs a non-destructive pre-flight check against a physical S7-300/400 PLC (or 'virtual'): tests ISO-on-TCP
+    port 102 with automatic PG/OP/S7-Basic TSAP fallback, reports negotiated PDU size, CPU MLFB & RUN/STOP mode,
+    online block inventory, Windows S7ONLINE PG/PC Interface setting, and readiness for monitoring vs program download.
+    """
+    try:
+        res = runtime_client.connection_check(
+            host=host, port=port, rack=rack, slot=slot, connection_type=connection_type
+        )
+        res["success"] = bool(res.get("ok"))
+        return json.dumps(res, indent=2)
+    except Exception as exc:
+        return json.dumps(
+            {"success": False, "failure_category": FailureCategory.TRANSPORT_ERROR.value, "error": str(exc)},
+            indent=2,
+        )
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, open_world=True, title="List Online PLC Blocks (S7comm TCP)"))
+def s7_runtime_list_online_blocks(
+    host: str = "127.0.0.1",
+    port: int = 102,
+    rack: int = 0,
+    slot: int = 2,
+    include_block_numbers: bool = True,
+    connection_type: str = "AUTO",
+) -> str:
+    """Queries the live block inventory (OB, FB, FC, DB, SDB, SFB, SFC counts & numbers) currently loaded on a physical PLC over S7comm TCP/IP."""
+    try:
+        res = runtime_client.list_online_blocks(
+            host=host,
+            port=port,
+            rack=rack,
+            slot=slot,
+            include_block_numbers=include_block_numbers,
+            connection_type=connection_type,
+        )
+        res["success"] = bool(res.get("ok"))
+        return json.dumps(res, indent=2)
+    except Exception as exc:
+        return json.dumps(
+            {"success": False, "failure_category": FailureCategory.TRANSPORT_ERROR.value, "error": str(exc)},
+            indent=2,
+        )
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=False, open_world=True, title="Collect PLC Time-Series Data & Analytics"))
+def s7_collect_plc_data(
+    tags: List[Any],
+    host: str = "127.0.0.1",
+    port: int = 102,
+    rack: int = 0,
+    slot: int = 2,
+    samples: int = 20,
+    interval_ms: int = 200,
+    duration_s: Optional[float] = None,
+    symbol_table: Optional[Dict[str, str]] = None,
+    project_name: Optional[str] = None,
+    thresholds: Optional[Dict[str, Dict[str, Any]]] = None,
+    export_format: Optional[str] = None,
+    dataset_name: Optional[str] = None,
+    include_raw_samples: bool = True,
+) -> str:
+    """
+    AI-agent data historian for physical PLCs (ISO-on-TCP port 102), S7-PLCSIM ('plcsim'), or VirtualS7PLC ('virtual').
+    Samples up to 500 time-series points (or up to 60s), resolves project symbols automatically, computes per-tag
+    analytics (min/max/mean/stddev/delta, BOOL duty cycle & edge counts), detects threshold violations, and optionally
+    exports datasets to CSV and/or JSONL in ~/Documents/Codex-Simatic7/Datasets/.
+    """
+    try:
+        res = runtime_client.collect_data(
+            tags=tags,
+            host=host,
+            port=port,
+            rack=rack,
+            slot=slot,
+            samples=samples,
+            interval_ms=interval_ms,
+            duration_s=duration_s,
+            symbol_table=symbol_table,
+            project_name=project_name,
+            thresholds=thresholds,
+            export_format=export_format,
+            dataset_name=dataset_name,
+            include_raw_samples=include_raw_samples,
+        )
         res["success"] = bool(res.get("ok"))
         return json.dumps(res, indent=2)
     except Exception as exc:

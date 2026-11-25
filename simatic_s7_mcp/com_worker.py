@@ -24,11 +24,11 @@ Supports:
 from __future__ import annotations
 
 import atexit
-import base64
 import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -59,10 +59,61 @@ function Get-PSim {
   return $script:PSim
 }
 
+function Get-PgPcInterface {
+  $info = @{
+    detected = $false
+    access_point = 'S7ONLINE'
+    device_name = ''
+    registry_path = ''
+    interface_type = 'unknown'
+    is_plcsim = $false
+    is_tcpip = $false
+    is_mpi_profibus = $false
+  }
+  $regPaths = @(
+    'HKLM:\SOFTWARE\WOW6432Node\Siemens\SINEC\LogNames\S7ONLINE',
+    'HKLM:\SOFTWARE\Siemens\SINEC\LogNames\S7ONLINE'
+  )
+  foreach ($rp in $regPaths) {
+    try {
+      if (Test-Path $rp) {
+        $props = Get-ItemProperty -Path $rp -ErrorAction Stop
+        $dev = ''
+        if ($props.PSObject.Properties['DeviceName'] -and $props.DeviceName) {
+          $dev = [string]$props.DeviceName
+        } elseif ($props.PSObject.Properties['(default)'] -and $props.'(default)') {
+          $dev = [string]$props.'(default)'
+        } elseif ($props.PSObject.Properties['LogName'] -and $props.LogName) {
+          $dev = [string]$props.LogName
+        }
+        if ($dev -ne '') {
+          $info.detected = $true
+          $info.device_name = $dev
+          $info.registry_path = $rp
+          $up = $dev.ToUpper()
+          if ($up -match 'PLCSIM') {
+            $info.is_plcsim = $true
+            $info.interface_type = 'plcsim'
+          } elseif ($up -match 'TCPIP|TCP/IP|ISO|PROFINET|ETH|NIC') {
+            $info.is_tcpip = $true
+            $info.interface_type = 'tcpip_iso'
+          } elseif ($up -match 'MPI|PROFIBUS|PC ADAPTER|CP5|CP56|CP57') {
+            $info.is_mpi_profibus = $true
+            $info.interface_type = 'mpi_profibus'
+          }
+          break
+        }
+      }
+    } catch {}
+  }
+  return $info
+}
+
 function Find-ProjectAndProgram([string]$targetProj) {
   $s7 = Get-S7
   $matchedProj = $null
   $matchedPrg = $null
+  $matchedStation = $null
   $srcContainer = $null
   $blkContainer = $null
 
@@ -88,6 +139,19 @@ function Find-ProjectAndProgram([string]$targetProj) {
           $matchedPrg = $candidatePrg
           $srcContainer = $foundSrc
           $blkContainer = $foundBlk
+          try {
+            if ($null -ne $candidatePrg.Parent -and $null -ne $candidatePrg.Parent.Parent) {
+              $matchedStation = $candidatePrg.Parent.Parent
+            }
+          } catch {}
+          if ($null -eq $matchedStation) {
+            try {
+              foreach ($st in $p.Stations) {
+                $matchedStation = $st
+                break
+              }
+            } catch {}
+          }
           break
         }
       }
@@ -96,6 +160,7 @@ function Find-ProjectAndProgram([string]$targetProj) {
   }
   return @{
     project = $matchedProj
+    station = $matchedStation
     program = $matchedPrg
     sources = $srcContainer
     blocks  = $blkContainer
@@ -121,6 +186,10 @@ function Handle-Command($req) {
 
   if ($cmd -eq 'ping') {
     return @{ ok = $true; worker = 'ps32_persistent'; pid = $PID }
+  }
+  if ($cmd -eq 'get_pgpc_interface') {
+    $pgpc = Get-PgPcInterface
+    return @{ ok = $true; pgpc_interface = $pgpc }
   }
   if ($cmd -eq 'shutdown') {
     return @{ ok = $true; shutting_down = $true }
@@ -148,25 +217,43 @@ function Handle-Command($req) {
     $pName = [string]$req.project_name
     $pDir = if ($req.project_dir) { [string]$req.project_dir } elseif ($req.project_path) { [string]$req.project_path } else { '' }
     if (-not $pName) { return @{ ok = $false; error = 'project_name is required.' } }
+    foreach ($existing in $s7.Projects) {
+      try {
+        if ($existing.Name -ieq $pName) {
+          return @{
+            ok = $false
+            failure_category = 'already_exists'
+            error = "Project '$pName' already exists in STEP 7."
+            project_name = [string]$existing.Name
+            project_dir = [string]$existing.LogPath
+          }
+        }
+      } catch {}
+    }
     if ($pDir) {
       $proj = $s7.Projects.Add($pName, $pDir, 1)
     } else {
       $proj = $s7.Projects.Add($pName)
     }
     $createdStation = ''
+    $stationError = $null
     if ($req.create_station -and $req.station_name) {
+      $stType = ([string]$req.station_type).ToUpper()
+      # S7StationType enum: S7300Station=30, S7400Station=31, S7PCStation=32
+      $stCode = if ($stType -match '400') { 31 } elseif ($stType -match 'WIN|PC') { 32 } else { 30 }
       try {
-        $stType = ([string]$req.station_type).ToUpper()
-        $stCode = if ($stType -match '400') { 1310722 } elseif ($stType -match 'WIN|PC') { 1310724 } else { 1310721 }
         $st = $proj.Stations.Add([string]$req.station_name, $stCode)
         $createdStation = [string]$st.Name
-      } catch {}
+      } catch {
+        $stationError = $_.Exception.Message
+      }
     }
     return @{
       ok = $true
       project_name = [string]$proj.Name
       project_dir = [string]$proj.LogPath
       station_name = $createdStation
+      station_error = $stationError
     }
   }
 
@@ -222,10 +309,20 @@ function Handle-Command($req) {
     if ($null -ne $ctx.blocks) {
       foreach ($b in $ctx.blocks.Next) {
         try {
+          $bName = [string]$b.Name
+          $cType = [int]$b.ConcreteType
+          $bLang = [string]$b.Language
+          if ($cType -eq 1138947 -or $bName -match '^\s*DB\s*\d+$') {
+            $bLang = 'DB'
+          } elseif ($cType -eq 1138955 -or $bName -match '^\s*SDB\s*\d*$') {
+            $bLang = 'SDB'
+          } elseif ($bName -match '^\s*UDT\s*\d+$') {
+            $bLang = 'UDT'
+          }
           $blocks += @{
-            name = [string]$b.Name
-            concrete_type = [int]$b.ConcreteType
-            language = [string]$b.Language
+            name = $bName
+            concrete_type = $cType
+            language = $bLang
             author = [string]$b.Creator
             symbolic_name = [string]$b.SymbolicName
             size = [int]$b.Size
@@ -264,7 +361,7 @@ function Handle-Command($req) {
     if ($null -eq $found) {
       return @{ ok = $false; error = "Block '$blkClean' not found in project '$($ctx.project.Name)'." }
     }
-    $found.GenerateSource($outFile, 0)
+    $null = $found.GenerateSource($outFile, 0)
     Get-Process S7kafapx -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -eq 0 } | Stop-Process -Force -ErrorAction SilentlyContinue
     return @{
       ok = [bool](Test-Path -LiteralPath $outFile)
@@ -326,7 +423,7 @@ function Handle-Command($req) {
     $blkClean = ([string]$req.block_name) -replace '\s+', ''
     foreach ($b in $ctx.blocks.Next) {
       if (($b.Name -replace '\s+', '') -ieq $blkClean) {
-        $b.Remove()
+        $null = $b.Remove()
         return @{ ok = $true; project_name = [string]$ctx.project.Name; deleted = $blkClean }
       }
     }
@@ -343,24 +440,79 @@ function Handle-Command($req) {
     if ($null -eq $srcCtx.blocks -or $null -eq $dstCtx.blocks) {
       return @{ ok = $false; error = 'Source or target Blocks container not found.' }
     }
-    $blkClean = $srcBlkRaw -replace '\s+', ''
-    $dstClean = $dstBlkRaw -replace '\s+', ''
+    $blkClean = ($srcBlkRaw -replace '\s+', '').ToUpper()
+    $dstClean = ($dstBlkRaw -replace '\s+', '').ToUpper()
+    $srcObj = $null
     foreach ($b in $srcCtx.blocks.Next) {
-      if (($b.Name -replace '\s+', '') -ieq $blkClean) {
-        $copiedObj = $b.Copy($dstCtx.blocks)
-        if ($dstClean -ne '' -and $dstClean -ine $blkClean -and $null -ne $copiedObj) {
-          try { $copiedObj.Name = $dstClean } catch {}
+      if (($b.Name -replace '\s+', '') -ieq $blkClean) { $srcObj = $b; break }
+    }
+    if ($null -eq $srcObj) {
+      return @{ ok = $false; error = "Block '$blkClean' not found in source project '$($srcCtx.project.Name)'." }
+    }
+    # Safe non-modal copy via GenerateSource + header rewrite + Compile (avoids SIMATIC Manager overwrite modal hang)
+    if ($null -ne $dstCtx.sources) {
+      $tmpAwl = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "mcp_copy_$([guid]::NewGuid().ToString('N')).awl")
+      try {
+        $null = $srcObj.GenerateSource($tmpAwl, 0)
+        Get-Process S7kafapx -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -eq 0 } | Stop-Process -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $tmpAwl) {
+          $srcText = [System.IO.File]::ReadAllText($tmpAwl, [System.Text.Encoding]::Default)
+          if ($dstClean -ne '' -and $dstClean -ine $blkClean) {
+            $mDst = [regex]::Match($dstClean, '^(OB|FC|FB|DB|UDT)(\d+)$')
+            if ($mDst.Success) {
+              $dstKind = $mDst.Groups[1].Value
+              $dstNum = $mDst.Groups[2].Value
+              $dstSpaced = "$dstKind $dstNum"
+              $srcText = [regex]::Replace(
+                $srcText,
+                '(?im)^(\s*(?:ORGANIZATION_BLOCK|FUNCTION_BLOCK|FUNCTION|DATA_BLOCK|TYPE)\s+)(?:"[^"]+"|(?:OB|FC|FB|DB|UDT)\s*\d+)',
+                "`${1}$dstSpaced",
+                1
+              )
+            }
+          }
+          [System.IO.File]::WriteAllText($tmpAwl, $srcText, [System.Text.Encoding]::Default)
+          $tmpSrcName = "MCP_COPY_$dstClean"
+          $srcItem = $null
+          foreach ($it in $dstCtx.sources.Next) {
+            if ($it.Name -ieq $tmpSrcName) { $srcItem = $it; break }
+          }
+          if ($null -eq $srcItem) {
+            try { $srcItem = $dstCtx.sources.Next.Add($tmpSrcName, 65, $tmpAwl) }
+            catch { $srcItem = $dstCtx.sources.Next.Add($tmpSrcName, 1122309, $tmpAwl) }
+          }
+          if ($srcItem.FilePath -and (Test-Path -LiteralPath (Split-Path -Parent $srcItem.FilePath))) {
+            Copy-Item -LiteralPath $tmpAwl -Destination $srcItem.FilePath -Force
+          }
+          $null = $srcItem.Compile()
+          try { $null = $srcItem.Remove() } catch {}
+          Get-Process S7kafapx -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -eq 0 } | Stop-Process -Force -ErrorAction SilentlyContinue
+          return @{
+            ok = $true
+            method = 'generate_source_and_compile'
+            source_block = $blkClean
+            target_block = $dstClean
+            source_project = [string]$srcCtx.project.Name
+            target_project = [string]$dstCtx.project.Name
+          }
         }
-        return @{
-          ok = $true
-          source_block = $blkClean
-          target_block = $dstClean
-          source_project = [string]$srcCtx.project.Name
-          target_project = [string]$dstCtx.project.Name
-        }
+      } finally {
+        if (Test-Path -LiteralPath $tmpAwl) { Remove-Item -LiteralPath $tmpAwl -Force -ErrorAction SilentlyContinue }
       }
     }
-    return @{ ok = $false; error = "Block '$blkClean' not found in source project '$($srcCtx.project.Name)'." }
+    # Fallback only when cross-project copy with no Sources container
+    $copiedObj = $srcObj.Copy($dstCtx.blocks)
+    if ($dstClean -ne '' -and $dstClean -ine $blkClean -and $null -ne $copiedObj) {
+      try { $copiedObj.Name = $dstClean } catch {}
+    }
+    return @{
+      ok = $true
+      method = 'com_copy'
+      source_block = $blkClean
+      target_block = $dstClean
+      source_project = [string]$srcCtx.project.Name
+      target_project = [string]$dstCtx.project.Name
+    }
   }
 
   if ($cmd -eq 'import_station_cfg') {
@@ -392,7 +544,7 @@ function Handle-Command($req) {
       if ($stationName -eq '' -or $cand.Name -ieq $stationName) { $st = $cand; break }
     }
     if ($null -eq $st) { return @{ ok = $false; error = "Station '$stationName' not found." } }
-    $st.Export($cfgPath)
+    $null = $st.Export($cfgPath)
     return @{ ok = [bool](Test-Path -LiteralPath $cfgPath); project_name = [string]$proj.Name; station_name = [string]$st.Name; cfg_path = $cfgPath }
   }
 
@@ -402,7 +554,11 @@ function Handle-Command($req) {
       return @{ ok = $false; error = 'SymbolTable not found in STEP 7 project.' }
     }
     $outFile = [string]$req.output_path
-    $ctx.program.SymbolTable.Export($outFile, 0)
+    try {
+      $null = $ctx.program.SymbolTable.Export($outFile)
+    } catch {
+      $null = $ctx.program.SymbolTable.Export($outFile, 0)
+    }
     return @{ ok = [bool](Test-Path -LiteralPath $outFile); project_name = [string]$ctx.project.Name; output_path = $outFile }
   }
 
@@ -412,14 +568,30 @@ function Handle-Command($req) {
       return @{ ok = $false; error = 'SymbolTable not found in STEP 7 project.' }
     }
     $inFile = [string]$req.input_path
-    $ctx.program.SymbolTable.Import($inFile, 1)
+    try {
+      $null = $ctx.program.SymbolTable.Import($inFile, 1)
+    } catch {
+      $null = $ctx.program.SymbolTable.Import($inFile)
+    }
     return @{ ok = $true; project_name = [string]$ctx.project.Name }
   }
 
   if ($cmd -eq 'download_blocks') {
+    $pgpc = Get-PgPcInterface
     $ctx = Find-ProjectAndProgram ([string]$req.project_name)
-    if ($null -eq $ctx.program) { return @{ ok = $false; error = 'Program not found for download.' } }
-    $mode = if ($null -eq $req.overwrite -or [bool]$req.overwrite) { 1 } else { 0 }
+    if ($null -eq $ctx.program) {
+      return @{
+        ok = $false
+        error = 'Program not found for download.'
+        pgpc_interface = $pgpc
+      }
+    }
+    # Siemens STEP 7 Command Interface S7OverwriteMode enum:
+    #   S7AskUser = 0 (BLOCKS headless COM with a modal dialog!)
+    #   S7OverwriteAll = 1
+    #   S7DoNotOverwrite = 2
+    $mode = if ($null -eq $req.overwrite -or [bool]$req.overwrite) { 1 } else { 2 }
+    $targetScope = if ($req.download_target) { ([string]$req.download_target).Trim().ToLower() } else { 'blocks' }
     $reqBlocks = @()
     if ($null -ne $req.blocks) {
       foreach ($rb in $req.blocks) {
@@ -427,38 +599,175 @@ function Handle-Command($req) {
         if ($c -ne '') { $reqBlocks += $c.ToUpper() }
       }
     }
+
+    $hint = if ($pgpc.is_plcsim) {
+      "Windows PG/PC Interface S7ONLINE is currently set to '$($pgpc.device_name)' (PLCSIM). For a physical PLC, open 'Set PG/PC Interface' in Windows Control Panel and set S7ONLINE to TCP/IP (Auto) or your MPI/PROFIBUS PC Adapter."
+    } else {
+      "Verify: (1) S7ONLINE PG/PC Interface matches your physical PLC cable/NIC (currently '$($pgpc.device_name)'), (2) Hardware Config station IP/MPI address matches the CPU, (3) CPU keyswitch is in RUN-P or STOP (not RUN-only), and (4) blocks are compiled."
+    }
+
+    if ($targetScope -eq 'station') {
+      if ($null -eq $ctx.station) {
+        return @{
+          ok = $false
+          scope = 'station'
+          error = 'No SIMATIC Station found in project for full station (HW + blocks) download. Import hardware configuration first or use download_target="blocks".'
+          pgpc_interface = $pgpc
+          troubleshooting_hint = $hint
+        }
+      }
+      try {
+        $null = $ctx.station.Download($mode)
+        return @{
+          ok = $true
+          scope = 'station'
+          method = 'station.Download'
+          project_name = [string]$ctx.project.Name
+          station_name = [string]$ctx.station.Name
+          program_name = [string]$ctx.program.Name
+          overwrite_mode = $mode
+          pgpc_interface = $pgpc
+        }
+      } catch {
+        return @{
+          ok = $false
+          scope = 'station'
+          project_name = [string]$ctx.project.Name
+          station_name = [string]$ctx.station.Name
+          error = "Station download failed: $($_.Exception.Message)"
+          pgpc_interface = $pgpc
+          troubleshooting_hint = $hint
+        }
+      }
+    }
+
     if ($reqBlocks.Count -eq 0 -or ($reqBlocks -contains '*') -or ($reqBlocks -contains 'ALL')) {
-      $ctx.program.Download($mode)
+      $attemptErrors = @()
+      if ($targetScope -eq 'blocks' -and $null -ne $ctx.blocks) {
+        try {
+          $null = $ctx.blocks.Download($mode)
+          return @{
+            ok = $true
+            scope = 'all_blocks'
+            method = 'blocks.Download'
+            project_name = [string]$ctx.project.Name
+            program_name = [string]$ctx.program.Name
+            overwrite_mode = $mode
+            pgpc_interface = $pgpc
+          }
+        } catch {
+          $attemptErrors += "blocks.Download: $($_.Exception.Message)"
+        }
+      }
+      try {
+        $null = $ctx.program.Download($mode)
+        return @{
+          ok = $true
+          scope = 'full_program'
+          method = 'program.Download'
+          project_name = [string]$ctx.project.Name
+          program_name = [string]$ctx.program.Name
+          overwrite_mode = $mode
+          pgpc_interface = $pgpc
+          fallback_notes = $attemptErrors
+        }
+      } catch {
+        $attemptErrors += "program.Download: $($_.Exception.Message)"
+      }
+      # Final fallback: per-block download so partial progress & exact failing block are reported
+      if ($null -ne $ctx.blocks) {
+        $dlOk = @()
+        $dlFail = @()
+        foreach ($b in $ctx.blocks.Next) {
+          $bName = [string]$b.Name
+          if ($bName -match '^(SFC|SFB)\d+$') { continue }
+          try {
+            $null = $b.Download($mode)
+            $dlOk += $bName
+          } catch {
+            $dlFail += @{ block = $bName; error = $_.Exception.Message }
+          }
+        }
+        if ($dlOk.Count -gt 0 -and $dlFail.Count -eq 0) {
+          return @{
+            ok = $true
+            scope = 'all_blocks_iterated'
+            method = 'per_block.Download'
+            project_name = [string]$ctx.project.Name
+            program_name = [string]$ctx.program.Name
+            downloaded_blocks = $dlOk
+            overwrite_mode = $mode
+            pgpc_interface = $pgpc
+            fallback_notes = $attemptErrors
+          }
+        }
+        return @{
+          ok = $false
+          scope = 'all_blocks_iterated'
+          project_name = [string]$ctx.project.Name
+          program_name = [string]$ctx.program.Name
+          downloaded_blocks = $dlOk
+          failed_blocks = $dlFail
+          error = ($attemptErrors -join ' | ')
+          pgpc_interface = $pgpc
+          troubleshooting_hint = $hint
+        }
+      }
       return @{
-        ok = $true
+        ok = $false
         scope = 'full_program'
         project_name = [string]$ctx.project.Name
         program_name = [string]$ctx.program.Name
+        error = ($attemptErrors -join ' | ')
+        pgpc_interface = $pgpc
+        troubleshooting_hint = $hint
       }
     }
-    if ($null -eq $ctx.blocks) { return @{ ok = $false; error = 'Blocks container not found for selective download.' } }
+
+    if ($null -eq $ctx.blocks) {
+      return @{
+        ok = $false
+        error = 'Blocks container not found for selective download.'
+        pgpc_interface = $pgpc
+      }
+    }
     $downloaded = @()
     $missing = @()
+    $failed = @()
     foreach ($want in $reqBlocks) {
       $hit = $null
       foreach ($b in $ctx.blocks.Next) {
         if (($b.Name -replace '\s+', '') -ieq $want) { $hit = $b; break }
       }
       if ($null -ne $hit) {
-        $hit.Download($mode)
-        $downloaded += [string]$hit.Name
+        try {
+          $null = $hit.Download($mode)
+          $downloaded += [string]$hit.Name
+        } catch {
+          $failed += @{ block = [string]$hit.Name; error = $_.Exception.Message }
+        }
       } else {
         $missing += $want
       }
     }
+    $errParts = @()
+    if ($missing.Count -gt 0) { $errParts += "Blocks not found: $($missing -join ', ')" }
+    if ($failed.Count -gt 0) {
+      $fNames = ($failed | ForEach-Object { "$($_.block): $($_.error)" }) -join '; '
+      $errParts += "COM download errors: $fNames"
+    }
     return @{
-      ok = ($downloaded.Count -gt 0 -and $missing.Count -eq 0)
+      ok = ($downloaded.Count -gt 0 -and $missing.Count -eq 0 -and $failed.Count -eq 0)
       scope = 'selective_blocks'
       project_name = [string]$ctx.project.Name
       program_name = [string]$ctx.program.Name
+      overwrite_mode = $mode
       downloaded_blocks = $downloaded
       missing_blocks = $missing
-      error = if ($missing.Count -gt 0) { "Blocks not found for download: $($missing -join ', ')" } else { $null }
+      failed_blocks = $failed
+      pgpc_interface = $pgpc
+      troubleshooting_hint = if ($errParts.Count -gt 0) { $hint } else { $null }
+      error = if ($errParts.Count -gt 0) { $errParts -join ' | ' } else { $null }
     }
   }
 
@@ -682,10 +991,14 @@ while ($true) {
   try {
     $req = $trimmed | ConvertFrom-Json
     $resp = Handle-Command $req
+    if ($resp -is [System.Array]) {
+      $dictResp = $resp | Where-Object { $_ -is [hashtable] } | Select-Object -Last 1
+      if ($null -ne $dictResp) { $resp = $dictResp }
+    }
     $jsonOut = ($resp | ConvertTo-Json -Compress -Depth 8)
     [Console]::Out.WriteLine($jsonOut)
     [Console]::Out.Flush()
-    if ($resp.shutting_down) { break }
+    if ($resp -is [hashtable] -and $resp.shutting_down) { break }
   } catch {
     $errOut = (@{ ok = $false; error = $_.Exception.Message } | ConvertTo-Json -Compress)
     [Console]::Out.WriteLine($errOut)
@@ -715,6 +1028,7 @@ class PersistentComWorker:
     ) -> None:
         self._lock = threading.RLock()
         self._proc: Optional[subprocess.Popen] = None
+        self._temp_script_path: Optional[Path] = None
         self._fallback_ps_worker: Optional["PersistentComWorker"] = None
         self._mock_handler = mock_handler
         self._prefer_native = prefer_native
@@ -764,15 +1078,20 @@ class PersistentComWorker:
             self._backend_name = "native_cpp_x86"
         else:
             assert self._ps32_exe is not None
-            encoded = base64.b64encode(_PERSISTENT_PS32_DAEMON_SCRIPT.encode("utf-16le")).decode("ascii")
+            # Write daemon script to a temp .ps1 file to avoid Windows 32,767-char CreateProcess limit ([WinError 206])
+            fd, tmp_name = tempfile.mkstemp(prefix="s7_com_worker_", suffix=".ps1")
+            os.close(fd)
+            script_path = Path(tmp_name)
+            script_path.write_text(_PERSISTENT_PS32_DAEMON_SCRIPT, encoding="utf-8-sig")
+            self._temp_script_path = script_path
             cmd = [
                 str(self._ps32_exe),
                 "-NoProfile",
                 "-NonInteractive",
                 "-ExecutionPolicy",
                 "Bypass",
-                "-EncodedCommand",
-                encoded,
+                "-File",
+                str(script_path),
             ]
             self._backend_name = "ps32_persistent_daemon"
 
@@ -793,7 +1112,7 @@ class PersistentComWorker:
                 self._kill_locked()
                 return False, "Persistent 32-bit COM worker did not send ready banner."
             banner = json.loads(ready_line)
-            if not banner.get("ok"):
+            if not isinstance(banner, dict) or not banner.get("ok"):
                 self._kill_locked()
                 return False, f"COM worker failed startup: {banner}"
             return True, None
@@ -820,19 +1139,25 @@ class PersistentComWorker:
         return result[0]
 
     def _kill_locked(self) -> None:
-        if self._proc is None:
-            return
-        try:
-            if self._proc.poll() is None:
-                self._proc.terminate()
-                try:
-                    self._proc.wait(timeout=1.5)
-                except subprocess.TimeoutExpired:
-                    self._proc.kill()
-        except Exception:
-            pass
-        finally:
-            self._proc = None
+        if self._proc is not None:
+            try:
+                if self._proc.poll() is None:
+                    self._proc.terminate()
+                    try:
+                        self._proc.wait(timeout=1.5)
+                    except subprocess.TimeoutExpired:
+                        self._proc.kill()
+            except OSError:
+                pass
+            finally:
+                self._proc = None
+        if self._temp_script_path is not None:
+            try:
+                self._temp_script_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            finally:
+                self._temp_script_path = None
 
     def stop(self) -> None:
         with self._lock:
@@ -919,6 +1244,17 @@ class PersistentComWorker:
                             "latency_ms": round((time.perf_counter() - t0) * 1000.0, 2),
                         }
                     parsed = json.loads(line.strip())
+                    if isinstance(parsed, list):
+                        dict_items = [item for item in parsed if isinstance(item, dict)]
+                        parsed = dict_items[-1] if dict_items else {
+                            "ok": False,
+                            "error": f"Unexpected list response from 32-bit COM worker: {parsed!r}",
+                        }
+                    if not isinstance(parsed, dict):
+                        parsed = {
+                            "ok": False,
+                            "error": f"Unexpected non-object JSON response from 32-bit COM worker: {type(parsed).__name__}",
+                        }
                     if parsed.get("fallback_required") and self._backend_name == "native_cpp_x86" and self._ps32_exe is not None:
                         return self._delegate_to_ps32_fallback(payload, timeout=timeout)
                     parsed["latency_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)

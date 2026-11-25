@@ -1,6 +1,7 @@
 import http from "node:http";
 
 const PORT = Number(process.env.PORT || 3000);
+const HOST = process.env.HOST || "0.0.0.0";
 
 const server = http.createServer((req, res) => {
   if (req.url === "/api/health") {
@@ -23,6 +24,6 @@ const server = http.createServer((req, res) => {
   );
 });
 
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`SIMATIC STEP 7 MCP health stub listening on http://0.0.0.0:${PORT}`);
+server.listen(PORT, HOST, () => {
+  console.log(`SIMATIC STEP 7 MCP health stub listening on http://${HOST}:${PORT}`);
 });

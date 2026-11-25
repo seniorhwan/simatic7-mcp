@@ -31,6 +31,7 @@ class FailureCategory(str, Enum):
     WRITE_GUARDRAIL_BLOCKED = "write_guardrail_blocked"
     ACCESS_DENIED = "access_denied"
     TARGET_NOT_FOUND = "target_not_found"
+    ALREADY_EXISTS = "already_exists"
     COMPILE_FAILED = "compile_failed"
     READBACK_MISMATCH = "readback_mismatch"
     BACKUP_FAILED = "backup_failed"

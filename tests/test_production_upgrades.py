@@ -20,6 +20,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from unittest import mock
+
 import simatic_s7_mcp_server as SERVER
 from simatic_s7_mcp import (
     AccessMode,
@@ -27,14 +29,10 @@ from simatic_s7_mcp import (
     EnhancedS7LoopbackServer,
     FailureCategory,
     PersistentComWorker,
-    S7ConnectionPool,
     StationHardwareConfig,
-    VirtualS7PLC,
-    WatchTableMonitor,
     compute_content_hash,
     generate_client_config,
     parse_station_cfg,
-    run_doctor,
 )
 
 
@@ -1172,6 +1170,244 @@ END_ORGANIZATION_BLOCK
         self.assertTrue(direct_net["success"], direct_net)
         st = json.loads(SERVER.s7_virtual_plc_step(write_inputs={"I0.0": True}, read_addresses=["Q0.7"]))
         self.assertTrue(st["observed"]["Q0.7"])
+
+
+class TestAuditRemediationBugs01To14(unittest.TestCase):
+    """Regression suite covering every bug from the empirical feature audit (BUG-01..BUG-14)."""
+
+    def test_bug01_com_worker_uses_ps1_file_not_encoded_command(self):
+        from simatic_s7_mcp.com_worker import _PERSISTENT_PS32_DAEMON_SCRIPT
+        # Ensure daemon script is well above the 8 KB EncodedCommand UTF-16LE limit and uses -File
+        self.assertGreater(len(_PERSISTENT_PS32_DAEMON_SCRIPT), 8000)
+        worker = PersistentComWorker()
+        captured_argv = []
+
+        class _FakeProc:
+            def __init__(self, argv):
+                captured_argv.extend(argv)
+                self.stdin = mock.MagicMock()
+                self.stdout = mock.MagicMock()
+                self.stdout.readline.return_value = '{"ok": true, "ready": true, "pid": 999}\n'
+                self.stderr = mock.MagicMock()
+                self.pid = 999
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        worker._native_exe = Path("/nonexistent/s7_com_bridge.exe")
+        worker._ps32_exe = Path("/fake/powershell.exe")
+        with mock.patch("simatic_s7_mcp.com_worker.sys.platform", "win32"), \
+             mock.patch("simatic_s7_mcp.com_worker.subprocess.Popen", side_effect=lambda argv, **kw: _FakeProc(argv)):
+            ok, err = worker._start_locked()
+            self.assertTrue(ok, err)
+            self.assertIn("-File", captured_argv)
+            self.assertNotIn("-EncodedCommand", captured_argv)
+            ps1_path = Path(captured_argv[captured_argv.index("-File") + 1])
+            self.assertTrue(ps1_path.is_file())
+            worker._kill_locked()
+            self.assertFalse(ps1_path.exists())
+
+    def test_bug02_com_create_project_already_exists_and_station_codes(self):
+        from simatic_s7_mcp.com_worker import _PERSISTENT_PS32_DAEMON_SCRIPT
+        self.assertEqual(FailureCategory.ALREADY_EXISTS.value, "already_exists")
+        self.assertIn("failure_category = 'already_exists'", _PERSISTENT_PS32_DAEMON_SCRIPT)
+        self.assertIn("S7300Station=30, S7400Station=31, S7PCStation=32", _PERSISTENT_PS32_DAEMON_SCRIPT)
+        self.assertIn("station_error", _PERSISTENT_PS32_DAEMON_SCRIPT)
+
+        # Verify s7_com_create_project propagates top-level failure_category
+        with mock.patch.object(
+            SERVER.controller.com_bridge,
+            "create_project",
+            return_value=(False, "Project 'DupProj' already exists.", {"ok": False, "failure_category": "already_exists"}),
+        ):
+            res = json.loads(SERVER.s7_com_create_project(project_name="DupProj"))
+            self.assertFalse(res["success"])
+            self.assertEqual(res["failure_category"], "already_exists")
+
+    def test_bug03_and_bug08_flat_step7_cfg_and_classic_cpu314(self):
+        # BUG-08: Classic CPU 314-1AE04-0AB0 must be in catalog
+        search_res = json.loads(SERVER.s7_hw_catalog_search(query="314-1AE04"))
+        self.assertTrue(search_res["success"])
+        self.assertTrue(any(m["mlfb"] == "6ES7 314-1AE04-0AB0" for m in search_res["modules"]))
+
+        # BUG-03: Flat STEP 7 V5.x grammar with quoted firmware and closed STATION block before RACK/SLOT
+        cfg = StationHardwareConfig(station_name="SIMATIC 300(1)", plc_family="S7-300")
+        self.assertTrue(cfg.add_module(slot=1, module="6ES7 307-1EA01-0AA0")[0])
+        self.assertTrue(cfg.add_module(slot=2, module="6ES7 314-1AE04-0AB0")[0])
+        self.assertTrue(cfg.add_module(slot=4, module="6ES7 321-1BL00-0AA0")[0])
+        cfg_text = cfg.generate_cfg()
+
+        self.assertIn('RACK 0, "6ES7 390-1???0-0AA0", "UR"', cfg_text)
+        self.assertIn('RACK 0, SLOT 2, "6ES7 314-1AE04-0AB0" "V1.2", "CPU 314"', cfg_text)
+        # STATION block must close with END before RACK 0 begins
+        station_pos = cfg_text.index("STATION S7300")
+        rack_pos = cfg_text.index('RACK 0, "6ES7 390')
+        self.assertIn("\nEND\n", cfg_text[station_pos:rack_pos])
+
+        # Round-trip parse_station_cfg must preserve quoted firmware & slots
+        parsed = parse_station_cfg(cfg_text)
+        self.assertEqual(parsed.station_name, "SIMATIC 300(1)")
+        by_slot = {m.slot: m for m in parsed.modules}
+        self.assertEqual(by_slot[2].mlfb, "6ES7 314-1AE04-0AB0")
+        self.assertEqual(by_slot[2].firmware, "V1.2")
+        self.assertEqual(by_slot[4].mlfb, "6ES7 321-1BL00-0AA0")
+
+    def test_bug04_com_worker_guards_non_dict_json_and_suppresses_com_output(self):
+        from simatic_s7_mcp.com_worker import _PERSISTENT_PS32_DAEMON_SCRIPT
+        self.assertIn("$null = $found.GenerateSource($outFile, 0)", _PERSISTENT_PS32_DAEMON_SCRIPT)
+        self.assertIn("$null = $ctx.program.SymbolTable.Export($outFile)", _PERSISTENT_PS32_DAEMON_SCRIPT)
+        self.assertIn("$null = $ctx.program.SymbolTable.Import($inFile, 1)", _PERSISTENT_PS32_DAEMON_SCRIPT)
+
+        # Python side must gracefully unwrap [..., {dict}] JSON arrays instead of crashing with AttributeError
+        worker = PersistentComWorker()
+        fake_proc = mock.MagicMock()
+        fake_proc.poll.return_value = None
+        fake_proc.stdin = mock.MagicMock()
+        fake_proc.stdout = mock.MagicMock()
+        fake_proc.stdout.readline.return_value = '[null, {"ok": true, "symbol_count": 5}]\n'
+        worker._proc = fake_proc
+        res = worker.call("export_symbols", {"output_path": "x.sdf"})
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["symbol_count"], 5)
+
+        # Pure non-dict JSON returns structured error dict
+        fake_proc.stdout.readline.return_value = '[1, 2, 3]\n'
+        res_bad = worker.call("export_symbols", {"output_path": "x.sdf"})
+        self.assertFalse(res_bad["ok"])
+        self.assertIn("Unexpected list response", res_bad["error"])
+
+    def test_bug05_copy_block_non_modal_and_graph_scl_offline_default(self):
+        from simatic_s7_mcp.com_worker import _PERSISTENT_PS32_DAEMON_SCRIPT
+        # copy_block uses GenerateSource + header rewrite + Compile rather than modal Copy()
+        self.assertIn("method = 'generate_source_and_compile'", _PERSISTENT_PS32_DAEMON_SCRIPT)
+
+        # Even if COM bridge reports available, s7_write_graph_block & s7_write_scl_block default to offline when project_name is omitted
+        with mock.patch.object(SERVER.controller.com_bridge, "is_available", return_value=True), \
+             mock.patch.object(SERVER.controller.com_bridge, "import_and_compile_awl") as mock_compile:
+            gr7 = json.loads(SERVER.s7_write_graph_block(
+                fb_number=12,
+                steps=[{"number": 1, "name": "S_INIT", "initial": True, "actions": [{"qualifier": "N", "operand": "Q 0.0"}]}],
+                transitions=[{"number": 1, "name": "T_LOOP", "from_step": 1, "to_step": 1, "condition": "I 0.0"}],
+            ))
+            self.assertTrue(gr7["success"])
+            self.assertEqual(gr7["mode"], "offline")
+            self.assertIn("gr7_source", gr7)
+            mock_compile.assert_not_called()
+
+            scl = json.loads(SERVER.s7_write_scl_block(
+                scl_code="FUNCTION FC 12 : VOID\nBEGIN\n  Q0.0 := I0.0;\nEND_FUNCTION\n",
+                block_name="FC12",
+            ))
+            self.assertTrue(scl["success"])
+            self.assertEqual(scl["mode"], "offline")
+            mock_compile.assert_not_called()
+
+    def test_bug06_list_blocks_db_language_mapping(self):
+        fake_worker_res = {
+            "ok": True,
+            "project_name": "PlantA",
+            "blocks": [
+                {"name": "OB1", "concrete_type": 1138945, "language": "LAD"},
+                {"name": "DB10", "concrete_type": 1138947, "language": "STL"},
+                {"name": "SDB0", "concrete_type": 1138955, "language": ""},
+                {"name": "UDT1", "concrete_type": 1138949, "language": "STL"},
+            ],
+        }
+        with mock.patch.object(SERVER.controller.com_bridge.worker, "call", return_value=fake_worker_res):
+            ok, blocks, _ = SERVER.controller.com_bridge.list_blocks(project_name="PlantA")
+            self.assertTrue(ok)
+            by_name = {b["name"]: b["language"] for b in blocks}
+            self.assertEqual(by_name["OB1"], "LAD")
+            self.assertEqual(by_name["DB10"], "DB")
+            self.assertEqual(by_name["SDB0"], "SDB")
+            self.assertEqual(by_name["UDT1"], "UDT")
+
+    def test_bug09_multi_block_program_analysis_eliminates_false_positives(self):
+        # FC1 sets M10.0 and starts T1; FC2 resets M10.0 and reads T1
+        blocks = {
+            "FC1": [
+                {"title": "Start Latch", "instructions": ["A I 0.0", "S M 10.0", "L S5T#5S", "SD T 1"]},
+            ],
+            "FC2": [
+                {"title": "Reset & Timer Contact", "instructions": ["A T 1", "R M 10.0", "A M 10.0", "= Q 0.0"]},
+            ],
+        }
+        res = json.loads(SERVER.s7_analyze_program(blocks=blocks, plc_type="S7-300"))
+        self.assertTrue(res["success"])
+        self.assertEqual(res["safety_score"], 100, res)
+        self.assertEqual(res["warnings"], [])
+        self.assertEqual(res["hazards"], [])
+        self.assertEqual(res["analyzed_blocks"], ["FC1", "FC2"])
+
+    def test_bug10_offline_create_open_project_and_open_block_in_custom_path(self):
+        orig_name = SERVER.controller.project_name
+        orig_dir = SERVER.controller.project_dir
+        orig_off = SERVER.controller.is_offline_project
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                cr = json.loads(SERVER.s7_create_project(
+                    project_name="AuditOfflineProj",
+                    plc_type="S7-300",
+                    project_path=td,
+                    launch_if_closed=False,
+                ))
+                self.assertTrue(cr["success"], cr)
+                expected_dir = Path(td).resolve() / "AuditOfflineProj"
+                self.assertTrue((expected_dir / "AuditOfflineProj.s7p").is_file())
+                self.assertTrue((expected_dir / "Blocks" / "OB1.awl").is_file())
+
+                op = json.loads(SERVER.s7_open_project(
+                    project_path_or_name=str(expected_dir),
+                    launch_if_closed=False,
+                ))
+                self.assertTrue(op["success"], op)
+                self.assertEqual(op["project"]["project_name"], "AuditOfflineProj")
+
+                ob = json.loads(SERVER.s7_open_block(block_name="OB1"))
+                self.assertTrue(ob["success"], ob)
+                self.assertEqual(ob["details"]["mode"], "offline")
+                self.assertTrue(Path(ob["details"]["block_path"]).is_file())
+        finally:
+            SERVER.controller.project_name = orig_name
+            SERVER.controller.project_dir = orig_dir
+            SERVER.controller.is_offline_project = orig_off
+
+    def test_bug11_standardized_response_keys(self):
+        sym_res = json.loads(SERVER.s7_write_symbol_table(symbols={"START_PB": "I 0.0", "MOTOR_Q": "Q 0.0"}))
+        self.assertTrue(sym_res["success"])
+        self.assertIn("sdf_path", sym_res)
+        self.assertIn("asc_path", sym_res)
+        self.assertIn("csv_path", sym_res)
+        self.assertEqual(sym_res["sdf_path"], sym_res["symbol_sdf_path"])
+
+        sample_awl = "ORGANIZATION_BLOCK OB 1\nBEGIN\nNETWORK\n  A I 0.0;\n  = Q 0.0;\nEND_ORGANIZATION_BLOCK\n"
+        def _fake_export(block_name, output_path, project_name=None):
+            Path(output_path).write_text(sample_awl, encoding="utf-8")
+            return True, "Exported"
+
+        with mock.patch.object(SERVER.controller.com_bridge, "export_block_to_awl", side_effect=_fake_export):
+            rd = json.loads(SERVER.s7_com_read_block(block_name="OB1", project_name="PlantA"))
+            self.assertTrue(rd["success"])
+            self.assertEqual(rd["awl_source"], sample_awl)
+            self.assertEqual(rd["raw_awl"], sample_awl)
+
+    def test_bug12_spawn_detached_never_uses_shell_true(self):
+        with mock.patch("simatic_s7_mcp_server.subprocess.Popen") as mock_popen:
+            ok = SERVER.spawn_detached_siemens_process('"/fake/path/s7tgtopx.exe" "/fake/proj.s7p"')
+            self.assertTrue(ok)
+            mock_popen.assert_called_once()
+            args, kwargs = mock_popen.call_args
+            self.assertIsInstance(args[0], list)
+            self.assertFalse(kwargs.get("shell", True))
 
 
 if __name__ == "__main__":

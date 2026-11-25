@@ -13,6 +13,8 @@ Provides:
 
 from __future__ import annotations
 
+import csv
+import json
 import math
 import re
 import socket
@@ -21,7 +23,8 @@ import struct
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -288,8 +291,28 @@ def wrap_tpkt_cotp_dt(s7_pdu: bytes) -> bytes:
     return struct.pack(">BBH", 0x03, 0x00, total) + cotp + s7_pdu
 
 
-def build_cotp_cr(rack: int, slot: int) -> bytes:
-    tsap_dst = 0x0100 | ((rack & 0x07) << 5) | (slot & 0x1F)
+S7_CONN_TYPES: Dict[str, int] = {
+    "PG": 0x01,
+    "OP": 0x02,
+    "S7_BASIC": 0x03,
+}
+
+S7_BLOCK_TYPE_CODES: Dict[str, int] = {
+    "OB": 0x38,
+    "DB": 0x41,
+    "SDB": 0x42,
+    "FC": 0x43,
+    "SFC": 0x44,
+    "FB": 0x45,
+    "SFB": 0x46,
+}
+
+S7_BLOCK_TYPE_NAMES: Dict[int, str] = {v: k for k, v in S7_BLOCK_TYPE_CODES.items()}
+
+
+def build_cotp_cr(rack: int, slot: int, connection_type: str = "PG") -> bytes:
+    conn_code = S7_CONN_TYPES.get((connection_type or "PG").strip().upper(), 0x01)
+    tsap_dst = (conn_code << 8) | ((rack & 0x07) << 5) | (slot & 0x1F)
     cotp = (
         bytes([0x11, 0xE0, 0x00, 0x00, 0x00, 0x01, 0x00])
         + bytes([0xC0, 0x01, 0x0A])
@@ -374,6 +397,22 @@ def build_szl_read_pdu(szl_id: int, szl_index: int = 0, pdu_ref: int = 1) -> byt
     return wrap_tpkt_cotp_dt(header + param + data)
 
 
+def build_list_blocks_count_pdu(pdu_ref: int = 1) -> bytes:
+    # S7comm Userdata (0x07), Block functions (group 3 -> 0x43), List blocks count (subfunction 1)
+    param = bytes([0x00, 0x01, 0x12, 0x04, 0x11, 0x43, 0x01, 0x00])
+    data = bytes([0x0A, 0x00, 0x00, 0x00])
+    header = struct.pack(">BBHHHH", 0x32, 0x07, 0x0000, pdu_ref & 0xFFFF, len(param), len(data))
+    return wrap_tpkt_cotp_dt(header + param + data)
+
+
+def build_list_blocks_of_type_pdu(block_type_code: int, pdu_ref: int = 1) -> bytes:
+    # S7comm Userdata (0x07), Block functions (group 3 -> 0x43), List blocks of type (subfunction 2)
+    param = bytes([0x00, 0x01, 0x12, 0x04, 0x11, 0x43, 0x02, 0x00])
+    data = bytes([0xFF, 0x09, 0x00, 0x02, 0x30, block_type_code & 0xFF])
+    header = struct.pack(">BBHHHH", 0x32, 0x07, 0x0000, pdu_ref & 0xFFFF, len(param), len(data))
+    return wrap_tpkt_cotp_dt(header + param + data)
+
+
 def build_cpu_control_pdu(action: str, pdu_ref: int = 1) -> bytes:
     act = action.strip().upper()
     if act == "STOP":
@@ -425,6 +464,7 @@ class _PooledS7Conn:
     slot: int
     sock: socket.socket
     negotiated_pdu: int = 240
+    connection_type: str = "PG"
     pdu_ref: int = 1
     last_used: float = field(default_factory=time.monotonic)
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -440,6 +480,80 @@ class _PooledS7Conn:
             pass
 
 
+def _chunk_read_specs(
+    parsed_specs: Sequence[Tuple[Dict[str, Any], ParsedS7Address]],
+    negotiated_pdu: int,
+    max_items_per_pdu: int = 16,
+) -> List[List[Tuple[Dict[str, Any], ParsedS7Address]]]:
+    """Split Read Var items so neither request nor response exceeds the CPU's negotiated PDU (e.g. 240B on S7-300)."""
+    pdu_budget = max(64, int(negotiated_pdu) - 4)
+    chunks: List[List[Tuple[Dict[str, Any], ParsedS7Address]]] = []
+    cur: List[Tuple[Dict[str, Any], ParsedS7Address]] = []
+    req_bytes = 12   # 10B S7 job header + 2B Read Var param header
+    resp_bytes = 14  # 12B S7 Ack_Data header + 2B Read Var param header
+    cap = max(1, int(max_items_per_pdu))
+
+    for spec in parsed_specs:
+        addr = spec[1]
+        item_req = 12
+        payload_len = 1 if addr.data_type == "BOOL" else addr.byte_length
+        padded_len = ((payload_len + 1) // 2) * 2
+        item_resp = 4 + padded_len
+        if cur and (
+            len(cur) >= cap
+            or (req_bytes + item_req) > pdu_budget
+            or (resp_bytes + item_resp) > pdu_budget
+        ):
+            chunks.append(cur)
+            cur = []
+            req_bytes = 12
+            resp_bytes = 14
+        cur.append(spec)
+        req_bytes += item_req
+        resp_bytes += item_resp
+
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def _chunk_write_specs(
+    encoded_specs: Sequence[Tuple[Dict[str, Any], ParsedS7Address, bytes]],
+    negotiated_pdu: int,
+    max_items_per_pdu: int = 12,
+) -> List[List[Tuple[Dict[str, Any], ParsedS7Address, bytes]]]:
+    """Split Write Var items so the request stays strictly inside the CPU's negotiated PDU (e.g. 240B on S7-300)."""
+    pdu_budget = max(64, int(negotiated_pdu) - 4)
+    chunks: List[List[Tuple[Dict[str, Any], ParsedS7Address, bytes]]] = []
+    cur: List[Tuple[Dict[str, Any], ParsedS7Address, bytes]] = []
+    req_bytes = 12   # 10B S7 job header + 2B Write Var param header
+    resp_bytes = 14  # 12B S7 Ack_Data header + 2B Write Var param header
+    cap = max(1, int(max_items_per_pdu))
+
+    for spec in encoded_specs:
+        _, addr, raw = spec
+        payload_len = 1 if addr.data_type == "BOOL" else len(raw)
+        padded_len = ((payload_len + 1) // 2) * 2
+        item_req = 12 + 4 + padded_len
+        item_resp = 1
+        if cur and (
+            len(cur) >= cap
+            or (req_bytes + item_req) > pdu_budget
+            or (resp_bytes + item_resp) > pdu_budget
+        ):
+            chunks.append(cur)
+            cur = []
+            req_bytes = 12
+            resp_bytes = 14
+        cur.append(spec)
+        req_bytes += item_req
+        resp_bytes += item_resp
+
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
 class S7ConnectionPool:
     """Thread-safe RFC1006/S7comm connection pool eliminating per-read TCP handshakes."""
 
@@ -451,36 +565,65 @@ class S7ConnectionPool:
         self.connect_count = 0
         self.reuse_count = 0
 
-    def _open_conn(self, host: str, port: int, rack: int, slot: int, timeout_s: float) -> _PooledS7Conn:
-        sock = socket.create_connection((host, port), timeout=timeout_s)
-        sock.settimeout(timeout_s)
-        try:
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        except Exception:
-            pass
-        # 1. COTP Connection Request
-        sock.sendall(build_cotp_cr(rack, slot))
-        cc = recv_tpkt(sock)
-        if len(cc) < 6 or cc[5] != 0xD0:
-            sock.close()
-            raise ConnectionError("PLC rejected COTP Connection Request")
-        # 2. S7 Setup Communication
-        sock.sendall(build_s7_setup_comm(pdu_ref=1, max_pdu=480))
-        setup_resp = recv_tpkt(sock)
-        _, err, param, _ = parse_s7_ack_data(setup_resp)
-        if err != 0:
-            sock.close()
-            raise ConnectionError(f"S7 Setup Communication error: 0x{err:04X}")
-        neg_pdu = struct.unpack(">H", param[6:8])[0] if len(param) >= 8 else 240
-        self.connect_count += 1
-        return _PooledS7Conn(
-            host=host,
-            port=port,
-            rack=rack,
-            slot=slot,
-            sock=sock,
-            negotiated_pdu=max(240, neg_pdu),
-        )
+    def _open_conn(
+        self,
+        host: str,
+        port: int,
+        rack: int,
+        slot: int,
+        timeout_s: float,
+        connection_type: str = "AUTO",
+    ) -> _PooledS7Conn:
+        ct_up = (connection_type or "AUTO").strip().upper()
+        candidates = ["PG", "OP", "S7_BASIC"] if ct_up == "AUTO" else [ct_up if ct_up in S7_CONN_TYPES else "PG"]
+        last_cotp_err: Optional[Exception] = None
+
+        for idx, cand_type in enumerate(candidates):
+            try:
+                sock = socket.create_connection((host, port), timeout=timeout_s)
+            except OSError:
+                # Physical TCP endpoint unreachable — fail immediately without retrying other TSAPs
+                raise
+            sock.settimeout(timeout_s)
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except Exception:
+                pass
+            try:
+                # 1. COTP Connection Request
+                sock.sendall(build_cotp_cr(rack, slot, connection_type=cand_type))
+                cc = recv_tpkt(sock)
+                if len(cc) < 6 or cc[5] != 0xD0:
+                    raise ConnectionError(
+                        f"PLC rejected COTP Connection Request (TSAP type={cand_type}, rack={rack}, slot={slot})"
+                    )
+                # 2. S7 Setup Communication
+                sock.sendall(build_s7_setup_comm(pdu_ref=1, max_pdu=480))
+                setup_resp = recv_tpkt(sock)
+                _, err, param, _ = parse_s7_ack_data(setup_resp)
+                if err != 0:
+                    raise ConnectionError(f"S7 Setup Communication error: 0x{err:04X}")
+                neg_pdu = struct.unpack(">H", param[6:8])[0] if len(param) >= 8 else 240
+                self.connect_count += 1
+                return _PooledS7Conn(
+                    host=host,
+                    port=port,
+                    rack=rack,
+                    slot=slot,
+                    sock=sock,
+                    negotiated_pdu=max(96, neg_pdu),
+                    connection_type=cand_type,
+                )
+            except Exception as exc:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+                last_cotp_err = exc
+                if idx == len(candidates) - 1:
+                    raise
+
+        raise last_cotp_err or ConnectionError("Failed to establish S7 COTP session")
 
     def acquire(
         self,
@@ -489,21 +632,24 @@ class S7ConnectionPool:
         rack: int = 0,
         slot: int = 2,
         timeout_s: Optional[float] = None,
+        connection_type: str = "AUTO",
     ) -> _PooledS7Conn:
         key = (host, int(port), int(rack), int(slot))
         t_out = timeout_s if timeout_s is not None else self.default_timeout_s
+        ct_up = (connection_type or "AUTO").strip().upper()
         now = time.monotonic()
         with self._lock:
             existing = self._conns.get(key)
             if existing is not None:
-                if (now - existing.last_used) <= self.idle_ttl_s and existing.sock.fileno() >= 0:
+                type_ok = (ct_up == "AUTO") or (existing.connection_type == ct_up)
+                if type_ok and (now - existing.last_used) <= self.idle_ttl_s and existing.sock.fileno() >= 0:
                     existing.sock.settimeout(t_out)
                     existing.last_used = now
                     self.reuse_count += 1
                     return existing
                 existing.close()
                 del self._conns[key]
-        conn = self._open_conn(host, int(port), int(rack), int(slot), t_out)
+        conn = self._open_conn(host, int(port), int(rack), int(slot), t_out, connection_type=ct_up)
         with self._lock:
             self._conns[key] = conn
         return conn
@@ -527,7 +673,10 @@ class S7ConnectionPool:
                 "active_connections": len(self._conns),
                 "total_handshakes": self.connect_count,
                 "pool_reuses": self.reuse_count,
-                "keys": [f"{h}:{p}/R{r}S{s}" for (h, p, r, s) in self._conns.keys()],
+                "keys": [
+                    f"{h}:{p}/R{r}S{s}({c.connection_type},PDU={c.negotiated_pdu})"
+                    for (h, p, r, s), c in self._conns.items()
+                ],
             }
 
     def _exchange(
@@ -538,10 +687,11 @@ class S7ConnectionPool:
         slot: int,
         pdu_builder: Callable[[int], bytes],
         timeout_s: float = 3.0,
+        connection_type: str = "AUTO",
     ) -> Tuple[int, int, bytes, bytes]:
         last_exc: Optional[Exception] = None
         for attempt in range(2):
-            conn = self.acquire(host, port, rack, slot, timeout_s=timeout_s)
+            conn = self.acquire(host, port, rack, slot, timeout_s=timeout_s, connection_type=connection_type)
             with conn.lock:
                 try:
                     ref = conn.next_ref()
@@ -565,8 +715,9 @@ class S7ConnectionPool:
         slot: int = 2,
         timeout_s: float = 3.0,
         max_items_per_pdu: int = 16,
+        connection_type: str = "AUTO",
     ) -> Dict[str, Any]:
-        """Read multiple S7 addresses in minimal S7comm Read Var PDUs."""
+        """Read multiple S7 addresses in minimal S7comm Read Var PDUs sized to the CPU's negotiated PDU."""
         t0 = time.perf_counter()
         parsed_specs: List[Tuple[Dict[str, Any], ParsedS7Address]] = []
         for item in items:
@@ -574,17 +725,22 @@ class S7ConnectionPool:
             dt = item.get("data_type")
             parsed_specs.append((item, parse_s7_address(addr_str, dt)))
 
+        conn = self.acquire(host, port, rack, slot, timeout_s=timeout_s, connection_type=connection_type)
+        neg_pdu = conn.negotiated_pdu
+        conn_type = conn.connection_type
+        chunks = _chunk_read_specs(parsed_specs, negotiated_pdu=neg_pdu, max_items_per_pdu=max_items_per_pdu)
+
         results: List[Dict[str, Any]] = []
         pdu_count = 0
 
-        for start in range(0, len(parsed_specs), max(1, max_items_per_pdu)):
-            chunk = parsed_specs[start:start + max_items_per_pdu]
+        for chunk in chunks:
             addrs = [a for _, a in chunk]
             pdu_count += 1
             _, err, _, data = self._exchange(
                 host, port, rack, slot,
                 lambda ref, _addrs=addrs: build_batch_read_pdu(_addrs, ref),
                 timeout_s=timeout_s,
+                connection_type=connection_type,
             )
             if err != 0:
                 raise RuntimeError(f"S7 Read Var failed with error 0x{err:04X}")
@@ -636,6 +792,8 @@ class S7ConnectionPool:
             "port": port,
             "rack": rack,
             "slot": slot,
+            "connection_type": conn_type,
+            "negotiated_pdu": neg_pdu,
             "item_count": len(results),
             "pdu_count": pdu_count,
             "latency_ms": elapsed_ms,
@@ -652,8 +810,9 @@ class S7ConnectionPool:
         slot: int = 2,
         timeout_s: float = 3.0,
         max_items_per_pdu: int = 12,
+        connection_type: str = "AUTO",
     ) -> Dict[str, Any]:
-        """Write multiple S7 addresses in minimal S7comm Write Var PDUs."""
+        """Write multiple S7 addresses in minimal S7comm Write Var PDUs sized to the CPU's negotiated PDU."""
         t0 = time.perf_counter()
         encoded: List[Tuple[Dict[str, Any], ParsedS7Address, bytes]] = []
         for item in items:
@@ -661,17 +820,22 @@ class S7ConnectionPool:
             raw = encode_s7_value(addr, item.get("value"))
             encoded.append((item, addr, raw))
 
+        conn = self.acquire(host, port, rack, slot, timeout_s=timeout_s, connection_type=connection_type)
+        neg_pdu = conn.negotiated_pdu
+        conn_type = conn.connection_type
+        chunks = _chunk_write_specs(encoded, negotiated_pdu=neg_pdu, max_items_per_pdu=max_items_per_pdu)
+
         results: List[Dict[str, Any]] = []
         pdu_count = 0
 
-        for start in range(0, len(encoded), max(1, max_items_per_pdu)):
-            chunk = encoded[start:start + max_items_per_pdu]
+        for chunk in chunks:
             pairs = [(a, raw) for _, a, raw in chunk]
             pdu_count += 1
             _, err, _, data = self._exchange(
                 host, port, rack, slot,
                 lambda ref, _pairs=pairs: build_batch_write_pdu(_pairs, ref),
                 timeout_s=timeout_s,
+                connection_type=connection_type,
             )
             if err != 0:
                 raise RuntimeError(f"S7 Write Var failed with error 0x{err:04X}")
@@ -694,6 +858,8 @@ class S7ConnectionPool:
             "port": port,
             "rack": rack,
             "slot": slot,
+            "connection_type": conn_type,
+            "negotiated_pdu": neg_pdu,
             "item_count": len(results),
             "pdu_count": pdu_count,
             "latency_ms": elapsed_ms,
@@ -707,21 +873,34 @@ class S7ConnectionPool:
         rack: int = 0,
         slot: int = 2,
         timeout_s: float = 3.0,
+        connection_type: str = "AUTO",
     ) -> Dict[str, Any]:
         """Query CPU order number (SZL 0x0011), CPU state (SZL 0x0424), and diagnostic buffer (SZL 0x00A0)."""
         t0 = time.perf_counter()
+        szl_errors: Dict[str, str] = {}
 
-        def _query(szl_id: int, szl_idx: int = 0) -> bytes:
-            _, _, _, data = self._exchange(
-                host, port, rack, slot,
-                lambda ref: build_szl_read_pdu(szl_id, szl_idx, ref),
-                timeout_s=timeout_s,
-            )
-            return data
+        def _query(label: str, szl_id: int, szl_idx: int = 0) -> bytes:
+            try:
+                _, err, _, data = self._exchange(
+                    host, port, rack, slot,
+                    lambda ref: build_szl_read_pdu(szl_id, szl_idx, ref),
+                    timeout_s=timeout_s,
+                    connection_type=connection_type,
+                )
+                if err != 0:
+                    szl_errors[label] = f"S7 error 0x{err:04X}"
+                    return b""
+                if len(data) >= 1 and data[0] != 0xFF:
+                    szl_errors[label] = f"SZL return code 0x{data[0]:02X}"
+                    return b""
+                return data
+            except Exception as exc:
+                szl_errors[label] = str(exc)
+                return b""
 
-        raw_id = _query(0x0011, 0x0001)
-        raw_state = _query(0x0424, 0x0000)
-        raw_diag = _query(0x00A0, 0x0000)
+        raw_id = _query("szl_0011_module_id", 0x0011, 0x0001)
+        raw_state = _query("szl_0424_cpu_mode", 0x0424, 0x0000)
+        raw_diag = _query("szl_00a0_diag_buffer", 0x00A0, 0x0000)
 
         # Parse module identification (SZL 0x0011)
         order_number = ""
@@ -766,16 +945,92 @@ class S7ConnectionPool:
                     "info2": f"0x{info2:08X}",
                 })
 
+        has_any_data = bool(order_number or cpu_mode != "UNKNOWN" or diag_entries or not szl_errors)
+        out: Dict[str, Any] = {
+            "ok": has_any_data,
+            "host": host,
+            "port": port,
+            "rack": rack,
+            "slot": slot,
+            "order_number": order_number or "UNKNOWN",
+            "cpu_mode": cpu_mode,
+            "diagnostics_count": len(diag_entries),
+            "diagnostics_buffer": diag_entries,
+            "latency_ms": round((time.perf_counter() - t0) * 1000.0, 2),
+        }
+        if szl_errors:
+            out["szl_errors"] = szl_errors
+        return out
+
+    def list_online_blocks(
+        self,
+        host: str,
+        port: int = 102,
+        rack: int = 0,
+        slot: int = 2,
+        include_block_numbers: bool = True,
+        timeout_s: float = 3.0,
+        connection_type: str = "AUTO",
+    ) -> Dict[str, Any]:
+        """List blocks currently loaded in a live S7-300/400 PLC over S7comm Userdata Block Functions (group 3)."""
+        t0 = time.perf_counter()
+        _, err, _, data = self._exchange(
+            host, port, rack, slot,
+            lambda ref: build_list_blocks_count_pdu(ref),
+            timeout_s=timeout_s,
+            connection_type=connection_type,
+        )
+        if err != 0:
+            raise RuntimeError(f"S7 List Blocks Count failed with error 0x{err:04X}")
+
+        counts: Dict[str, int] = {name: 0 for name in S7_BLOCK_TYPE_CODES}
+        if len(data) >= 4 and data[0] == 0xFF:
+            payload_len = struct.unpack(">H", data[2:4])[0]
+            body = data[4:4 + payload_len]
+            for pos in range(0, len(body) - 3, 4):
+                if body[pos] == 0x30:
+                    b_type = S7_BLOCK_TYPE_NAMES.get(body[pos + 1])
+                    b_cnt = struct.unpack(">H", body[pos + 2:pos + 4])[0]
+                    if b_type:
+                        counts[b_type] = b_cnt
+
+        blocks: Dict[str, List[int]] = {}
+        block_names: List[str] = []
+        if include_block_numbers:
+            for b_type, b_code in S7_BLOCK_TYPE_CODES.items():
+                if counts.get(b_type, 0) <= 0:
+                    blocks[b_type] = []
+                    continue
+                try:
+                    _, b_err, _, b_data = self._exchange(
+                        host, port, rack, slot,
+                        lambda ref, _c=b_code: build_list_blocks_of_type_pdu(_c, ref),
+                        timeout_s=timeout_s,
+                        connection_type=connection_type,
+                    )
+                    nums: List[int] = []
+                    if b_err == 0 and len(b_data) >= 4 and b_data[0] == 0xFF:
+                        blen = struct.unpack(">H", b_data[2:4])[0]
+                        bbody = b_data[4:4 + blen]
+                        for pos in range(0, len(bbody) - 3, 4):
+                            nums.append(struct.unpack(">H", bbody[pos:pos + 2])[0])
+                    nums = sorted(set(nums))
+                    blocks[b_type] = nums
+                    for n in nums:
+                        block_names.append(f"{b_type}{n}")
+                except Exception:
+                    blocks[b_type] = []
+
         return {
             "ok": True,
             "host": host,
             "port": port,
             "rack": rack,
             "slot": slot,
-            "order_number": order_number or "6ES7 315-2EH14-0AB0",
-            "cpu_mode": cpu_mode,
-            "diagnostics_count": len(diag_entries),
-            "diagnostics_buffer": diag_entries,
+            "counts": counts,
+            "total_blocks": sum(counts.values()),
+            "blocks": blocks,
+            "block_names": block_names,
             "latency_ms": round((time.perf_counter() - t0) * 1000.0, 2),
         }
 
@@ -787,12 +1042,14 @@ class S7ConnectionPool:
         rack: int = 0,
         slot: int = 2,
         timeout_s: float = 3.0,
+        connection_type: str = "AUTO",
     ) -> Dict[str, Any]:
         t0 = time.perf_counter()
         _, err, param, _ = self._exchange(
             host, port, rack, slot,
             lambda ref: build_cpu_control_pdu(action, ref),
             timeout_s=timeout_s,
+            connection_type=connection_type,
         )
         return {
             "ok": err == 0,
@@ -847,7 +1104,7 @@ class WatchTableMonitor:
                 addr = addr_or_sym
             resolved_tags.append({"address": addr, "data_type": dt, "symbol": sym})
 
-        sample_count = max(1, min(int(samples), 20))
+        sample_count = max(1, min(int(samples), 100))
         all_samples: List[Dict[str, Any]] = []
         key = f"{table_id}@{host}:{port}"
 
@@ -891,6 +1148,248 @@ class WatchTableMonitor:
             "latest": all_samples[-1] if all_samples else None,
             "samples": all_samples,
         }
+
+
+# ---------------------------------------------------------------------------
+# AI-Agent PLC Data Collector & Time-Series Historian
+# ---------------------------------------------------------------------------
+
+class PLCDataCollector:
+    """High-throughput time-series data logger, statistical summarizer, and CSV/JSONL exporter for AI agents."""
+
+    @staticmethod
+    def _sanitize_name(name: str) -> str:
+        cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", (name or "plc_dataset").strip()).strip("_")
+        return cleaned[:64] or "plc_dataset"
+
+    @classmethod
+    def collect(
+        cls,
+        read_fn: Callable[[List[Dict[str, Any]]], Dict[str, Any]],
+        tags: Sequence[Dict[str, Any]],
+        samples: int = 20,
+        interval_ms: int = 200,
+        duration_s: Optional[float] = None,
+        thresholds: Optional[Dict[str, Dict[str, Any]]] = None,
+        export_format: Optional[str] = None,
+        export_dir: Optional[Path] = None,
+        dataset_name: Optional[str] = None,
+        include_raw_samples: bool = True,
+    ) -> Dict[str, Any]:
+        """Collect time-series tag data via ``read_fn``, compute per-tag analytics, and optionally export CSV/JSONL."""
+        if not tags:
+            raise ValueError("At least one tag must be provided to PLCDataCollector.collect().")
+
+        max_samples = max(1, min(int(samples), 500))
+        sleep_s = max(0.0, min(int(interval_ms), 10000) / 1000.0)
+        max_duration_s = min(float(duration_s), 60.0) if duration_s is not None else None
+        if max_duration_s is not None and max_duration_s <= 0:
+            max_duration_s = 0.0
+
+        tag_list = [dict(t) for t in tags]
+        tag_keys: List[str] = []
+        for idx, t in enumerate(tag_list):
+            k = str(t.get("symbol") or t.get("address") or f"tag_{idx}")
+            if k in tag_keys:
+                k = f"{k}_{idx}"
+            t["_key"] = k
+            tag_keys.append(k)
+
+        norm_thresholds: Dict[str, Dict[str, Any]] = {}
+        for tk, rule in (thresholds or {}).items():
+            if isinstance(rule, dict):
+                norm_thresholds[tk.strip().upper()] = rule
+
+        rows: List[Dict[str, Any]] = []
+        alerts: List[Dict[str, Any]] = []
+        t_start = time.perf_counter()
+        wall_start = time.time()
+
+        per_tag_values: Dict[str, List[Any]] = {k: [] for k in tag_keys}
+        per_tag_errors: Dict[str, int] = {k: 0 for k in tag_keys}
+        per_tag_meta: Dict[str, Dict[str, Any]] = {
+            t["_key"]: {"address": t.get("address"), "symbol": t.get("symbol"), "data_type": t.get("data_type")}
+            for t in tag_list
+        }
+
+        idx = 0
+        while idx < max_samples:
+            if max_duration_s is not None and idx > 0 and (time.perf_counter() - t_start) >= max_duration_s:
+                break
+            sample_ts = time.time()
+            elapsed_ms = round((time.perf_counter() - t_start) * 1000.0, 2)
+            br = read_fn(tag_list)
+            items = br.get("items") or []
+
+            row_vals: Dict[str, Any] = {}
+            row_errs: List[str] = []
+            for j, tag_spec in enumerate(tag_list):
+                k = tag_spec["_key"]
+                item = items[j] if j < len(items) else None
+                if item and item.get("ok"):
+                    val = item.get("value")
+                    row_vals[k] = val
+                    per_tag_values[k].append(val)
+                    if item.get("data_type") and not per_tag_meta[k].get("data_type"):
+                        per_tag_meta[k]["data_type"] = item.get("data_type")
+                    if item.get("address"):
+                        per_tag_meta[k]["address"] = item.get("address")
+
+                    # Threshold/alarm evaluation
+                    rule = (
+                        norm_thresholds.get(k.upper())
+                        or norm_thresholds.get(str(tag_spec.get("address") or "").strip().upper())
+                        or norm_thresholds.get(str(tag_spec.get("symbol") or "").strip().upper())
+                    )
+                    if rule:
+                        if "min" in rule and isinstance(val, (int, float)) and not isinstance(val, bool):
+                            if val < float(rule["min"]):
+                                alerts.append({
+                                    "sample_index": idx,
+                                    "timestamp": sample_ts,
+                                    "tag": k,
+                                    "rule": f"min<{rule['min']}",
+                                    "value": val,
+                                })
+                        if "max" in rule and isinstance(val, (int, float)) and not isinstance(val, bool):
+                            if val > float(rule["max"]):
+                                alerts.append({
+                                    "sample_index": idx,
+                                    "timestamp": sample_ts,
+                                    "tag": k,
+                                    "rule": f"max>{rule['max']}",
+                                    "value": val,
+                                })
+                        if "equals" in rule and val == rule["equals"]:
+                            alerts.append({
+                                "sample_index": idx,
+                                "timestamp": sample_ts,
+                                "tag": k,
+                                "rule": f"equals=={rule['equals']}",
+                                "value": val,
+                            })
+                else:
+                    row_vals[k] = None
+                    per_tag_errors[k] += 1
+                    err_txt = (item or {}).get("error") or (item or {}).get("return_code") or "read_failed"
+                    row_errs.append(f"{k}:{err_txt}")
+
+            rows.append({
+                "sample_index": idx,
+                "timestamp": sample_ts,
+                "elapsed_ms": elapsed_ms,
+                "latency_ms": br.get("latency_ms", 0.0),
+                "values": row_vals,
+                "errors": row_errs,
+            })
+            idx += 1
+
+            if idx < max_samples and sleep_s > 0.0:
+                if max_duration_s is not None:
+                    remaining = max_duration_s - (time.perf_counter() - t_start)
+                    if remaining <= 0.0:
+                        break
+                    time.sleep(min(sleep_s, remaining))
+                else:
+                    time.sleep(sleep_s)
+
+        total_elapsed_ms = round((time.perf_counter() - t_start) * 1000.0, 2)
+
+        # Compute per-tag statistics
+        per_tag_stats: Dict[str, Dict[str, Any]] = {}
+        for k in tag_keys:
+            vals = per_tag_values[k]
+            err_cnt = per_tag_errors[k]
+            changes = 0
+            for prev_v, cur_v in zip(vals, vals[1:]):
+                if cur_v != prev_v:
+                    changes += 1
+
+            stat: Dict[str, Any] = {
+                "address": per_tag_meta[k].get("address"),
+                "symbol": per_tag_meta[k].get("symbol"),
+                "data_type": per_tag_meta[k].get("data_type"),
+                "samples_ok": len(vals),
+                "samples_error": err_cnt,
+                "first": vals[0] if vals else None,
+                "last": vals[-1] if vals else None,
+                "change_count": changes,
+            }
+            if vals and all(isinstance(v, bool) for v in vals):
+                t_cnt = sum(1 for v in vals if v)
+                rising = sum(1 for p, c in zip(vals, vals[1:]) if (not p) and c)
+                falling = sum(1 for p, c in zip(vals, vals[1:]) if p and (not c))
+                stat.update({
+                    "true_count": t_cnt,
+                    "false_count": len(vals) - t_cnt,
+                    "true_ratio": round(t_cnt / len(vals), 4),
+                    "rising_edges": rising,
+                    "falling_edges": falling,
+                })
+            else:
+                nums = [float(v) for v in vals if isinstance(v, (int, float)) and not isinstance(v, bool)]
+                if nums:
+                    mean_v = sum(nums) / len(nums)
+                    var_v = sum((x - mean_v) ** 2 for x in nums) / len(nums)
+                    stat.update({
+                        "min": round(min(nums), 6),
+                        "max": round(max(nums), 6),
+                        "mean": round(mean_v, 6),
+                        "stddev": round(math.sqrt(var_v), 6),
+                        "delta": round(nums[-1] - nums[0], 6),
+                    })
+            per_tag_stats[k] = stat
+
+        # Optional CSV / JSONL export
+        exported_files: Dict[str, str] = {}
+        fmt = (export_format or "").strip().lower()
+        if fmt in ("csv", "jsonl", "both") and export_dir is not None:
+            out_dir = Path(export_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            ts_tag = time.strftime("%Y%m%d_%H%M%S", time.localtime(wall_start))
+            stem = f"{cls._sanitize_name(dataset_name or 'plc_data')}_{ts_tag}"
+            if fmt in ("csv", "both"):
+                csv_path = out_dir / f"{stem}.csv"
+                with csv_path.open("w", newline="", encoding="utf-8") as fh:
+                    writer = csv.writer(fh)
+                    writer.writerow(["sample_index", "timestamp", "elapsed_ms", "latency_ms", *tag_keys])
+                    for r in rows:
+                        writer.writerow([
+                            r["sample_index"],
+                            f"{r['timestamp']:.6f}",
+                            r["elapsed_ms"],
+                            r["latency_ms"],
+                            *[r["values"].get(k) for k in tag_keys],
+                        ])
+                exported_files["csv"] = str(csv_path)
+            if fmt in ("jsonl", "both"):
+                jsonl_path = out_dir / f"{stem}.jsonl"
+                with jsonl_path.open("w", encoding="utf-8") as fh:
+                    for r in rows:
+                        fh.write(json.dumps(r) + "\n")
+                exported_files["jsonl"] = str(jsonl_path)
+
+        latencies = [float(r["latency_ms"]) for r in rows if r.get("latency_ms") is not None]
+        avg_lat = round(sum(latencies) / len(latencies), 2) if latencies else 0.0
+
+        result: Dict[str, Any] = {
+            "ok": len(rows) > 0 and any(s["samples_ok"] > 0 for s in per_tag_stats.values()),
+            "tag_count": len(tag_keys),
+            "sample_count": len(rows),
+            "duration_ms": total_elapsed_ms,
+            "avg_poll_latency_ms": avg_lat,
+            "alert_count": len(alerts),
+            "alerts": alerts[:100],
+            "per_tag_stats": per_tag_stats,
+            "exported_files": exported_files,
+        }
+        if include_raw_samples:
+            result["samples"] = rows[:100]
+            if len(rows) > 100:
+                result["samples_truncated_note"] = (
+                    f"Showing first 100 of {len(rows)} samples inline; full series saved to exported_files."
+                )
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -963,6 +1462,9 @@ class VirtualS7PLC:
         ]
         self._open_db: int = 1
         self._current_tick_ms: int = 100
+        self.ob35_count: int = 0
+        self.ob35_interval_ms: int = 100
+        self._ob35_accum_ms: int = 0
 
     def reset(self, clear_blocks: bool = False, clear_symbols: bool = False) -> None:
         with self._lock:
@@ -981,6 +1483,8 @@ class VirtualS7PLC:
             self.sfc_states.clear()
             self.scan_count = 0
             self.sim_time_ms = 0
+            self.ob35_count = 0
+            self._ob35_accum_ms = 0
             self.cpu_mode = "RUN"
             self.last_unsupported_instructions = []
             if clear_blocks:
@@ -1682,7 +2186,9 @@ class VirtualS7PLC:
         depth: int = 0,
         call_params: Optional[Dict[str, Any]] = None,
         instance_db: Optional[int] = None,
+        raw_call_params: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
+        from .s7_stdlib import execute_stdlib_block, get_stdlib_schema, resolve_stdlib_block_name
         from .scl_graph_sim import execute_graph_block, execute_scl_block
 
         if depth > 16:
@@ -1697,8 +2203,27 @@ class VirtualS7PLC:
             stat_store = self.fb_statics.setdefault(stat_key, {})
 
             def _call_cb(callee: str, kw: Dict[str, Any]) -> Any:
-                out = self._execute_block(callee, depth=depth + 1, call_params=kw)
-                return out.get("__RETURN__", 0)
+                c_blk = callee
+                c_db: Optional[int] = None
+                if "." in callee:
+                    left_c, right_c = callee.rsplit(".", 1)
+                    right_clean = right_c.strip().strip('"')
+                    m_cdb = re.fullmatch(r"DB\s*(\d+)", right_clean, re.IGNORECASE)
+                    if m_cdb:
+                        c_blk = left_c
+                        c_db = int(m_cdb.group(1))
+                    elif right_clean.upper() in self.db_names:
+                        c_blk = left_c
+                        c_db = self.db_names[right_clean.upper()]
+                out = self._execute_block(c_blk, depth=depth + 1, call_params=kw, instance_db=c_db)
+                c_key = re.sub(r"\s+", "", c_blk.strip().upper())
+                c_decls = (self.block_meta.get(c_key) or {}).get("var_decls") or get_stdlib_schema(c_key) or {}
+                out_only = {
+                    k: v
+                    for k, v in out.items()
+                    if k != "__RETURN__" and (not c_decls or (c_decls.get(k, ("", ""))[0] in ("VAR_OUTPUT", "VAR_IN_OUT")))
+                }
+                return {"__RETURN__": out.get("__RETURN__", 0), "__OUTPUTS__": out_only}
 
             return execute_scl_block(
                 meta["parsed_scl"],
@@ -1724,6 +2249,16 @@ class VirtualS7PLC:
 
         instrs = self.blocks.get(key, [])
         if not instrs:
+            # Dispatch built-in Siemens S7-300 standard/system library blocks (SFB0-5, FC105-106, FB41, SFC20/21/64)
+            if resolve_stdlib_block_name(key):
+                return execute_stdlib_block(
+                    self,
+                    key,
+                    call_params or {},
+                    raw_param_exprs=raw_call_params,
+                    instance_db=instance_db,
+                    tick_ms=self._current_tick_ms,
+                )
             return {}
 
         # Prepare local temp frame + parameter bindings
@@ -1877,10 +2412,11 @@ class VirtualS7PLC:
                         if not rlo:
                             fc_bit = False
                             continue
+                    from .s7_stdlib import get_stdlib_schema, parse_iec_time_ms
                     target_blk, inst_db, param_map = self._parse_call_statement(arg)
                     bound_in: Dict[str, Any] = {}
                     out_targets: Dict[str, str] = {}
-                    callee_decls = (self.block_meta.get(target_blk) or {}).get("var_decls") or {}
+                    callee_decls = (self.block_meta.get(target_blk) or {}).get("var_decls") or get_stdlib_schema(target_blk) or {}
                     for pname, pexpr in param_map.items():
                         decl = callee_decls.get(pname)
                         sec = decl[0] if decl else "VAR_INPUT"
@@ -1888,9 +2424,13 @@ class VirtualS7PLC:
                             out_targets[pname] = pexpr
                         if sec != "VAR_OUTPUT":
                             try:
-                                if re.fullmatch(r"TRUE|FALSE", pexpr, re.IGNORECASE):
+                                if re.match(r"^P#", pexpr, re.IGNORECASE):
+                                    bound_in[pname] = pexpr
+                                elif re.match(r"^(?:S5TIME|S5T|TIME|T)#", pexpr, re.IGNORECASE):
+                                    bound_in[pname] = parse_iec_time_ms(pexpr)
+                                elif re.fullmatch(r"TRUE|FALSE", pexpr, re.IGNORECASE):
                                     bound_in[pname] = pexpr.upper() == "TRUE"
-                                elif re.fullmatch(r"[+-]?\d+\.\d+", pexpr):
+                                elif re.fullmatch(r"[+-]?\d+\.\d+(?:[eE][+-]?\d+)?", pexpr):
                                     bound_in[pname] = float(pexpr)
                                 elif re.fullmatch(r"[+-]?\d+", pexpr):
                                     bound_in[pname] = int(pexpr)
@@ -1901,7 +2441,13 @@ class VirtualS7PLC:
                                     bound_in[pname] = self.read_address(pexpr, data_type=dt_hint)
                             except Exception:
                                 bound_in[pname] = 0
-                    callee_out = self._execute_block(target_blk, depth=depth + 1, call_params=bound_in, instance_db=inst_db)
+                    callee_out = self._execute_block(
+                        target_blk,
+                        depth=depth + 1,
+                        call_params=bound_in,
+                        instance_db=inst_db,
+                        raw_call_params=param_map,
+                    )
                     for pname, dest_expr in out_targets.items():
                         if pname in callee_out:
                             val_out = callee_out[pname]
@@ -2318,10 +2864,20 @@ class VirtualS7PLC:
                     "sim_time_ms": self.sim_time_ms,
                     "warning": "CPU is in STOP mode; no scan cycles executed.",
                 }
+            entry_up = re.sub(r"\s+", "", entry_block.strip().upper())
             for _ in range(max(1, int(cycles))):
                 self.sim_time_ms += self._current_tick_ms
                 self._advance_timers(self._current_tick_ms)
                 self._execute_block(entry_block)
+                if entry_up == "OB35":
+                    self.ob35_count += 1
+                elif "OB35" in self.blocks:
+                    self._ob35_accum_ms += self._current_tick_ms
+                    interval = max(1, int(self.ob35_interval_ms))
+                    while self._ob35_accum_ms >= interval:
+                        self._ob35_accum_ms -= interval
+                        self._execute_block("OB35")
+                        self.ob35_count += 1
                 self.scan_count += 1
                 executed += 1
             res: Dict[str, Any] = {
@@ -2332,6 +2888,8 @@ class VirtualS7PLC:
                 "sim_time_ms": self.sim_time_ms,
                 "entry_block": entry_block.upper(),
             }
+            if self.ob35_count:
+                res["ob35_executions"] = self.ob35_count
             if self.last_unsupported_instructions:
                 res["unsupported_instructions"] = list(self.last_unsupported_instructions)
             if self.sfc_states:
@@ -2403,16 +2961,44 @@ class VirtualS7PLC:
 class EnhancedS7LoopbackServer:
     """Real RFC1006/S7comm TCP server backed by ``VirtualS7PLC`` for offline & CI verification."""
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 0, plc: Optional[VirtualS7PLC] = None) -> None:
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 0,
+        plc: Optional[VirtualS7PLC] = None,
+        max_pdu: int = 480,
+        allowed_connection_types: Optional[Sequence[str]] = None,
+    ) -> None:
         self.host = host
         self.requested_port = port
         self.plc = plc or VirtualS7PLC()
+        self.max_pdu = max(96, int(max_pdu))
+        self.allowed_connection_types = (
+            {S7_CONN_TYPES[c.strip().upper()] for c in allowed_connection_types if c.strip().upper() in S7_CONN_TYPES}
+            if allowed_connection_types is not None
+            else None
+        )
         self._server: Optional[socketserver.ThreadingTCPServer] = None
         self._thread: Optional[threading.Thread] = None
         self.port: int = port
 
+    @staticmethod
+    def _collect_plc_blocks(plc_ref: VirtualS7PLC) -> Dict[str, List[int]]:
+        by_type: Dict[str, set] = {name: set() for name in S7_BLOCK_TYPE_CODES}
+        with plc_ref._lock:
+            for bname in set(list(plc_ref.blocks.keys()) + list(plc_ref.block_meta.keys())):
+                m = re.match(r"^(OB|FB|FC|DB|SDB|SFB|SFC)(\d+)$", bname.strip().upper())
+                if m:
+                    by_type[m.group(1)].add(int(m.group(2)))
+            for db_num in plc_ref.dbs.keys():
+                by_type["DB"].add(int(db_num))
+        return {k: sorted(v) for k, v in by_type.items()}
+
     def start(self) -> int:
         plc_ref = self.plc
+        server_max_pdu = self.max_pdu
+        allowed_conn_codes = self.allowed_connection_types
+        collect_blocks = self._collect_plc_blocks
 
         class _Handler(socketserver.BaseRequestHandler):
             def handle(self) -> None:
@@ -2426,9 +3012,26 @@ class EnhancedS7LoopbackServer:
                     if len(frame) < 6:
                         break
                     cotp_type = frame[5]
-                    if cotp_type == 0xE0:  # COTP CR -> CC
+                    if cotp_type == 0xE0:  # COTP CR -> CC (or Disconnect Request if TSAP rejected)
+                        dst_tsap_hi = 0x01
+                        dst_tsap_lo = 0x02
+                        # Locate 0xC2 parameter (Dst TSAP) inside COTP CR
+                        pos = 11
+                        while pos + 2 <= len(frame):
+                            p_code = frame[pos]
+                            p_len = frame[pos + 1]
+                            if p_code == 0xC2 and p_len >= 2 and pos + 2 + p_len <= len(frame):
+                                dst_tsap_hi = frame[pos + 2]
+                                dst_tsap_lo = frame[pos + 3]
+                                break
+                            pos += 2 + p_len
+                        if allowed_conn_codes is not None and dst_tsap_hi not in allowed_conn_codes:
+                            # Send COTP Disconnect Request (0x80) to simulate occupied PG resource
+                            dr = bytes([0x03, 0x00, 0x00, 0x0B, 0x06, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00])
+                            sock.sendall(dr)
+                            break
                         cc = bytes([0x03, 0x00, 0x00, 0x16, 0x11, 0xD0, 0x00, 0x01, 0x00, 0x01, 0x00,
-                                    0xC0, 0x01, 0x0A, 0xC1, 0x02, 0x01, 0x00, 0xC2, 0x02, 0x01, 0x02])
+                                    0xC0, 0x01, 0x0A, 0xC1, 0x02, 0x01, 0x00, 0xC2, 0x02, dst_tsap_hi, dst_tsap_lo])
                         sock.sendall(cc)
                         continue
                     if len(frame) < 17 or frame[7] != 0x32:
@@ -2443,10 +3046,16 @@ class EnhancedS7LoopbackServer:
                     if rosctr == 0x01 and param:
                         fn = param[0]
                         if fn == 0xF0:  # Setup Communication
-                            r_param = struct.pack(">BBHHH", 0xF0, 0x00, 0x0001, 0x0001, 480)
+                            req_pdu = struct.unpack(">H", param[6:8])[0] if len(param) >= 8 else 480
+                            neg = min(req_pdu, server_max_pdu)
+                            r_param = struct.pack(">BBHHH", 0xF0, 0x00, 0x0001, 0x0001, neg)
                             hdr = struct.pack(">BBHHHHBB", 0x32, 0x03, 0x0000, pdu_ref, len(r_param), 0, 0, 0)
                             sock.sendall(wrap_tpkt_cotp_dt(hdr + r_param))
                         elif fn == 0x04:  # Multi-Item Read Var
+                            if len(s7) > server_max_pdu:
+                                hdr = struct.pack(">BBHHHHBB", 0x32, 0x03, 0x0000, pdu_ref, 0, 0, 0x85, 0x00)
+                                sock.sendall(wrap_tpkt_cotp_dt(hdr))
+                                continue
                             item_cnt = param[1]
                             resp_data = bytearray()
                             cursor = 2
@@ -2475,9 +3084,17 @@ class EnhancedS7LoopbackServer:
                                     if len(payload) % 2 == 1 and idx < item_cnt - 1:
                                         resp_data.append(0x00)
                             r_param = bytes([0x04, item_cnt])
+                            if 12 + len(r_param) + len(resp_data) > server_max_pdu:
+                                hdr = struct.pack(">BBHHHHBB", 0x32, 0x03, 0x0000, pdu_ref, 0, 0, 0x85, 0x00)
+                                sock.sendall(wrap_tpkt_cotp_dt(hdr))
+                                continue
                             hdr = struct.pack(">BBHHHHBB", 0x32, 0x03, 0x0000, pdu_ref, len(r_param), len(resp_data), 0, 0)
                             sock.sendall(wrap_tpkt_cotp_dt(hdr + r_param + bytes(resp_data)))
                         elif fn == 0x05:  # Multi-Item Write Var
+                            if len(s7) > server_max_pdu:
+                                hdr = struct.pack(">BBHHHHBB", 0x32, 0x03, 0x0000, pdu_ref, 0, 0, 0x85, 0x00)
+                                sock.sendall(wrap_tpkt_cotp_dt(hdr))
+                                continue
                             item_cnt = param[1]
                             p_cur = 2
                             d_cur = 0
@@ -2511,30 +3128,54 @@ class EnhancedS7LoopbackServer:
                             r_param = bytes([fn, 0x00])
                             hdr = struct.pack(">BBHHHHBB", 0x32, 0x03, 0x0000, pdu_ref, len(r_param), 0, 0, 0)
                             sock.sendall(wrap_tpkt_cotp_dt(hdr + r_param))
-                    elif rosctr == 0x07 and len(data) >= 8:  # Userdata SZL Read
-                        szl_id, szl_idx = struct.unpack(">HH", data[4:8])
-                        r_param = bytes([0x00, 0x01, 0x12, 0x08, 0x12, 0x84, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00])
-                        if szl_id == 0x0011:
-                            ord_b = plc_ref.order_number.encode("ascii").ljust(20, b" ")[:20]
-                            rec = struct.pack(">H", 0x0001) + ord_b + bytes(6)
-                            body = struct.pack(">HHHH", 0x0011, szl_idx, len(rec), 1) + rec
-                        elif szl_id == 0x0424:
-                            mode_b = 0x08 if plc_ref.cpu_mode == "RUN" else 0x04
-                            rec = bytes([0x00, 0x00, 0x00, mode_b, 0x00, 0x00])
-                            body = struct.pack(">HHHH", 0x0424, 0x0000, len(rec), 1) + rec
-                        elif szl_id == 0x00A0:
-                            recs = bytearray()
-                            for d in plc_ref.diagnostics[:10]:
-                                recs.extend(struct.pack(
-                                    ">HBBHI",
-                                    d["event_id"], d["priority_class"], d["ob_number"], d["info1"], d["info2"]
-                                ) + bytes(10))
-                            body = struct.pack(">HHHH", 0x00A0, 0x0000, 20, len(plc_ref.diagnostics[:10])) + bytes(recs)
-                        else:
-                            body = struct.pack(">HHHH", szl_id, szl_idx, 0, 0)
-                        r_data = struct.pack(">BBH", 0xFF, 0x09, len(body)) + body
-                        hdr = struct.pack(">BBHHHH", 0x32, 0x07, 0x0000, pdu_ref, len(r_param), len(r_data))
-                        sock.sendall(wrap_tpkt_cotp_dt(hdr + r_param + r_data))
+                    elif rosctr == 0x07 and len(param) >= 7:
+                        group = param[5] & 0x0F
+                        subfunc = param[6]
+                        if group == 0x03 and subfunc == 0x01:  # List Blocks Count
+                            inv = collect_blocks(plc_ref)
+                            body = bytearray()
+                            for b_type, b_code in S7_BLOCK_TYPE_CODES.items():
+                                body.extend(struct.pack(">BBH", 0x30, b_code, len(inv.get(b_type, []))))
+                            r_param = bytes([0x00, 0x01, 0x12, 0x08, 0x12, 0x83, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00])
+                            r_data = struct.pack(">BBH", 0xFF, 0x09, len(body)) + bytes(body)
+                            hdr = struct.pack(">BBHHHH", 0x32, 0x07, 0x0000, pdu_ref, len(r_param), len(r_data))
+                            sock.sendall(wrap_tpkt_cotp_dt(hdr + r_param + r_data))
+                        elif group == 0x03 and subfunc == 0x02 and len(data) >= 6:  # List Blocks of Type
+                            b_code = data[5]
+                            b_type = S7_BLOCK_TYPE_NAMES.get(b_code, "")
+                            inv = collect_blocks(plc_ref)
+                            nums = inv.get(b_type, [])
+                            body = bytearray()
+                            for n in nums:
+                                body.extend(struct.pack(">HBB", n, 0x00, 0x01))
+                            r_param = bytes([0x00, 0x01, 0x12, 0x08, 0x12, 0x83, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00])
+                            r_data = struct.pack(">BBH", 0xFF, 0x09, len(body)) + bytes(body)
+                            hdr = struct.pack(">BBHHHH", 0x32, 0x07, 0x0000, pdu_ref, len(r_param), len(r_data))
+                            sock.sendall(wrap_tpkt_cotp_dt(hdr + r_param + r_data))
+                        elif group == 0x04 and len(data) >= 8:  # Userdata SZL Read
+                            szl_id, szl_idx = struct.unpack(">HH", data[4:8])
+                            r_param = bytes([0x00, 0x01, 0x12, 0x08, 0x12, 0x84, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00])
+                            if szl_id == 0x0011:
+                                ord_b = plc_ref.order_number.encode("ascii").ljust(20, b" ")[:20]
+                                rec = struct.pack(">H", 0x0001) + ord_b + bytes(6)
+                                body = struct.pack(">HHHH", 0x0011, szl_idx, len(rec), 1) + rec
+                            elif szl_id == 0x0424:
+                                mode_b = 0x08 if plc_ref.cpu_mode == "RUN" else 0x04
+                                rec = bytes([0x00, 0x00, 0x00, mode_b, 0x00, 0x00])
+                                body = struct.pack(">HHHH", 0x0424, 0x0000, len(rec), 1) + rec
+                            elif szl_id == 0x00A0:
+                                recs = bytearray()
+                                for d in plc_ref.diagnostics[:10]:
+                                    recs.extend(struct.pack(
+                                        ">HBBHI",
+                                        d["event_id"], d["priority_class"], d["ob_number"], d["info1"], d["info2"]
+                                    ) + bytes(10))
+                                body = struct.pack(">HHHH", 0x00A0, 0x0000, 20, len(plc_ref.diagnostics[:10])) + bytes(recs)
+                            else:
+                                body = struct.pack(">HHHH", szl_id, szl_idx, 0, 0)
+                            r_data = struct.pack(">BBH", 0xFF, 0x09, len(body)) + body
+                            hdr = struct.pack(">BBHHHH", 0x32, 0x07, 0x0000, pdu_ref, len(r_param), len(r_data))
+                            sock.sendall(wrap_tpkt_cotp_dt(hdr + r_param + r_data))
 
         class _ReuseServer(socketserver.ThreadingTCPServer):
             allow_reuse_address = True
@@ -2557,12 +3198,19 @@ class EnhancedS7LoopbackServer:
 
 
 __all__ = [
+    "S7_CONN_TYPES",
+    "S7_BLOCK_TYPE_CODES",
+    "S7_BLOCK_TYPE_NAMES",
     "ParsedS7Address",
     "parse_s7_address",
     "encode_s7_value",
     "decode_s7_value",
+    "build_cotp_cr",
+    "build_list_blocks_count_pdu",
+    "build_list_blocks_of_type_pdu",
     "S7ConnectionPool",
     "WatchTableMonitor",
+    "PLCDataCollector",
     "VirtualS7PLC",
     "EnhancedS7LoopbackServer",
 ]
