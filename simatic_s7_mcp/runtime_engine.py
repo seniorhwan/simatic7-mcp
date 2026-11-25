@@ -2188,7 +2188,7 @@ class VirtualS7PLC:
         instance_db: Optional[int] = None,
         raw_call_params: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
-        from .s7_stdlib import execute_stdlib_block, get_stdlib_schema, resolve_stdlib_block_name
+        from .s7_stdlib import execute_stdlib_block, get_stdlib_schema, parse_iec_time_ms, resolve_stdlib_block_name
         from .scl_graph_sim import execute_graph_block, execute_scl_block
 
         if depth > 16:
@@ -2412,7 +2412,6 @@ class VirtualS7PLC:
                         if not rlo:
                             fc_bit = False
                             continue
-                    from .s7_stdlib import get_stdlib_schema, parse_iec_time_ms
                     target_blk, inst_db, param_map = self._parse_call_statement(arg)
                     bound_in: Dict[str, Any] = {}
                     out_targets: Dict[str, str] = {}

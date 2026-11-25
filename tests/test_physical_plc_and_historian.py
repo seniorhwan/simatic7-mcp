@@ -155,17 +155,22 @@ class TestPhysicalPlcProtocolAndHistorian(unittest.TestCase):
         port = loopback.start()
 
         stop_evt = threading.Event()
+        started_evt = threading.Event()
 
         def _mutate_process() -> None:
             step = 0
-            while not stop_evt.is_set() and step < 25:
+            while not stop_evt.is_set() and step < 60:
                 step += 1
                 plc.write_address("MD 100", 20.0 + step * 5.0, data_type="REAL")
                 plc.write_address("Q 0.0", (step % 2) == 0, data_type="BOOL")
+                if step >= 4:
+                    started_evt.set()
                 time.sleep(0.015)
+            started_evt.set()
 
         t = threading.Thread(target=_mutate_process, daemon=True)
         t.start()
+        started_evt.wait(timeout=2.0)
         exported_paths: list[Path] = []
         try:
             res = json.loads(
@@ -309,8 +314,10 @@ class TestPhysicalPlcProtocolAndHistorian(unittest.TestCase):
             tools = {t.name: t.annotations for t in srv.mcp._tool_manager.list_tools()}
             for name in expected:
                 self.assertIn(name, tools, f"Missing registered MCP tool: {name}")
-                self.assertIsNotNone(tools[name], f"Missing annotations on {name}")
-                self.assertTrue(tools[name].readOnlyHint)
+                ann = tools[name]
+                self.assertIsNotNone(ann, f"Missing annotations on {name}")
+                ro = ann.readOnlyHint if hasattr(ann, "readOnlyHint") else ann.get("readOnlyHint")
+                self.assertTrue(ro)
         else:
             tools_map = getattr(srv.mcp, "_tools", {})
             for name in expected:

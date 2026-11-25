@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68.0", "wheel"]
+requires = ["setuptools>=77.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,10 +8,10 @@ version = "2.0.0"
 description = "Production-grade Siemens SIMATIC STEP 7 Classic (V5.x) MCP Server for VS Code, Google Antigravity, OpenAI Codex, and Claude Code"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
 keywords = ["siemens", "simatic", "step7", "s7-300", "s7-400", "plc", "mcp", "plcsim", "iec-61131-3"]
 dependencies = [
-    "mcp>=1.2.0",
+    "mcp>=1.6.0,<2.0.0",
 ]
 
 [project.optional-dependencies]
@@ -21,6 +21,7 @@ windows = [
 ]
 dev = [
     "pytest>=8.0",
+    "flake8>=7.0",
 ]
 
 [project.scripts]

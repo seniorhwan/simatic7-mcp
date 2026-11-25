@@ -72,6 +72,7 @@ import ctypes
 import datetime
 import difflib
 import fnmatch
+import inspect
 import io
 import json
 import os
@@ -138,48 +139,52 @@ try:
     from mcp.server.fastmcp import FastMCP
     MCP_SDK_AVAILABLE = True
 except ImportError:
-    MCP_SDK_AVAILABLE = False
+    try:
+        from mcp.server.mcpserver import MCPServer as FastMCP  # type: ignore[import-not-found]
+        MCP_SDK_AVAILABLE = True
+    except ImportError:
+        MCP_SDK_AVAILABLE = False
 
-    class FastMCP:  # type: ignore[no-redef]
-        """Lightweight FastMCP fallback shim for CLI diagnostics, config export, and unit tests when 'mcp' is not installed."""
+        class FastMCP:  # type: ignore[no-redef]
+            """Lightweight FastMCP fallback shim for CLI diagnostics, config export, and unit tests when 'mcp' is not installed."""
 
-        def __init__(self, name: str, instructions: str = "", **kwargs: Any) -> None:
-            self.name = name
-            self.instructions = instructions
-            self._tools: Dict[str, Dict[str, Any]] = {}
-            self._resources: Dict[str, Callable[..., Any]] = {}
-            self._prompts: Dict[str, Callable[..., Any]] = {}
+            def __init__(self, name: str, instructions: str = "", **kwargs: Any) -> None:
+                self.name = name
+                self.instructions = instructions
+                self._tools: Dict[str, Dict[str, Any]] = {}
+                self._resources: Dict[str, Callable[..., Any]] = {}
+                self._prompts: Dict[str, Callable[..., Any]] = {}
 
-        def tool(self, *args: Any, **kwargs: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-            def _decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
-                self._tools[kwargs.get("name") or fn.__name__] = {
-                    "fn": fn,
-                    "annotations": kwargs.get("annotations"),
-                }
-                return fn
-            if args and callable(args[0]):
-                return _decorator(args[0])
-            return _decorator
+            def tool(self, *args: Any, **kwargs: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+                def _decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
+                    self._tools[kwargs.get("name") or fn.__name__] = {
+                        "fn": fn,
+                        "annotations": kwargs.get("annotations"),
+                    }
+                    return fn
+                if args and callable(args[0]):
+                    return _decorator(args[0])
+                return _decorator
 
-        def resource(self, uri: str, **kwargs: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-            def _decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
-                self._resources[uri] = fn
-                return fn
-            return _decorator
+            def resource(self, uri: str, **kwargs: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+                def _decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
+                    self._resources[uri] = fn
+                    return fn
+                return _decorator
 
-        def prompt(self, *args: Any, **kwargs: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-            def _decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
-                self._prompts[kwargs.get("name") or fn.__name__] = fn
-                return fn
-            if args and callable(args[0]):
-                return _decorator(args[0])
-            return _decorator
+            def prompt(self, *args: Any, **kwargs: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+                def _decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
+                    self._prompts[kwargs.get("name") or fn.__name__] = fn
+                    return fn
+                if args and callable(args[0]):
+                    return _decorator(args[0])
+                return _decorator
 
-        def run(self, *args: Any, **kwargs: Any) -> None:
-            raise SystemExit(
-                "Missing 'mcp' package required to run stdio MCP server. "
-                "Install it with: pip install \"mcp[cli]\" pywinauto pywin32"
-            )
+            def run(self, *args: Any, **kwargs: Any) -> None:
+                raise SystemExit(
+                    "Missing 'mcp' package required to run stdio MCP server. "
+                    "Install it with: pip install \"mcp[cli]\" pywinauto pywin32"
+                )
 
 
 # Optional Windows GUI automation imports (handled gracefully if offline)
@@ -5348,7 +5353,6 @@ class SimaticManagerController:
         # Ensure desktop attachment for Windows GUI automation
         hdesk = None
         try:
-            import ctypes
             u32 = ctypes.windll.user32
             hwinsta = u32.OpenWindowStationW("WinSta0", False, 0x037F)
             if hwinsta:
@@ -6499,6 +6503,7 @@ def serialized_gui(function):
             finally:
                 if function.__name__ == "s7_write_program":
                     GUI_ACTIVE_WRITE.clear()
+    wrapper.__signature__ = inspect.signature(function)  # type: ignore[attr-defined]
     return wrapper
 
 
