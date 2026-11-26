@@ -357,8 +357,18 @@ def _encode_db_field_value(data_type: str, value: Any, byte_size: int) -> bytes:
     if dt == "BOOL":
         return bytes([1 if bool(value) else 0])
     if dt in ("BYTE", "CHAR"):
-        if isinstance(value, str) and len(value) == 1:
-            return bytes([ord(value) & 0xFF])
+        if isinstance(value, str):
+            s = value.strip()
+            s_up = s.upper()
+            if s_up.startswith("B#16#"):
+                return bytes([int(s_up[5:], 16) & 0xFF])
+            if s_up.startswith("16#"):
+                return bytes([int(s_up[3:], 16) & 0xFF])
+            if len(s) == 1 and not s.isdigit():
+                return bytes([ord(s) & 0xFF])
+            if len(s) == 3 and s[0] == "'" and s[2] == "'":
+                return bytes([ord(s[1]) & 0xFF])
+            return bytes([int(s) & 0xFF])
         return bytes([int(value) & 0xFF])
     if dt == "INT":
         return struct.pack(">h", int(value))
@@ -501,6 +511,11 @@ def build_db_mc7_block(
             fsize = int(item["size_bytes"])
             raw_init = assignments.get(fname, item.get("initial"))
             if raw_init is None:
+                # Real S7-300/400 DBs must always populate STRING[N] header byte 0 (max capacity)
+                if ftype.upper().startswith("STRING") and fsize >= 2:
+                    m_str = re.match(r"^STRING(?:\[(\d+)\])?$", ftype.upper())
+                    max_len = min(254, int(m_str.group(1))) if (m_str and m_str.group(1)) else 254
+                    buf[b_off] = max_len
                 continue
             val = _coerce_literal(raw_init, ftype)
             if ftype.upper() == "BOOL":

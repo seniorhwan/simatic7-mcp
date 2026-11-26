@@ -4950,6 +4950,7 @@ class S7RuntimeClient:
         port: int = 102,
         rack: int = 0,
         slot: int = 2,
+        connection_type: str = "AUTO",
     ) -> Dict[str, Any]:
         h_low = host.strip().lower()
         if h_low == "virtual":
@@ -4984,7 +4985,9 @@ class S7RuntimeClient:
                 "scan_mode": st.get("scan_mode"),
                 "error": st.get("error"),
             }
-        return self.pool.read_szl_diagnostics(host=host, port=port, rack=rack, slot=slot)
+        return self.pool.read_szl_diagnostics(
+            host=host, port=port, rack=rack, slot=slot, connection_type=connection_type
+        )
 
     def cpu_control(
         self,
@@ -4994,6 +4997,7 @@ class S7RuntimeClient:
         rack: int = 0,
         slot: int = 2,
         confirm_live_write: bool = False,
+        connection_type: str = "AUTO",
     ) -> Dict[str, Any]:
         if not self.writes_enabled(confirm_live_write, host=host, port=port):
             return {
@@ -5018,7 +5022,9 @@ class S7RuntimeClient:
             res["transport"] = "plcsim_s7prosim_com"
             res["action"] = action.upper()
             return res
-        return self.pool.cpu_control(host=host, action=action, port=port, rack=rack, slot=slot)
+        return self.pool.cpu_control(
+            host=host, action=action, port=port, rack=rack, slot=slot, connection_type=connection_type
+        )
 
     def list_online_blocks(
         self,
@@ -5395,7 +5401,7 @@ class S7RuntimeClient:
             report["capabilities"]["can_monitor_and_gather_data"] = True
             report["capabilities"]["can_upload_blocks_via_tcp"] = True
             report["capabilities"]["can_deploy_program_via_tcp"] = is_full_mode and env_writes
-            report["capabilities"]["can_write_memory"] = is_full_mode and env_writes
+            report["capabilities"]["can_write_memory"] = (ACTIVE_ACCESS_MODE in (AccessMode.READ_WRITE, AccessMode.FULL)) and env_writes
 
             # 2. Query CPU SZL identity & RUN/STOP mode
             diag = self.pool.read_szl_diagnostics(
@@ -5464,6 +5470,190 @@ class S7RuntimeClient:
         report["capabilities"]["can_download_program_via_com"] = com_ready
         report["latency_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
         return report
+
+    def diagnose_connectivity(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 102,
+        rack: int = 0,
+        slot: int = 2,
+        probe_count: int = 3,
+        timeout_s: float = 2.5,
+        connection_type: str = "AUTO",
+        auto_probe_slots: bool = True,
+        target_blocks: Optional[Sequence[str]] = None,
+        verify_upload_channel: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Comprehensive 7-stage network, S7comm protocol, CPU health, block-service, and guardrail
+        diagnostic suite to verify communication with a physical S7-300/S7-400 PLC before program uploads.
+        """
+        t0 = time.perf_counter()
+        env_writes = os.environ.get("S7_WRITES_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+        access_mode_val = ACTIVE_ACCESS_MODE.value
+        is_full_mode = ACTIVE_ACCESS_MODE == AccessMode.FULL
+        pgpc_info = self.com_bridge.get_pgpc_interface()
+        com_available = sys.platform == "win32"
+        h_low = host.strip().lower()
+
+        if h_low == "virtual":
+            diag = self.read_cpu_diagnostics(host="virtual")
+            blks = self.list_online_blocks(host="virtual")
+            online_names = list(blks.get("block_names") or [])
+            online_set = set(online_names)
+            blk_details: Dict[str, Any] = {
+                "total_online_blocks": blks.get("total_blocks", len(online_names)),
+                "counts": blks.get("counts", {}),
+                "online_block_names": online_names,
+            }
+            warnings_v: List[str] = []
+            if target_blocks:
+                norm_t = [f"{parse_block_identifier(tb)[0]}{parse_block_identifier(tb)[1]}" for tb in target_blocks]
+                overwrites = [n for n in norm_t if n in online_set]
+                blk_details["target_block_impact"] = {
+                    "requested": norm_t,
+                    "will_overwrite_existing": overwrites,
+                    "will_create_new": [n for n in norm_t if n not in online_set],
+                }
+                if overwrites:
+                    warnings_v.append(
+                        f"Deploying will overwrite existing online block(s): {', '.join(overwrites)}."
+                    )
+            total_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+            return {
+                "ok": True,
+                "read_ready": True,
+                "upload_ready": True,
+                "readiness_verdict": "DEGRADED" if warnings_v else "READY",
+                "transport": "virtual_s7_plc",
+                "host": "virtual",
+                "port": 0,
+                "rack": rack,
+                "slot": slot,
+                "platform": sys.platform,
+                "access_mode": access_mode_val,
+                "s7_writes_enabled_env": env_writes,
+                "pgpc_interface": pgpc_info,
+                "network_reachable": True,
+                "s7comm_healthy": True,
+                "selected_connection_type": "VIRTUAL",
+                "negotiated_pdu": 480,
+                "max_block_chunk_bytes": 456,
+                "discovered_rack_slot": None,
+                "cpu": {
+                    "order_number": diag.get("order_number"),
+                    "cpu_mode": diag.get("cpu_mode"),
+                    "scan_count": diag.get("scan_count"),
+                },
+                "online_blocks": blk_details,
+                "stages": [
+                    {"stage": "dns_resolution", "ok": True, "status": "PASS", "latency_ms": 0.0, "details": {"host": "virtual"}, "remediation": None},
+                    {"stage": "tcp_reachability", "ok": True, "status": "PASS", "latency_ms": 0.0, "details": {"transport": "in_memory"}, "remediation": None},
+                    {"stage": "cotp_tsap_probe", "ok": True, "status": "PASS", "latency_ms": 0.0, "details": {"selected_connection_type": "VIRTUAL"}, "remediation": None},
+                    {"stage": "s7_setup_comm", "ok": True, "status": "PASS", "latency_ms": 0.0, "details": {"negotiated_pdu": 480, "max_block_chunk_bytes": 456}, "remediation": None},
+                    {"stage": "cpu_health_szl", "ok": True, "status": "PASS", "latency_ms": total_ms, "details": {"order_number": diag.get("order_number"), "cpu_mode": diag.get("cpu_mode")}, "remediation": None},
+                    {"stage": "block_transfer_readiness", "ok": True, "status": "PASS", "latency_ms": 0.0, "details": blk_details, "remediation": None},
+                    {"stage": "deployment_guardrails", "ok": True, "status": "PASS", "latency_ms": 0.0, "details": {"access_mode": access_mode_val, "s7_writes_enabled_env": env_writes, "virtual_bypass": True}, "remediation": None},
+                ],
+                "blocking_issues": [],
+                "warnings": warnings_v,
+                "total_latency_ms": total_ms,
+            }
+
+        res = self.pool.diagnose_connectivity(
+            host=host,
+            port=port,
+            rack=rack,
+            slot=slot,
+            probe_count=probe_count,
+            timeout_s=timeout_s,
+            connection_type=connection_type,
+            auto_probe_slots=auto_probe_slots,
+            target_blocks=target_blocks,
+            verify_upload_channel=verify_upload_channel,
+        )
+
+        stages: List[Dict[str, Any]] = list(res.get("stages") or [])
+        blocking_issues: List[str] = list(res.get("blocking_issues") or [])
+        warnings: List[str] = list(res.get("warnings") or [])
+
+        # ---- Stage 7: Deployment Guardrails & Host Environment ----
+        t7 = time.perf_counter()
+        guardrail_blockers: List[str] = []
+        if not is_full_mode:
+            guardrail_blockers.append(
+                f"Server is running in '--mode {access_mode_val}'. Restart with '--mode full' (or S7_ACCESS_MODE=full) to authorize physical PLC program uploads."
+            )
+        if not env_writes:
+            guardrail_blockers.append(
+                "Environment variable S7_WRITES_ENABLED is not 'true'. Set S7_WRITES_ENABLED=true and pass confirm_live_write=True when calling s7_plc_deploy_program."
+            )
+        if com_available and pgpc_info.get("is_plcsim"):
+            warnings.append(
+                f"Windows PG/PC Interface 'S7ONLINE' is set to '{pgpc_info.get('device_name')}' (PLCSIM). "
+                "Direct TCP deployment (s7_plc_deploy_program) bypasses S7ONLINE and still works over port 102, "
+                "but STEP 7 COM downloads (s7_com_download_blocks) require switching S7ONLINE to TCP/IP or MPI/PROFIBUS."
+            )
+
+        guardrails_ok = is_full_mode and env_writes
+        guardrail_rem = " ".join(guardrail_blockers) if guardrail_blockers else None
+        blocking_issues.extend(guardrail_blockers)
+
+        stages.append({
+            "stage": "deployment_guardrails",
+            "ok": guardrails_ok,
+            "status": "PASS" if guardrails_ok else "FAIL",
+            "latency_ms": round((time.perf_counter() - t7) * 1000.0, 2),
+            "details": {
+                "platform": sys.platform,
+                "access_mode": access_mode_val,
+                "full_mode_enabled": is_full_mode,
+                "s7_writes_enabled_env": env_writes,
+                "confirm_live_write_required": True,
+                "com_available": com_available,
+                "pgpc_interface": pgpc_info,
+            },
+            "remediation": guardrail_rem,
+        })
+
+        read_ready = bool(res.get("ok"))
+        upload_ready = read_ready and guardrails_ok
+        if not upload_ready:
+            verdict = "BLOCKED"
+        elif warnings:
+            verdict = "DEGRADED"
+        else:
+            verdict = "READY"
+
+        return {
+            "ok": read_ready,
+            "read_ready": read_ready,
+            "upload_ready": upload_ready,
+            "readiness_verdict": verdict,
+            "transport": "s7comm_iso_tcp",
+            "host": host,
+            "resolved_ip": res.get("resolved_ip"),
+            "port": int(port),
+            "rack": int(rack),
+            "slot": int(slot),
+            "platform": sys.platform,
+            "access_mode": access_mode_val,
+            "s7_writes_enabled_env": env_writes,
+            "pgpc_interface": pgpc_info,
+            "network_reachable": bool(res.get("network_reachable")),
+            "s7comm_healthy": bool(res.get("s7comm_healthy")),
+            "selected_connection_type": res.get("selected_connection_type"),
+            "negotiated_pdu": res.get("negotiated_pdu"),
+            "max_block_chunk_bytes": res.get("max_block_chunk_bytes"),
+            "discovered_rack_slot": res.get("discovered_rack_slot"),
+            "cpu": res.get("cpu"),
+            "online_blocks": res.get("online_blocks"),
+            "stages": stages,
+            "blocking_issues": blocking_issues,
+            "warnings": warnings,
+            "total_latency_ms": round((time.perf_counter() - t0) * 1000.0, 2),
+        }
+
 
     def collect_data(
         self,
@@ -6861,6 +7051,9 @@ def s7_create_project(
         launch_if_closed: If True (default), automatically starts SIMATIC Manager if closed.
         target_cpu: Optional alias for cpu_type.
     """
+    denied = _check_access_mode("s7_create_project", AccessMode.READ_WRITE)
+    if denied:
+        return denied
     eff_cpu = cpu_type or target_cpu
     ok, message, meta = controller.create_project(
         project_name,
@@ -7395,6 +7588,9 @@ def s7_write_symbol_table(
         import_via_gui: Must be False; automated GUI import of symbol tables is not supported safely.
         plc_type: Target PLC family for symbol verification.
     """
+    denied = _check_access_mode("s7_write_symbol_table", AccessMode.READ_WRITE)
+    if denied:
+        return denied
     if not isinstance(import_via_gui, bool):
         return json.dumps({"status": "REJECTED_BEFORE_WRITE", "errors": ["import_via_gui must be a boolean."]}, indent=2)
     if not symbols:
@@ -7479,6 +7675,9 @@ def s7_write_device_comments(
         plc_type: Target PLC family: 'S7-300', 'S7-400', or 'WinAC'.
         import_via_gui: Must be False; automated GUI symbol table import is unsupported.
     """
+    denied = _check_access_mode("s7_write_device_comments", AccessMode.READ_WRITE)
+    if denied:
+        return denied
     if not isinstance(import_via_gui, bool):
         return json.dumps({"status": "REJECTED_BEFORE_WRITE", "errors": ["import_via_gui must be a boolean."]}, indent=2)
     if not device_comments or not isinstance(device_comments, (dict, list)):
@@ -10071,6 +10270,63 @@ def s7_plc_connection_check(
         )
 
 
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, open_world=True, title="Diagnose Physical PLC Connectivity Before Upload"))
+def s7_plc_diagnose_connectivity(
+    host: str = "127.0.0.1",
+    port: int = 102,
+    rack: int = 0,
+    slot: int = 2,
+    probe_count: int = 3,
+    timeout_s: float = 2.5,
+    connection_type: str = "AUTO",
+    auto_probe_slots: bool = True,
+    target_blocks: Optional[List[str]] = None,
+    verify_upload_channel: bool = True,
+) -> str:
+    """
+    Runs a non-destructive 7-stage network, S7comm protocol, CPU health, and deployment-readiness diagnostic
+    against a physical S7-300/S7-400 PLC BEFORE initiating program uploads/downloads:
+      1. DNS / IPv4 resolution
+      2. Multi-probe TCP reachability (min/avg/max RTT, jitter, packet loss %)
+      3. ISO-on-TCP COTP TSAP availability matrix (PG / OP / S7_BASIC) + automatic rack/slot discovery on mismatch
+      4. S7comm 0xF0 Setup Communication & negotiated PDU chunk budget
+      5. CPU SZL identity (0x0011), RUN/STOP/HOLD mode (0x0424) & diagnostic buffer (0x00A0)
+      6. Online block management readiness, target block overwrite analysis & non-destructive 0x1D..0x1F upload probe
+      7. Deployment guardrails (--mode full, S7_WRITES_ENABLED, Windows S7ONLINE PG/PC status)
+
+    Returns an explicit `readiness_verdict` ("READY", "DEGRADED", or "BLOCKED"), `read_ready`, `upload_ready`,
+    per-stage results, and actionable remediation steps. Safe to run in any access mode including `read-only`.
+    """
+    try:
+        res = runtime_client.diagnose_connectivity(
+            host=host,
+            port=port,
+            rack=rack,
+            slot=slot,
+            probe_count=probe_count,
+            timeout_s=timeout_s,
+            connection_type=connection_type,
+            auto_probe_slots=auto_probe_slots,
+            target_blocks=target_blocks,
+            verify_upload_channel=verify_upload_channel,
+        )
+        res["success"] = bool(res.get("read_ready"))
+        return json.dumps(res, indent=2)
+    except Exception as exc:
+        return json.dumps(
+            {
+                "success": False,
+                "read_ready": False,
+                "upload_ready": False,
+                "readiness_verdict": "BLOCKED",
+                "failure_category": FailureCategory.TRANSPORT_ERROR.value,
+                "error": str(exc),
+            },
+            indent=2,
+        )
+
+
+
 @mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, open_world=True, title="List Online PLC Blocks (S7comm TCP)"))
 def s7_runtime_list_online_blocks(
     host: str = "127.0.0.1",
@@ -10204,6 +10460,7 @@ def s7_plc_deploy_program(
     activate: bool = True,
     copy_ram_to_rom: bool = False,
     verify_online: bool = True,
+    preflight_check: bool = True,
     connection_type: str = "AUTO",
     timeout_s: float = 20.0,
     confirm_live_write: bool = False,
@@ -10414,6 +10671,48 @@ def s7_plc_deploy_program(
             ),
         )
 
+        # Optional Step 0: Fast pre-upload connectivity & S7comm diagnostic gate
+        preflight_diag: Optional[Dict[str, Any]] = None
+        effective_conn_type = connection_type
+        if preflight_check and h_low != "virtual":
+            preflight_diag = runtime_client.pool.diagnose_connectivity(
+                host=host,
+                port=port,
+                rack=rack,
+                slot=slot,
+                probe_count=1,
+                timeout_s=min(float(timeout_s), 4.0),
+                connection_type=connection_type,
+                auto_probe_slots=True,
+                target_blocks=[k for k, _ in ordered_items],
+                verify_upload_channel=False,
+            )
+            if not preflight_diag.get("ok"):
+                reason = "; ".join(preflight_diag.get("blocking_issues") or []) or (
+                    f"Pre-upload connectivity diagnostic failed for {host}:{port} (rack={rack}, slot={slot})."
+                )
+                AUDIT_LOGGER.record(
+                    tool="s7_plc_deploy_program",
+                    action="preflight_blocked",
+                    target=f"{host}:{port}",
+                    success=False,
+                    status="FAILED",
+                    failure_category=FailureCategory.TRANSPORT_ERROR.value,
+                )
+                return json.dumps(
+                    {
+                        "success": False,
+                        "status": "PREFLIGHT_DIAGNOSTIC_FAILED",
+                        "failure_category": FailureCategory.TRANSPORT_ERROR.value,
+                        "error": reason,
+                        "preflight_diagnostics": preflight_diag,
+                        "latency_ms": round((time.perf_counter() - t0) * 1000.0, 2),
+                    },
+                    indent=2,
+                )
+            if preflight_diag.get("selected_connection_type"):
+                effective_conn_type = str(preflight_diag["selected_connection_type"])
+
         # Optional Step A: Backup existing online blocks before overwriting
         backups: Dict[str, Any] = {}
         if backup_before_overwrite:
@@ -10427,7 +10726,7 @@ def s7_plc_deploy_program(
                         slot=slot,
                         save_to_backup=True,
                         timeout_s=timeout_s,
-                        connection_type=connection_type,
+                        connection_type=effective_conn_type,
                     )
                     if up.get("ok"):
                         backups[b_key] = {
@@ -10446,7 +10745,13 @@ def s7_plc_deploy_program(
         cpu_restarted = False
         if stop_cpu_for_download:
             stop_res = runtime_client.cpu_control(
-                action="STOP", host=host, port=port, rack=rack, slot=slot, confirm_live_write=confirm_live_write
+                action="STOP",
+                host=host,
+                port=port,
+                rack=rack,
+                slot=slot,
+                confirm_live_write=confirm_live_write,
+                connection_type=effective_conn_type,
             )
             cpu_stopped = bool(stop_res.get("ok"))
 
@@ -10467,7 +10772,7 @@ def s7_plc_deploy_program(
                     activate=activate,
                     copy_ram_to_rom=False,
                     timeout_s=timeout_s,
-                    connection_type=connection_type,
+                    connection_type=effective_conn_type,
                     confirm_live_write=confirm_live_write,
                 )
                 if dl.get("ok"):
@@ -10486,14 +10791,20 @@ def s7_plc_deploy_program(
                 rack=rack,
                 slot=slot,
                 timeout_s=max(timeout_s, 30.0),
-                connection_type=connection_type,
+                connection_type=effective_conn_type,
                 confirm_live_write=confirm_live_write,
             )
 
         # Optional Step E: Restart CPU if we stopped it
         if cpu_stopped and not failed_results:
             run_res = runtime_client.cpu_control(
-                action="RUN", host=host, port=port, rack=rack, slot=slot, confirm_live_write=confirm_live_write
+                action="RUN",
+                host=host,
+                port=port,
+                rack=rack,
+                slot=slot,
+                confirm_live_write=confirm_live_write,
+                connection_type=effective_conn_type,
             )
             cpu_restarted = bool(run_res.get("ok"))
 
@@ -10501,9 +10812,11 @@ def s7_plc_deploy_program(
         online_verification: Optional[Dict[str, Any]] = None
         if verify_online and deployed_results:
             try:
-                diag = runtime_client.read_cpu_diagnostics(host=host, port=port, rack=rack, slot=slot)
+                diag = runtime_client.read_cpu_diagnostics(
+                    host=host, port=port, rack=rack, slot=slot, connection_type=effective_conn_type
+                )
                 inv = runtime_client.list_online_blocks(
-                    host=host, port=port, rack=rack, slot=slot, include_block_numbers=True, connection_type=connection_type
+                    host=host, port=port, rack=rack, slot=slot, include_block_numbers=True, connection_type=effective_conn_type
                 )
                 online_names = set(inv.get("block_names", []))
                 deployed_names = [d["block_name"] for d in deployed_results]
@@ -10536,6 +10849,7 @@ def s7_plc_deploy_program(
                 "rack": rack,
                 "slot": slot,
                 "source_origin": source_origin,
+                "preflight_diagnostics": preflight_diag,
                 "deployed_count": len(deployed_results),
                 "deployed_blocks": deployed_results,
                 "failed_blocks": failed_results,

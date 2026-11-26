@@ -1572,6 +1572,510 @@ class S7ConnectionPool:
             "latency_ms": round((time.perf_counter() - t0) * 1000.0, 2),
         }
 
+    def _probe_single_cotp_s7(
+        self,
+        resolved_ip: str,
+        port: int,
+        rack: int,
+        slot: int,
+        conn_type: str,
+        timeout_s: float,
+    ) -> Dict[str, Any]:
+        """Run a fresh non-pooled COTP CR/CC + S7 0xF0 Setup Comm probe for one (rack, slot, TSAP)."""
+        t0 = time.perf_counter()
+        sock: Optional[socket.socket] = None
+        try:
+            sock = socket.create_connection((resolved_ip, port), timeout=timeout_s)
+            sock.settimeout(timeout_s)
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except Exception:
+                pass
+            sock.sendall(build_cotp_cr(rack, slot, connection_type=conn_type))
+            cc = recv_tpkt(sock)
+            if len(cc) < 6 or cc[5] != 0xD0:
+                cotp_code = f"0x{cc[5]:02X}" if len(cc) >= 6 else "EMPTY"
+                return {
+                    "ok": False,
+                    "cotp_accepted": False,
+                    "cotp_pdu_type": cotp_code,
+                    "connection_type": conn_type,
+                    "rack": rack,
+                    "slot": slot,
+                    "latency_ms": round((time.perf_counter() - t0) * 1000.0, 2),
+                    "error": f"COTP rejected (PDU={cotp_code})",
+                }
+            sock.sendall(build_s7_setup_comm(pdu_ref=1, max_pdu=480))
+            setup_resp = recv_tpkt(sock)
+            _, err, param, _ = parse_s7_ack_data(setup_resp)
+            if err != 0:
+                return {
+                    "ok": False,
+                    "cotp_accepted": True,
+                    "s7_setup_ok": False,
+                    "connection_type": conn_type,
+                    "rack": rack,
+                    "slot": slot,
+                    "error_code": f"0x{err:04X}",
+                    "error": describe_s7_error(err),
+                    "latency_ms": round((time.perf_counter() - t0) * 1000.0, 2),
+                }
+            neg_pdu = struct.unpack(">H", param[6:8])[0] if len(param) >= 8 else 240
+            return {
+                "ok": True,
+                "cotp_accepted": True,
+                "s7_setup_ok": True,
+                "connection_type": conn_type,
+                "rack": rack,
+                "slot": slot,
+                "negotiated_pdu": max(96, neg_pdu),
+                "max_block_chunk_bytes": max(32, ((max(96, neg_pdu) - 24) // 2) * 2),
+                "latency_ms": round((time.perf_counter() - t0) * 1000.0, 2),
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "cotp_accepted": False,
+                "connection_type": conn_type,
+                "rack": rack,
+                "slot": slot,
+                "latency_ms": round((time.perf_counter() - t0) * 1000.0, 2),
+                "error": str(exc),
+            }
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+    def diagnose_connectivity(
+        self,
+        host: str,
+        port: int = 102,
+        rack: int = 0,
+        slot: int = 2,
+        probe_count: int = 3,
+        timeout_s: float = 2.5,
+        connection_type: str = "AUTO",
+        auto_probe_slots: bool = True,
+        target_blocks: Optional[Sequence[str]] = None,
+        verify_upload_channel: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Comprehensive multi-layer network & S7comm communication diagnostic suite designed
+        to run BEFORE initiating program uploads/downloads to a physical S7-300/S7-400 PLC.
+
+        Verifies 6 transport/PLC layers (caller may append guardrail stage 7):
+          1. DNS / IPv4 resolution
+          2. Multi-probe TCP port reachability, RTT min/avg/max, jitter & packet loss
+          3. ISO-on-TCP COTP TSAP resource availability matrix (PG / OP / S7_BASIC) + auto rack/slot discovery
+          4. S7comm 0xF0 Setup Communication & negotiated PDU chunk budget
+          5. CPU SZL identity (0x0011), operating mode (0x0424) & diagnostic buffer health (0x00A0)
+          6. Block management service readiness, target block overwrite map & optional 0x1D..0x1F upload channel probe
+        """
+        t_start = time.perf_counter()
+        stages: List[Dict[str, Any]] = []
+        blocking_issues: List[str] = []
+        warnings: List[str] = []
+
+        eff_probes = max(1, min(10, int(probe_count)))
+        eff_timeout = max(0.3, min(15.0, float(timeout_s)))
+
+        # ---- Stage 1: DNS / Host Resolution ----
+        t1 = time.perf_counter()
+        resolved_ip = host
+        resolved_ips: List[str] = []
+        try:
+            infos = socket.getaddrinfo(host, int(port), family=socket.AF_INET, type=socket.SOCK_STREAM)
+            resolved_ips = sorted({info[4][0] for info in infos})
+            resolved_ip = resolved_ips[0] if resolved_ips else host
+            stages.append({
+                "stage": "dns_resolution",
+                "ok": True,
+                "status": "PASS",
+                "latency_ms": round((time.perf_counter() - t1) * 1000.0, 2),
+                "details": {"host": host, "resolved_ip": resolved_ip, "addresses": resolved_ips},
+                "remediation": None,
+            })
+        except Exception as exc:
+            rem = f"Cannot resolve PLC host {host!r}. Use the PLC's IPv4 address directly (e.g. '192.168.0.10') or verify DNS/hosts configuration."
+            blocking_issues.append(rem)
+            stages.append({
+                "stage": "dns_resolution",
+                "ok": False,
+                "status": "FAIL",
+                "latency_ms": round((time.perf_counter() - t1) * 1000.0, 2),
+                "details": {"host": host, "error": str(exc)},
+                "remediation": rem,
+            })
+            return {
+                "ok": False,
+                "host": host,
+                "port": int(port),
+                "rack": int(rack),
+                "slot": int(slot),
+                "network_reachable": False,
+                "s7comm_healthy": False,
+                "stages": stages,
+                "blocking_issues": blocking_issues,
+                "warnings": warnings,
+                "total_latency_ms": round((time.perf_counter() - t_start) * 1000.0, 2),
+            }
+
+        # ---- Stage 2: Raw TCP Reachability, RTT, Jitter & Packet Loss ----
+        t2 = time.perf_counter()
+        rtts: List[float] = []
+        tcp_errors: List[str] = []
+        for _ in range(eff_probes):
+            tp = time.perf_counter()
+            s: Optional[socket.socket] = None
+            try:
+                s = socket.create_connection((resolved_ip, int(port)), timeout=eff_timeout)
+                rtts.append(round((time.perf_counter() - tp) * 1000.0, 2))
+            except Exception as exc:
+                tcp_errors.append(str(exc))
+            finally:
+                if s is not None:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+
+        loss_pct = round(((eff_probes - len(rtts)) / eff_probes) * 100.0, 1)
+        tcp_ok = len(rtts) > 0
+        avg_rtt = round(sum(rtts) / len(rtts), 2) if rtts else None
+        min_rtt = min(rtts) if rtts else None
+        max_rtt = max(rtts) if rtts else None
+        jitter_ms = round((max_rtt - min_rtt), 2) if (min_rtt is not None and max_rtt is not None) else None
+
+        tcp_rem: Optional[str] = None
+        if not tcp_ok:
+            tcp_rem = (
+                f"TCP port {port} on {resolved_ip} is unreachable (100% packet loss; last error: {tcp_errors[-1] if tcp_errors else 'timeout'}). "
+                "Verify Ethernet/PROFINET cable, PC subnet mask matches PLC subnet, industrial firewall allows TCP 102, and PLC/CP343-1 is powered on."
+            )
+            blocking_issues.append(tcp_rem)
+        elif loss_pct > 0.0:
+            w = f"Intermittent TCP connectivity to {resolved_ip}:{port} ({loss_pct}% connection drop across {eff_probes} probes). Check cable/switch stability before deploying programs."
+            warnings.append(w)
+            tcp_rem = w
+        elif avg_rtt is not None and avg_rtt > 150.0:
+            w = f"High TCP RTT to PLC ({avg_rtt} ms avg, jitter {jitter_ms} ms). Consider increasing transfer timeout_s."
+            warnings.append(w)
+
+        stages.append({
+            "stage": "tcp_reachability",
+            "ok": tcp_ok,
+            "status": "PASS" if (tcp_ok and loss_pct == 0.0) else ("WARN" if tcp_ok else "FAIL"),
+            "latency_ms": round((time.perf_counter() - t2) * 1000.0, 2),
+            "details": {
+                "resolved_ip": resolved_ip,
+                "port": int(port),
+                "probes_sent": eff_probes,
+                "probes_succeeded": len(rtts),
+                "packet_loss_pct": loss_pct,
+                "min_rtt_ms": min_rtt,
+                "avg_rtt_ms": avg_rtt,
+                "max_rtt_ms": max_rtt,
+                "jitter_ms": jitter_ms,
+                "errors": tcp_errors[:3],
+            },
+            "remediation": tcp_rem,
+        })
+
+        if not tcp_ok:
+            return {
+                "ok": False,
+                "host": host,
+                "resolved_ip": resolved_ip,
+                "port": int(port),
+                "rack": int(rack),
+                "slot": int(slot),
+                "network_reachable": False,
+                "s7comm_healthy": False,
+                "stages": stages,
+                "blocking_issues": blocking_issues,
+                "warnings": warnings,
+                "total_latency_ms": round((time.perf_counter() - t_start) * 1000.0, 2),
+            }
+
+        # ---- Stage 3: ISO-on-TCP COTP TSAP Matrix & Optional Rack/Slot Auto-Discovery ----
+        t3 = time.perf_counter()
+        ct_req = (connection_type or "AUTO").strip().upper()
+        tsap_order = ["PG", "OP", "S7_BASIC"] if ct_req == "AUTO" else [ct_req if ct_req in S7_CONN_TYPES else "PG"]
+        tsap_matrix: Dict[str, Dict[str, Any]] = {}
+        best_probe: Optional[Dict[str, Any]] = None
+        for ct in tsap_order:
+            p = self._probe_single_cotp_s7(resolved_ip, int(port), int(rack), int(slot), ct, eff_timeout)
+            tsap_matrix[ct] = p
+            if p["ok"] and best_probe is None:
+                best_probe = p
+
+        discovered_rack_slot: Optional[Dict[str, Any]] = None
+        if best_probe is None and auto_probe_slots:
+            candidates = [(0, 2), (0, 3), (0, 1), (0, 4), (1, 2), (1, 3)]
+            for cand_r, cand_s in candidates:
+                if (cand_r, cand_s) == (int(rack), int(slot)):
+                    continue
+                for ct in ("PG", "OP", "S7_BASIC"):
+                    p = self._probe_single_cotp_s7(resolved_ip, int(port), cand_r, cand_s, ct, min(eff_timeout, 1.5))
+                    if p["ok"]:
+                        discovered_rack_slot = {
+                            "rack": cand_r,
+                            "slot": cand_s,
+                            "connection_type": ct,
+                            "negotiated_pdu": p.get("negotiated_pdu"),
+                        }
+                        break
+                if discovered_rack_slot is not None:
+                    break
+
+        cotp_ok = best_probe is not None
+        cotp_rem: Optional[str] = None
+        if not cotp_ok:
+            if discovered_rack_slot:
+                cotp_rem = (
+                    f"COTP rejected on requested rack={rack}, slot={slot}, BUT a Siemens CPU responded on "
+                    f"rack={discovered_rack_slot['rack']}, slot={discovered_rack_slot['slot']} "
+                    f"(TSAP={discovered_rack_slot['connection_type']}, PDU={discovered_rack_slot['negotiated_pdu']}). "
+                    f"Re-run with rack={discovered_rack_slot['rack']}, slot={discovered_rack_slot['slot']}!"
+                )
+            else:
+                cotp_rem = (
+                    f"TCP port {port} is open, but ISO-on-TCP COTP handshake failed for rack={rack}, slot={slot} across {tsap_order}. "
+                    "Verify CPU rack/slot (S7-300=rack 0 slot 2; S7-400=rack 0 slot 3), PUT/GET or PG/OP connection resources, and that no other engineering station exhausted all CPU connections."
+                )
+            blocking_issues.append(cotp_rem)
+        elif ct_req == "AUTO" and not tsap_matrix.get("PG", {}).get("ok"):
+            w = (
+                f"PG connection resource (TSAP 0x01) is occupied on rack={rack}, slot={slot} (often held by SIMATIC Manager), "
+                f"so communication fell back to {best_probe['connection_type']} TSAP. Live monitoring and S7comm transfers will use {best_probe['connection_type']}."
+            )
+            warnings.append(w)
+            cotp_rem = w
+
+        stages.append({
+            "stage": "cotp_tsap_probe",
+            "ok": cotp_ok,
+            "status": "PASS" if (cotp_ok and (ct_req != "AUTO" or tsap_matrix.get("PG", {}).get("ok"))) else ("WARN" if cotp_ok else "FAIL"),
+            "latency_ms": round((time.perf_counter() - t3) * 1000.0, 2),
+            "details": {
+                "requested_rack": int(rack),
+                "requested_slot": int(slot),
+                "selected_connection_type": best_probe["connection_type"] if best_probe else None,
+                "tsap_availability": {k: bool(v.get("ok")) for k, v in tsap_matrix.items()},
+                "tsap_probes": tsap_matrix,
+                "discovered_rack_slot": discovered_rack_slot,
+            },
+            "remediation": cotp_rem,
+        })
+
+        if not cotp_ok or best_probe is None:
+            return {
+                "ok": False,
+                "host": host,
+                "resolved_ip": resolved_ip,
+                "port": int(port),
+                "rack": int(rack),
+                "slot": int(slot),
+                "network_reachable": True,
+                "s7comm_healthy": False,
+                "discovered_rack_slot": discovered_rack_slot,
+                "stages": stages,
+                "blocking_issues": blocking_issues,
+                "warnings": warnings,
+                "total_latency_ms": round((time.perf_counter() - t_start) * 1000.0, 2),
+            }
+
+        selected_ct = best_probe["connection_type"]
+        neg_pdu = int(best_probe["negotiated_pdu"])
+        max_chunk = int(best_probe["max_block_chunk_bytes"])
+
+        # ---- Stage 4: S7comm Setup Communication & PDU Budget ----
+        stages.append({
+            "stage": "s7_setup_comm",
+            "ok": True,
+            "status": "PASS",
+            "latency_ms": best_probe["latency_ms"],
+            "details": {
+                "connection_type": selected_ct,
+                "negotiated_pdu": neg_pdu,
+                "max_block_chunk_bytes": max_chunk,
+                "recommended_for_s7_300": neg_pdu == 240,
+            },
+            "remediation": None,
+        })
+
+        # ---- Stage 5: CPU Identity, Operating Mode & Diagnostic Buffer (SZL) ----
+        t5 = time.perf_counter()
+        cpu_info: Dict[str, Any] = {}
+        szl_ok = False
+        szl_rem: Optional[str] = None
+        try:
+            diag = self.read_szl_diagnostics(
+                host=resolved_ip,
+                port=int(port),
+                rack=int(rack),
+                slot=int(slot),
+                timeout_s=eff_timeout,
+                connection_type=selected_ct,
+            )
+            szl_ok = bool(diag.get("ok"))
+            cpu_mode = str(diag.get("cpu_mode") or "UNKNOWN")
+            cpu_info = {
+                "order_number": diag.get("order_number", "UNKNOWN"),
+                "cpu_mode": cpu_mode,
+                "diagnostics_count": diag.get("diagnostics_count", 0),
+                "recent_diagnostics": (diag.get("diagnostics_buffer") or [])[:5],
+                "szl_errors": diag.get("szl_errors"),
+            }
+            if cpu_mode == "STOP":
+                w = "PLC CPU is currently in STOP mode. Program download is permitted in STOP, but remember to switch CPU back to RUN after verification."
+                warnings.append(w)
+                szl_rem = w
+            elif cpu_mode == "HOLD":
+                w = "PLC CPU is in HOLD/breakpoint mode. Verify debugging session before downloading blocks."
+                warnings.append(w)
+                szl_rem = w
+            elif not szl_ok:
+                w = "CPU SZL diagnostics partially unavailable; S7comm data/block communication may still work."
+                warnings.append(w)
+                szl_rem = w
+        except Exception as exc:
+            szl_rem = f"SZL CPU diagnostics query failed: {exc}"
+            warnings.append(szl_rem)
+            cpu_info = {"error": str(exc)}
+
+        stages.append({
+            "stage": "cpu_health_szl",
+            "ok": szl_ok,
+            "status": "PASS" if (szl_ok and cpu_info.get("cpu_mode") == "RUN") else "WARN",
+            "latency_ms": round((time.perf_counter() - t5) * 1000.0, 2),
+            "details": cpu_info,
+            "remediation": szl_rem,
+        })
+
+        # ---- Stage 6: Block Services, Target Overwrite Analysis & Non-Destructive Upload Probe ----
+        t6 = time.perf_counter()
+        blk_ok = False
+        blk_details: Dict[str, Any] = {}
+        blk_rem: Optional[str] = None
+        try:
+            inv = self.list_online_blocks(
+                host=resolved_ip,
+                port=int(port),
+                rack=int(rack),
+                slot=int(slot),
+                include_block_numbers=True,
+                timeout_s=eff_timeout,
+                connection_type=selected_ct,
+            )
+            blk_ok = bool(inv.get("ok"))
+            online_names = list(inv.get("block_names") or [])
+            online_set = set(online_names)
+            blk_details = {
+                "total_online_blocks": inv.get("total_blocks", 0),
+                "counts": inv.get("counts", {}),
+                "online_block_names": online_names,
+            }
+
+            if target_blocks:
+                normalized_targets: List[str] = []
+                invalid_targets: List[str] = []
+                for tb in target_blocks:
+                    try:
+                        bt, bnum = parse_block_identifier(tb)
+                        normalized_targets.append(f"{bt}{bnum}")
+                    except ValueError:
+                        invalid_targets.append(str(tb))
+                will_overwrite = [n for n in normalized_targets if n in online_set]
+                new_blocks = [n for n in normalized_targets if n not in online_set]
+                blk_details["target_block_impact"] = {
+                    "requested": normalized_targets,
+                    "will_overwrite_existing": will_overwrite,
+                    "will_create_new": new_blocks,
+                    "invalid_identifiers": invalid_targets,
+                }
+                if invalid_targets:
+                    warnings.append(
+                        f"Ignored invalid target_blocks identifier(s): {', '.join(invalid_targets)} "
+                        "(expected OB/FC/FB/DB/SDB/SFC/SFB followed by a number)."
+                    )
+                if will_overwrite:
+                    warnings.append(
+                        f"Deploying will overwrite existing online block(s): {', '.join(will_overwrite)}. "
+                        "Keep backup_before_overwrite=True when calling s7_plc_deploy_program."
+                    )
+
+            if verify_upload_channel and online_names:
+                probe_target = "OB1" if "OB1" in online_set else online_names[0]
+                p_bt, p_bnum = parse_block_identifier(probe_target)
+                try:
+                    up_probe = self.upload_block(
+                        host=resolved_ip,
+                        block_type=p_bt,
+                        block_number=p_bnum,
+                        port=int(port),
+                        rack=int(rack),
+                        slot=int(slot),
+                        timeout_s=max(eff_timeout, 5.0),
+                        connection_type=selected_ct,
+                    )
+                    blk_details["upload_channel_probe"] = {
+                        "ok": True,
+                        "probed_block": probe_target,
+                        "byte_length": up_probe.get("byte_length"),
+                        "chunks_received": up_probe.get("chunks_received"),
+                        "latency_ms": up_probe.get("latency_ms"),
+                    }
+                except Exception as up_exc:
+                    blk_details["upload_channel_probe"] = {
+                        "ok": False,
+                        "probed_block": probe_target,
+                        "error": str(up_exc),
+                    }
+                    w = (
+                        f"Block inventory succeeded, but read-only upload probe of {probe_target} (0x1D..0x1F) returned: {up_exc}. "
+                        "Check CPU protection level / know-how protection or firewall DPI rules on S7comm block transfer packets."
+                    )
+                    warnings.append(w)
+                    blk_rem = w
+        except Exception as exc:
+            blk_ok = False
+            blk_rem = f"S7comm Block Management service query failed: {exc}. Verify CPU allows S7comm block access and is not read/write protected."
+            blocking_issues.append(blk_rem)
+            blk_details = {"error": str(exc)}
+
+        stages.append({
+            "stage": "block_transfer_readiness",
+            "ok": blk_ok,
+            "status": "PASS" if (blk_ok and not blk_rem) else ("WARN" if blk_ok else "FAIL"),
+            "latency_ms": round((time.perf_counter() - t6) * 1000.0, 2),
+            "details": blk_details,
+            "remediation": blk_rem,
+        })
+
+        return {
+            "ok": tcp_ok and cotp_ok and blk_ok,
+            "host": host,
+            "resolved_ip": resolved_ip,
+            "port": int(port),
+            "rack": int(rack),
+            "slot": int(slot),
+            "network_reachable": True,
+            "s7comm_healthy": cotp_ok and blk_ok,
+            "selected_connection_type": selected_ct,
+            "negotiated_pdu": neg_pdu,
+            "max_block_chunk_bytes": max_chunk,
+            "cpu": cpu_info,
+            "online_blocks": blk_details,
+            "stages": stages,
+            "blocking_issues": blocking_issues,
+            "warnings": warnings,
+            "total_latency_ms": round((time.perf_counter() - t_start) * 1000.0, 2),
+        }
+
 
 # ---------------------------------------------------------------------------
 # Watch Table (VAT) Monitor with Symbolic Resolution & Delta Tracking
@@ -3540,6 +4044,7 @@ class EnhancedS7LoopbackServer:
         plc: Optional[VirtualS7PLC] = None,
         max_pdu: int = 480,
         allowed_connection_types: Optional[Sequence[str]] = None,
+        allowed_rack_slots: Optional[Sequence[Tuple[int, int]]] = None,
     ) -> None:
         self.host = host
         self.requested_port = port
@@ -3548,6 +4053,11 @@ class EnhancedS7LoopbackServer:
         self.allowed_connection_types = (
             {S7_CONN_TYPES[c.strip().upper()] for c in allowed_connection_types if c.strip().upper() in S7_CONN_TYPES}
             if allowed_connection_types is not None
+            else None
+        )
+        self.allowed_rack_slots = (
+            {(int(r), int(s)) for r, s in allowed_rack_slots}
+            if allowed_rack_slots is not None
             else None
         )
         self._server: Optional[socketserver.ThreadingTCPServer] = None
@@ -3575,6 +4085,7 @@ class EnhancedS7LoopbackServer:
         plc_ref = self.plc
         server_max_pdu = self.max_pdu
         allowed_conn_codes = self.allowed_connection_types
+        allowed_rs = self.allowed_rack_slots
         collect_blocks = self._collect_plc_blocks
 
         class _Handler(socketserver.BaseRequestHandler):
@@ -3604,7 +4115,7 @@ class EnhancedS7LoopbackServer:
                     if len(frame) < 6:
                         break
                     cotp_type = frame[5]
-                    if cotp_type == 0xE0:  # COTP CR -> CC (or Disconnect Request if TSAP rejected)
+                    if cotp_type == 0xE0:  # COTP CR -> CC (or Disconnect Request if TSAP/slot rejected)
                         dst_tsap_hi = 0x01
                         dst_tsap_lo = 0x02
                         # Locate 0xC2 parameter (Dst TSAP) inside COTP CR
@@ -3617,8 +4128,14 @@ class EnhancedS7LoopbackServer:
                                 dst_tsap_lo = frame[pos + 3]
                                 break
                             pos += 2 + p_len
+                        req_rack = (dst_tsap_lo >> 5) & 0x07
+                        req_slot = dst_tsap_lo & 0x1F
                         if allowed_conn_codes is not None and dst_tsap_hi not in allowed_conn_codes:
                             # Send COTP Disconnect Request (0x80) to simulate occupied PG resource
+                            dr = bytes([0x03, 0x00, 0x00, 0x0B, 0x06, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00])
+                            sock.sendall(dr)
+                            break
+                        if allowed_rs is not None and (req_rack, req_slot) not in allowed_rs:
                             dr = bytes([0x03, 0x00, 0x00, 0x0B, 0x06, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00])
                             sock.sendall(dr)
                             break

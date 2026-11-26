@@ -531,6 +531,7 @@ class TestPhysicalPLCTCPTransferEndToEnd(unittest.TestCase):
 
     def test_new_tools_registered_with_annotations(self) -> None:
         expected = {
+            "s7_plc_diagnose_connectivity",
             "s7_plc_deploy_program",
             "s7_plc_upload_block",
             "s7_plc_delete_block",
@@ -548,5 +549,288 @@ class TestPhysicalPLCTCPTransferEndToEnd(unittest.TestCase):
                 self.assertTrue(callable(getattr(srv, name, None)))
 
 
+class TestPreUploadConnectivityDiagnostics(unittest.TestCase):
+    """Real TCP socket tests for s7_plc_diagnose_connectivity and s7_plc_deploy_program preflight gate."""
+
+    def setUp(self) -> None:
+        self._prev_mode = srv.ACTIVE_ACCESS_MODE
+        self._prev_writes = os.environ.get("S7_WRITES_ENABLED")
+        self.plc = VirtualS7PLC(order_number="6ES7 315-2EH14-0AB0")
+        self.plc.store_mc7_block("OB1", build_mc7_block("OB", 1, b"\x00\x00" * 16 + MC7_OP_BE, author="DIAG"))
+        self.server = EnhancedS7LoopbackServer(host="127.0.0.1", port=0, plc=self.plc, max_pdu=240)
+        self.port = self.server.start()
+
+    def tearDown(self) -> None:
+        srv.runtime_client.pool.close_all()
+        self.server.stop()
+        srv.set_access_mode(self._prev_mode.value)
+        if self._prev_writes is None:
+            os.environ.pop("S7_WRITES_ENABLED", None)
+        else:
+            os.environ["S7_WRITES_ENABLED"] = self._prev_writes
+
+    def test_healthy_s7_300_plc_returns_ready_and_all_7_stages_pass(self) -> None:
+        srv.set_access_mode("full")
+        os.environ["S7_WRITES_ENABLED"] = "true"
+
+        res = json.loads(
+            srv.s7_plc_diagnose_connectivity(
+                host="127.0.0.1",
+                port=self.port,
+                rack=0,
+                slot=2,
+                probe_count=3,
+                verify_upload_channel=True,
+            )
+        )
+        self.assertTrue(res["success"], res)
+        self.assertTrue(res["read_ready"])
+        self.assertTrue(res["upload_ready"])
+        self.assertEqual(res["readiness_verdict"], "READY")
+        self.assertTrue(res["network_reachable"])
+        self.assertTrue(res["s7comm_healthy"])
+        self.assertEqual(res["selected_connection_type"], "PG")
+        self.assertEqual(res["negotiated_pdu"], 240)
+        self.assertEqual(res["max_block_chunk_bytes"], 216)
+        self.assertEqual(len(res["stages"]), 7)
+        stage_map = {st["stage"]: st for st in res["stages"]}
+        self.assertEqual(
+            set(stage_map.keys()),
+            {
+                "dns_resolution",
+                "tcp_reachability",
+                "cotp_tsap_probe",
+                "s7_setup_comm",
+                "cpu_health_szl",
+                "block_transfer_readiness",
+                "deployment_guardrails",
+            },
+        )
+        for st in res["stages"]:
+            self.assertEqual(st["status"], "PASS", st)
+        self.assertEqual(stage_map["tcp_reachability"]["details"]["probes_succeeded"], 3)
+        self.assertEqual(stage_map["tcp_reachability"]["details"]["packet_loss_pct"], 0.0)
+        self.assertTrue(stage_map["block_transfer_readiness"]["details"]["upload_channel_probe"]["ok"])
+        self.assertEqual(stage_map["block_transfer_readiness"]["details"]["upload_channel_probe"]["probed_block"], "OB1")
+
+        # Target blocks overwrite analysis detects OB1 overwrite + FC99 creation
+        res_tgt = json.loads(
+            srv.s7_plc_diagnose_connectivity(
+                host="127.0.0.1",
+                port=self.port,
+                probe_count=1,
+                target_blocks=["OB1", "FC99"],
+                verify_upload_channel=False,
+            )
+        )
+        self.assertTrue(res_tgt["upload_ready"])
+        impact = res_tgt["online_blocks"]["target_block_impact"]
+        self.assertEqual(impact["will_overwrite_existing"], ["OB1"])
+        self.assertEqual(impact["will_create_new"], ["FC99"])
+        self.assertEqual(res_tgt["readiness_verdict"], "DEGRADED")
+        self.assertTrue(any("OB1" in w for w in res_tgt["warnings"]))
+
+    def test_occupied_pg_resource_falls_back_to_op_and_warns_degraded(self) -> None:
+        srv.set_access_mode("full")
+        os.environ["S7_WRITES_ENABLED"] = "true"
+        op_server = EnhancedS7LoopbackServer(
+            host="127.0.0.1",
+            port=0,
+            plc=self.plc,
+            max_pdu=240,
+            allowed_connection_types=["OP", "S7_BASIC"],
+        )
+        op_port = op_server.start()
+        try:
+            res = json.loads(
+                srv.s7_plc_diagnose_connectivity(
+                    host="127.0.0.1",
+                    port=op_port,
+                    rack=0,
+                    slot=2,
+                    probe_count=2,
+                    connection_type="AUTO",
+                )
+            )
+            self.assertTrue(res["success"], res)
+            self.assertTrue(res["read_ready"])
+            self.assertTrue(res["upload_ready"])
+            self.assertEqual(res["readiness_verdict"], "DEGRADED")
+            self.assertEqual(res["selected_connection_type"], "OP")
+            cotp_stage = next(st for st in res["stages"] if st["stage"] == "cotp_tsap_probe")
+            self.assertEqual(cotp_stage["status"], "WARN")
+            self.assertEqual(
+                cotp_stage["details"]["tsap_availability"],
+                {"PG": False, "OP": True, "S7_BASIC": True},
+            )
+        finally:
+            srv.runtime_client.pool.close_all()
+            op_server.stop()
+
+    def test_wrong_rack_slot_auto_discovers_s7_400_slot_3(self) -> None:
+        srv.set_access_mode("full")
+        os.environ["S7_WRITES_ENABLED"] = "true"
+        s7_400_plc = VirtualS7PLC(order_number="6ES7 416-3XR05-0AB0")
+        s7_400_server = EnhancedS7LoopbackServer(
+            host="127.0.0.1",
+            port=0,
+            plc=s7_400_plc,
+            max_pdu=480,
+            allowed_rack_slots=[(0, 3)],
+        )
+        s400_port = s7_400_server.start()
+        try:
+            # Request S7-300 default slot=2 against an S7-400 CPU sitting on rack=0, slot=3
+            res = json.loads(
+                srv.s7_plc_diagnose_connectivity(
+                    host="127.0.0.1",
+                    port=s400_port,
+                    rack=0,
+                    slot=2,
+                    probe_count=1,
+                    auto_probe_slots=True,
+                )
+            )
+            self.assertFalse(res["success"])
+            self.assertFalse(res["read_ready"])
+            self.assertFalse(res["upload_ready"])
+            self.assertEqual(res["readiness_verdict"], "BLOCKED")
+            self.assertTrue(res["network_reachable"])
+            self.assertFalse(res["s7comm_healthy"])
+            self.assertIsNotNone(res["discovered_rack_slot"])
+            self.assertEqual(res["discovered_rack_slot"]["rack"], 0)
+            self.assertEqual(res["discovered_rack_slot"]["slot"], 3)
+            self.assertTrue(any("slot=3" in b for b in res["blocking_issues"]))
+        finally:
+            srv.runtime_client.pool.close_all()
+            s7_400_server.stop()
+
+    def test_unreachable_tcp_port_and_deploy_preflight_fail_fast(self) -> None:
+        import socket as _sock
+
+        # Allocate and immediately close an ephemeral TCP port so connection is reliably refused
+        tmp_sock = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+        tmp_sock.bind(("127.0.0.1", 0))
+        closed_port = tmp_sock.getsockname()[1]
+        tmp_sock.close()
+
+        srv.set_access_mode("full")
+        os.environ["S7_WRITES_ENABLED"] = "true"
+
+        diag = json.loads(
+            srv.s7_plc_diagnose_connectivity(
+                host="127.0.0.1",
+                port=closed_port,
+                probe_count=2,
+                timeout_s=0.5,
+            )
+        )
+        self.assertFalse(diag["success"])
+        self.assertFalse(diag["network_reachable"])
+        self.assertFalse(diag["upload_ready"])
+        self.assertEqual(diag["readiness_verdict"], "BLOCKED")
+        tcp_stage = next(st for st in diag["stages"] if st["stage"] == "tcp_reachability")
+        self.assertEqual(tcp_stage["status"], "FAIL")
+        self.assertEqual(tcp_stage["details"]["packet_loss_pct"], 100.0)
+
+        # s7_plc_deploy_program with preflight_check=True fails fast with structured preflight_diagnostics
+        dep = json.loads(
+            srv.s7_plc_deploy_program(
+                host="127.0.0.1",
+                port=closed_port,
+                db_number=91,
+                db_byte_size=16,
+                preflight_check=True,
+                timeout_s=1.0,
+                confirm_live_write=True,
+            )
+        )
+        self.assertFalse(dep["success"])
+        self.assertEqual(dep["status"], "PREFLIGHT_DIAGNOSTIC_FAILED")
+        self.assertEqual(dep["failure_category"], "transport_error")
+        self.assertIn("preflight_diagnostics", dep)
+        self.assertFalse(dep["preflight_diagnostics"]["network_reachable"])
+
+    def test_read_only_mode_diagnostic_succeeds_but_flags_upload_blocked_and_virtual_ready(self) -> None:
+        srv.set_access_mode("read-only")
+        os.environ["S7_WRITES_ENABLED"] = "false"
+
+        res = json.loads(
+            srv.s7_plc_diagnose_connectivity(
+                host="127.0.0.1",
+                port=self.port,
+                probe_count=1,
+            )
+        )
+        self.assertTrue(res["success"])
+        self.assertTrue(res["read_ready"])
+        self.assertFalse(res["upload_ready"])
+        self.assertEqual(res["readiness_verdict"], "BLOCKED")
+        guard_stage = next(st for st in res["stages"] if st["stage"] == "deployment_guardrails")
+        self.assertEqual(guard_stage["status"], "FAIL")
+        self.assertTrue(any("--mode full" in b for b in res["blocking_issues"]))
+        self.assertTrue(any("S7_WRITES_ENABLED" in b for b in res["blocking_issues"]))
+
+        # Virtual PLC always reports READY
+        v_res = json.loads(srv.s7_plc_diagnose_connectivity(host="virtual"))
+        self.assertTrue(v_res["success"])
+        self.assertTrue(v_res["upload_ready"])
+        self.assertEqual(v_res["readiness_verdict"], "READY")
+        self.assertEqual(len(v_res["stages"]), 7)
+
+        # Read-only mode blocks disk-writing project/symbol/comment tools
+        self.assertEqual(
+            json.loads(srv.s7_create_project(project_name="BlockedProj"))["failure_category"],
+            "access_denied",
+        )
+        self.assertEqual(
+            json.loads(srv.s7_write_symbol_table(symbols={"START": "I 0.0"}))["failure_category"],
+            "access_denied",
+        )
+        self.assertEqual(
+            json.loads(srv.s7_write_device_comments(device_comments={"I 0.0": "Start"}))["failure_category"],
+            "access_denied",
+        )
+
+    def test_db_hex_byte_and_uninitialized_string_header_and_invalid_target_blocks(self) -> None:
+        # 1. BYTE hex literal (B#16#A5) and uninitialized STRING[16] preserve exact S7 DB layout
+        db_src = """
+DATA_BLOCK DB 99
+STRUCT
+  MaskByte : BYTE := B#16#A5;
+  Label : STRING[16];
+END_STRUCT;
+BEGIN
+END_DATA_BLOCK
+"""
+        _, meta = build_db_mc7_block(db_number=0, db_source=db_src)
+        body = bytes.fromhex(meta["mc7_body_hex"])
+        self.assertEqual(body[0], 0xA5)
+        # STRING[16] aligns to even byte offset 2, byte 2 = max_len (16), byte 3 = actual_len (0)
+        self.assertEqual(body[2], 16)
+        self.assertEqual(body[3], 0)
+
+        # 2. Invalid target_blocks entry does not falsely fail S7comm Block Management
+        srv.set_access_mode("full")
+        os.environ["S7_WRITES_ENABLED"] = "true"
+        res = json.loads(
+            srv.s7_plc_diagnose_connectivity(
+                host="127.0.0.1",
+                port=self.port,
+                probe_count=1,
+                target_blocks=["OB1", "BADBLOCK"],
+                verify_upload_channel=False,
+            )
+        )
+        self.assertTrue(res["read_ready"])
+        self.assertTrue(res["upload_ready"])
+        impact = res["online_blocks"]["target_block_impact"]
+        self.assertEqual(impact["will_overwrite_existing"], ["OB1"])
+        self.assertEqual(impact["invalid_identifiers"], ["BADBLOCK"])
+        self.assertTrue(any("BADBLOCK" in w for w in res["warnings"]))
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
