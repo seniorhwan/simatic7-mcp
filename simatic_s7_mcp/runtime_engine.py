@@ -26,6 +26,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from .s7_mc7 import (
+    MC7_HEADER_SIZE,
+    S7_COMM_BLOCK_TYPE_HEX,
+    S7_COMM_HEX_TO_BLOCK_TYPE,
+    build_mc7_block,
+    parse_block_identifier,
+    parse_mc7_block,
+)
+
 
 # ---------------------------------------------------------------------------
 # S7 Address Parsing & Encoding
@@ -450,6 +459,199 @@ def parse_s7_ack_data(tpkt: bytes) -> Tuple[int, int, bytes, bytes]:
     param = s7[offset:offset + param_len]
     data = s7[offset + param_len:offset + param_len + data_len]
     return rosctr, err, param, data
+
+
+def parse_s7_frame(tpkt: bytes) -> Tuple[int, int, int, bytes, bytes]:
+    """Return (rosctr, pdu_ref, error_code, param_bytes, data_bytes) from any TPKT S7 frame."""
+    if len(tpkt) < 17:
+        raise ValueError(f"Truncated S7 frame ({len(tpkt)} bytes)")
+    s7 = tpkt[7:]  # skip 4-byte TPKT + 3-byte COTP DT
+    if s7[0] != 0x32:
+        raise ValueError(f"Unexpected S7 protocol ID: 0x{s7[0]:02X}")
+    rosctr = s7[1]
+    pdu_ref = struct.unpack(">H", s7[4:6])[0]
+    if rosctr == 0x03:  # Ack_Data
+        param_len, data_len, err_class, err_code = struct.unpack(">HHBB", s7[6:12])
+        offset = 12
+        err = (err_class << 8) | err_code
+    else:
+        param_len, data_len = struct.unpack(">HH", s7[6:10])
+        offset = 10
+        err = 0
+    param = s7[offset:offset + param_len]
+    data = s7[offset + param_len:offset + param_len + data_len]
+    return rosctr, pdu_ref, err, param, data
+
+
+S7_ERROR_DESCRIPTIONS: Dict[int, str] = {
+    0x0000: "OK",
+    0x0110: "Invalid block number",
+    0x0112: "Invalid parameter",
+    0x011A: "PG resource error",
+    0x011B: "PLC internal error",
+    0x011C: "Protocol error",
+    0x8104: "Service not supported on this CPU",
+    0x8404: "Grave error — block transfer aborted by CPU",
+    0x8500: "Incorrect PDU size",
+    0xD001: "Protocol error during block transfer",
+    0xD002: "Parameter error",
+    0xD201: "Syntax error in block name or MC7 block format",
+    0xD202: "Syntax error in function parameters",
+    0xD205: "Linked block already exists in RAM",
+    0xD206: "Linked block already exists in EPROM",
+    0xD208: "Maximum number of copied/unlinked modules exceeded",
+    0xD209: "Block not found on PLC",
+    0xD20A: "Maximum number of blocks exceeded",
+    0xD20E: "No block available (check block number / CPU memory)",
+    0xD210: "Block number exceeds CPU maximum",
+    0xD241: "CPU protection level is insufficient (unlock PLC password or check keyswitch RUN-P)",
+    0xD242: "Protection violation while processing block",
+    0xD280: "Error compiling block in S7-300/400 CPU",
+    0xD401: "Information function unavailable",
+}
+
+
+def describe_s7_error(err: int) -> str:
+    """Return a concise diagnostic description for an S7comm error code."""
+    return S7_ERROR_DESCRIPTIONS.get(int(err) & 0xFFFF, f"S7comm error 0x{int(err) & 0xFFFF:04X}")
+
+
+def _s7_block_type_hex(block_type: str) -> bytes:
+    bt = block_type.strip().upper()
+    if bt not in S7_COMM_BLOCK_TYPE_HEX:
+        raise ValueError(f"Unsupported S7 block type for S7comm transfer: {block_type!r}")
+    return S7_COMM_BLOCK_TYPE_HEX[bt].encode("ascii")
+
+
+def build_request_download_pdu(
+    block_type: str,
+    block_number: int,
+    load_size: int,
+    mc7_size: int,
+    pdu_ref: int = 1,
+    filesystem: str = "P",
+) -> bytes:
+    """Build S7comm Job 0x1A (Request Download) frame for PC -> PLC block transfer."""
+    t_hex = _s7_block_type_hex(block_type)
+    fs_b = (filesystem or "P").strip().upper()[:1].encode("ascii")
+    filename = b"_" + t_hex + f"{int(block_number):05d}".encode("ascii") + fs_b
+    part2 = b"1" + f"{int(load_size):06d}".encode("ascii") + f"{int(mc7_size):06d}".encode("ascii")
+    param = (
+        bytes([0x1A, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, len(filename)])
+        + filename
+        + bytes([len(part2)])
+        + part2
+    )
+    header = struct.pack(">BBHHHH", 0x32, 0x01, 0x0000, pdu_ref & 0xFFFF, len(param), 0)
+    return wrap_tpkt_cotp_dt(header + param)
+
+
+def build_download_block_ack_pdu(chunk: bytes, more_data: bool, pdu_ref: int) -> bytes:
+    """Build S7comm Ack_Data 0x1B (Download Block chunk) replying to a PLC-initiated 0x1B Job."""
+    r_param = bytes([0x1B, 0x01 if more_data else 0x00])
+    r_data = struct.pack(">HH", len(chunk), 0x00FB) + bytes(chunk)
+    header = struct.pack(
+        ">BBHHHHBB",
+        0x32, 0x03, 0x0000, pdu_ref & 0xFFFF, len(r_param), len(r_data), 0x00, 0x00,
+    )
+    return wrap_tpkt_cotp_dt(header + r_param + r_data)
+
+
+def build_download_ended_ack_pdu(pdu_ref: int) -> bytes:
+    """Build S7comm Ack_Data 0x1C (Download Ended) replying to a PLC-initiated 0x1C Job."""
+    r_param = b"\x1c"
+    header = struct.pack(">BBHHHHBB", 0x32, 0x03, 0x0000, pdu_ref & 0xFFFF, len(r_param), 0, 0x00, 0x00)
+    return wrap_tpkt_cotp_dt(header + r_param)
+
+
+def build_pi_insert_block_pdu(
+    block_type: str,
+    block_number: int,
+    pdu_ref: int = 1,
+    filesystem: str = "P",
+) -> bytes:
+    """Build S7comm 0x28 PI-Service '_INSE' frame to activate a newly downloaded passive block."""
+    t_hex = _s7_block_type_hex(block_type)
+    fs_b = (filesystem or "P").strip().upper()[:1].encode("ascii")
+    p_block = bytes([0x01, 0x00]) + t_hex + f"{int(block_number):05d}".encode("ascii") + fs_b
+    service_name = b"_INSE"
+    param = (
+        bytes([0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFD])
+        + struct.pack(">H", len(p_block))
+        + p_block
+        + bytes([len(service_name)])
+        + service_name
+    )
+    header = struct.pack(">BBHHHH", 0x32, 0x01, 0x0000, pdu_ref & 0xFFFF, len(param), 0)
+    return wrap_tpkt_cotp_dt(header + param)
+
+
+def build_pi_delete_block_pdu(
+    block_type: str,
+    block_number: int,
+    pdu_ref: int = 1,
+    filesystem: str = "B",
+) -> bytes:
+    """Build S7comm 0x28 PI-Service '_DELE' frame to delete a block from PLC memory ('B'=Active+Passive)."""
+    t_hex = _s7_block_type_hex(block_type)
+    fs_b = (filesystem or "B").strip().upper()[:1].encode("ascii")
+    p_block = bytes([0x01, 0x00]) + t_hex + f"{int(block_number):05d}".encode("ascii") + fs_b
+    service_name = b"_DELE"
+    param = (
+        bytes([0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFD])
+        + struct.pack(">H", len(p_block))
+        + p_block
+        + bytes([len(service_name)])
+        + service_name
+    )
+    header = struct.pack(">BBHHHH", 0x32, 0x01, 0x0000, pdu_ref & 0xFFFF, len(param), 0)
+    return wrap_tpkt_cotp_dt(header + param)
+
+
+def build_pi_copy_ram_to_rom_pdu(pdu_ref: int = 1) -> bytes:
+    """Build S7comm 0x28 PI-Service '_MODU' frame to persist RAM blocks to MMC / EPROM."""
+    p_block = b"EP"
+    service_name = b"_MODU"
+    param = (
+        bytes([0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFD])
+        + struct.pack(">H", len(p_block))
+        + p_block
+        + bytes([len(service_name)])
+        + service_name
+    )
+    header = struct.pack(">BBHHHH", 0x32, 0x01, 0x0000, pdu_ref & 0xFFFF, len(param), 0)
+    return wrap_tpkt_cotp_dt(header + param)
+
+
+def build_start_upload_pdu(
+    block_type: str,
+    block_number: int,
+    pdu_ref: int = 1,
+    filesystem: str = "A",
+) -> bytes:
+    """Build S7comm Job 0x1D (Start Upload) frame for PLC -> PC block retrieval."""
+    t_hex = _s7_block_type_hex(block_type)
+    fs_b = (filesystem or "A").strip().upper()[:1].encode("ascii")
+    filename = b"_" + t_hex + f"{int(block_number):05d}".encode("ascii") + fs_b
+    param = bytes([0x1D, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, len(filename)]) + filename
+    header = struct.pack(">BBHHHH", 0x32, 0x01, 0x0000, pdu_ref & 0xFFFF, len(param), 0)
+    return wrap_tpkt_cotp_dt(header + param)
+
+
+def build_upload_block_pdu(upload_id: bytes, pdu_ref: int = 1) -> bytes:
+    """Build S7comm Job 0x1E (Upload next chunk) frame."""
+    uid = bytes(upload_id)[:4].ljust(4, b"\x00")
+    param = bytes([0x1E, 0x00, 0x00, 0x00]) + uid
+    header = struct.pack(">BBHHHH", 0x32, 0x01, 0x0000, pdu_ref & 0xFFFF, len(param), 0)
+    return wrap_tpkt_cotp_dt(header + param)
+
+
+def build_end_upload_pdu(upload_id: bytes, pdu_ref: int = 1) -> bytes:
+    """Build S7comm Job 0x1F (End Upload) frame."""
+    uid = bytes(upload_id)[:4].ljust(4, b"\x00")
+    param = bytes([0x1F, 0x00, 0x00, 0x00]) + uid
+    header = struct.pack(">BBHHHH", 0x32, 0x01, 0x0000, pdu_ref & 0xFFFF, len(param), 0)
+    return wrap_tpkt_cotp_dt(header + param)
 
 
 # ---------------------------------------------------------------------------
@@ -1061,6 +1263,315 @@ class S7ConnectionPool:
             "latency_ms": round((time.perf_counter() - t0) * 1000.0, 2),
         }
 
+    def download_block(
+        self,
+        host: str,
+        block_bytes: bytes,
+        block_type: Optional[str] = None,
+        block_number: Optional[int] = None,
+        port: int = 102,
+        rack: int = 0,
+        slot: int = 2,
+        activate: bool = True,
+        copy_ram_to_rom: bool = False,
+        timeout_s: float = 15.0,
+        connection_type: str = "AUTO",
+    ) -> Dict[str, Any]:
+        """
+        Download a compiled Siemens S7-300/S7-400 MC7 block image directly to a physical PLC
+        over S7comm ISO-on-TCP (RFC 1006, port 102).
+
+        Executes the full Siemens STEP 7 / Snap7 wire protocol:
+          1. ``0x1A`` Request Download (PC -> PLC)
+          2. ``0x1B`` Download Block loop (PLC sends Job -> PC sends Ack_Data chunk sized to negotiated PDU)
+          3. ``0x1C`` Download Ended (PLC sends Job -> PC sends Ack_Data)
+          4. ``0x28`` PI-Service ``_INSE`` (activates block in PLC execution memory)
+          5. Optional ``0x28`` PI-Service ``_MODU`` (Copy RAM to ROM / MMC persistence)
+        """
+        t0 = time.perf_counter()
+        raw = bytes(block_bytes)
+        parsed = parse_mc7_block(raw)
+        bt = (block_type or parsed["block_type"]).strip().upper()
+        bnum = int(parsed["block_number"] if block_number is None else block_number)
+        load_size = len(raw)
+        mc7_size = int(parsed["mc7_size"])
+
+        conn = self.acquire(host, port, rack, slot, timeout_s=timeout_s, connection_type=connection_type)
+        chunks_sent = 0
+        try:
+            with conn.lock:
+                conn.sock.settimeout(timeout_s)
+                max_chunk = max(32, ((conn.negotiated_pdu - 24) // 2) * 2)
+
+                # Step 1: 0x1A Request Download
+                ref1 = conn.next_ref()
+                conn.sock.sendall(build_request_download_pdu(bt, bnum, load_size, mc7_size, pdu_ref=ref1))
+                rosctr, _, err, r_param, _ = parse_s7_frame(recv_tpkt(conn.sock))
+                if rosctr != 0x03 or err != 0:
+                    raise RuntimeError(
+                        f"PLC rejected Request Download (0x1A) for {bt}{bnum}: "
+                        f"0x{err:04X} ({describe_s7_error(err)})"
+                    )
+
+                # Step 2: PLC-initiated 0x1B Download Block chunk requests
+                offset = 0
+                while True:
+                    rosctr, plc_ref, err, p_param, _ = parse_s7_frame(recv_tpkt(conn.sock))
+                    if rosctr == 0x01 and p_param and p_param[0] == 0x1B:
+                        chunk = raw[offset:offset + max_chunk]
+                        offset += len(chunk)
+                        more = offset < load_size
+                        conn.sock.sendall(build_download_block_ack_pdu(chunk, more_data=more, pdu_ref=plc_ref))
+                        chunks_sent += 1
+                        if not more:
+                            break
+                    elif rosctr == 0x01 and p_param and p_param[0] == 0x1C:
+                        # PLC terminated early with Download Ended (often carrying an error code)
+                        conn.sock.sendall(build_download_ended_ack_pdu(plc_ref))
+                        end_err = struct.unpack(">H", p_param[2:4])[0] if len(p_param) >= 4 else 0
+                        raise RuntimeError(
+                            f"PLC aborted block download (0x1C early) for {bt}{bnum}: "
+                            f"0x{end_err:04X} ({describe_s7_error(end_err)})"
+                        )
+                    else:
+                        raise RuntimeError(
+                            f"Unexpected S7comm frame during 0x1B download for {bt}{bnum}: "
+                            f"rosctr=0x{rosctr:02X}, param={p_param.hex()}, err=0x{err:04X}"
+                        )
+
+                # Step 3: PLC-initiated 0x1C Download Ended
+                rosctr, plc_ref, err, p_param, _ = parse_s7_frame(recv_tpkt(conn.sock))
+                if rosctr != 0x01 or not p_param or p_param[0] != 0x1C:
+                    raise RuntimeError(
+                        f"Expected PLC 0x1C Download Ended for {bt}{bnum}, got rosctr=0x{rosctr:02X}, param={p_param.hex()}"
+                    )
+                conn.sock.sendall(build_download_ended_ack_pdu(plc_ref))
+                end_err = struct.unpack(">H", p_param[2:4])[0] if len(p_param) >= 4 else 0
+                if end_err != 0:
+                    raise RuntimeError(
+                        f"PLC rejected downloaded block {bt}{bnum} at Download Ended (0x1C): "
+                        f"0x{end_err:04X} ({describe_s7_error(end_err)})"
+                    )
+
+                # Step 4: Activate block via 0x28 PI-Service _INSE
+                activated = False
+                if activate:
+                    ref_ins = conn.next_ref()
+                    conn.sock.sendall(build_pi_insert_block_pdu(bt, bnum, pdu_ref=ref_ins))
+                    rosctr, _, ins_err, _, _ = parse_s7_frame(recv_tpkt(conn.sock))
+                    if rosctr != 0x03 or ins_err != 0:
+                        raise RuntimeError(
+                            f"Block {bt}{bnum} transferred but PI-Service _INSE activation failed: "
+                            f"0x{ins_err:04X} ({describe_s7_error(ins_err)})"
+                        )
+                    activated = True
+
+                # Step 5: Optional Copy RAM to ROM (_MODU)
+                rom_copied = False
+                if copy_ram_to_rom:
+                    conn.sock.settimeout(max(timeout_s, 30.0))
+                    ref_rom = conn.next_ref()
+                    conn.sock.sendall(build_pi_copy_ram_to_rom_pdu(pdu_ref=ref_rom))
+                    rosctr, _, rom_err, _, _ = parse_s7_frame(recv_tpkt(conn.sock))
+                    if rosctr != 0x03 or rom_err != 0:
+                        raise RuntimeError(
+                            f"Block {bt}{bnum} activated, but Copy RAM to ROM (_MODU) failed: "
+                            f"0x{rom_err:04X} ({describe_s7_error(rom_err)})"
+                        )
+                    rom_copied = True
+
+                conn.last_used = time.monotonic()
+                return {
+                    "ok": True,
+                    "transport": "s7comm_iso_tcp",
+                    "host": host,
+                    "port": port,
+                    "rack": rack,
+                    "slot": slot,
+                    "connection_type": conn.connection_type,
+                    "negotiated_pdu": conn.negotiated_pdu,
+                    "block_name": f"{bt}{bnum}",
+                    "block_type": bt,
+                    "block_number": bnum,
+                    "bytes_transferred": load_size,
+                    "mc7_size": mc7_size,
+                    "chunks_sent": chunks_sent,
+                    "activated": activated,
+                    "copied_ram_to_rom": rom_copied,
+                    "parsed_header": parsed,
+                    "latency_ms": round((time.perf_counter() - t0) * 1000.0, 2),
+                }
+        except Exception:
+            self.invalidate(host, port, rack, slot)
+            raise
+
+    def upload_block(
+        self,
+        host: str,
+        block_type: str,
+        block_number: int,
+        port: int = 102,
+        rack: int = 0,
+        slot: int = 2,
+        timeout_s: float = 15.0,
+        connection_type: str = "AUTO",
+    ) -> Dict[str, Any]:
+        """
+        Upload a complete Siemens S7-300/S7-400 MC7 block binary image FROM a physical PLC
+        over S7comm ISO-on-TCP (0x1D Start Upload -> 0x1E Upload loop -> 0x1F End Upload).
+        """
+        t0 = time.perf_counter()
+        bt = block_type.strip().upper()
+        bnum = int(block_number)
+        conn = self.acquire(host, port, rack, slot, timeout_s=timeout_s, connection_type=connection_type)
+        chunks_received = 0
+        try:
+            with conn.lock:
+                conn.sock.settimeout(timeout_s)
+                # Step 1: 0x1D Start Upload
+                ref1 = conn.next_ref()
+                conn.sock.sendall(build_start_upload_pdu(bt, bnum, pdu_ref=ref1))
+                rosctr, _, err, r_param, _ = parse_s7_frame(recv_tpkt(conn.sock))
+                if rosctr != 0x03 or err != 0 or len(r_param) < 8:
+                    raise RuntimeError(
+                        f"PLC rejected Start Upload (0x1D) for {bt}{bnum}: "
+                        f"0x{err:04X} ({describe_s7_error(err)})"
+                    )
+                upload_id = r_param[4:8]
+                declared_len = 0
+                if len(r_param) >= 9:
+                    slen = r_param[8]
+                    len_str = r_param[9:9 + slen].decode("ascii", errors="ignore").strip()
+                    if len_str.isdigit():
+                        declared_len = int(len_str)
+
+                # Step 2: 0x1E Upload chunks until more_data == 0
+                buf = bytearray()
+                while True:
+                    ref_up = conn.next_ref()
+                    conn.sock.sendall(build_upload_block_pdu(upload_id, pdu_ref=ref_up))
+                    rosctr, _, err, u_param, u_data = parse_s7_frame(recv_tpkt(conn.sock))
+                    if rosctr != 0x03 or err != 0:
+                        raise RuntimeError(
+                            f"PLC failed during Upload (0x1E) for {bt}{bnum}: "
+                            f"0x{err:04X} ({describe_s7_error(err)})"
+                        )
+                    more_data = u_param[1] if len(u_param) >= 2 else 0
+                    if len(u_data) >= 4:
+                        chunk_len = struct.unpack(">H", u_data[0:2])[0]
+                        buf.extend(u_data[4:4 + chunk_len])
+                    chunks_received += 1
+                    if more_data == 0:
+                        break
+                    if chunks_received > 4096:
+                        raise RuntimeError(f"Upload loop exceeded 4096 chunks for {bt}{bnum}")
+
+                # Step 3: 0x1F End Upload
+                ref_end = conn.next_ref()
+                conn.sock.sendall(build_end_upload_pdu(upload_id, pdu_ref=ref_end))
+                rosctr, _, end_err, _, _ = parse_s7_frame(recv_tpkt(conn.sock))
+                if rosctr != 0x03 or end_err != 0:
+                    raise RuntimeError(
+                        f"PLC failed at End Upload (0x1F) for {bt}{bnum}: "
+                        f"0x{end_err:04X} ({describe_s7_error(end_err)})"
+                    )
+
+                raw_bytes = bytes(buf)
+                parsed_header: Optional[Dict[str, Any]] = None
+                try:
+                    parsed_header = parse_mc7_block(raw_bytes)
+                except Exception:
+                    parsed_header = None
+
+                conn.last_used = time.monotonic()
+                return {
+                    "ok": True,
+                    "transport": "s7comm_iso_tcp",
+                    "host": host,
+                    "port": port,
+                    "rack": rack,
+                    "slot": slot,
+                    "connection_type": conn.connection_type,
+                    "negotiated_pdu": conn.negotiated_pdu,
+                    "block_name": f"{bt}{bnum}",
+                    "block_type": bt,
+                    "block_number": bnum,
+                    "declared_length": declared_len or len(raw_bytes),
+                    "byte_length": len(raw_bytes),
+                    "chunks_received": chunks_received,
+                    "block_bytes": raw_bytes,
+                    "parsed_header": parsed_header,
+                    "latency_ms": round((time.perf_counter() - t0) * 1000.0, 2),
+                }
+        except Exception:
+            self.invalidate(host, port, rack, slot)
+            raise
+
+    def delete_block(
+        self,
+        host: str,
+        block_type: str,
+        block_number: int,
+        port: int = 102,
+        rack: int = 0,
+        slot: int = 2,
+        timeout_s: float = 10.0,
+        connection_type: str = "AUTO",
+    ) -> Dict[str, Any]:
+        """Delete a block from a physical S7-300/S7-400 PLC via S7comm 0x28 PI-Service '_DELE'."""
+        t0 = time.perf_counter()
+        bt = block_type.strip().upper()
+        bnum = int(block_number)
+        _, err, param, _ = self._exchange(
+            host, port, rack, slot,
+            lambda ref: build_pi_delete_block_pdu(bt, bnum, pdu_ref=ref),
+            timeout_s=timeout_s,
+            connection_type=connection_type,
+        )
+        return {
+            "ok": err == 0,
+            "transport": "s7comm_iso_tcp",
+            "host": host,
+            "port": port,
+            "rack": rack,
+            "slot": slot,
+            "block_name": f"{bt}{bnum}",
+            "error_code": f"0x{err:04X}",
+            "error_description": describe_s7_error(err),
+            "response_hex": param.hex(),
+            "latency_ms": round((time.perf_counter() - t0) * 1000.0, 2),
+        }
+
+    def copy_ram_to_rom(
+        self,
+        host: str,
+        port: int = 102,
+        rack: int = 0,
+        slot: int = 2,
+        timeout_s: float = 30.0,
+        connection_type: str = "AUTO",
+    ) -> Dict[str, Any]:
+        """Persist active RAM blocks to MMC / Flash EPROM via S7comm 0x28 PI-Service '_MODU'."""
+        t0 = time.perf_counter()
+        _, err, param, _ = self._exchange(
+            host, port, rack, slot,
+            lambda ref: build_pi_copy_ram_to_rom_pdu(pdu_ref=ref),
+            timeout_s=timeout_s,
+            connection_type=connection_type,
+        )
+        return {
+            "ok": err == 0,
+            "transport": "s7comm_iso_tcp",
+            "host": host,
+            "port": port,
+            "rack": rack,
+            "slot": slot,
+            "error_code": f"0x{err:04X}",
+            "error_description": describe_s7_error(err),
+            "response_hex": param.hex(),
+            "latency_ms": round((time.perf_counter() - t0) * 1000.0, 2),
+        }
+
 
 # ---------------------------------------------------------------------------
 # Watch Table (VAT) Monitor with Symbolic Resolution & Delta Tracking
@@ -1453,6 +1964,8 @@ class VirtualS7PLC:
         self.counters: Dict[int, _S7CounterState] = {}
         self.blocks: Dict[str, List[str]] = {}
         self.block_meta: Dict[str, Dict[str, Any]] = {}
+        self.mc7_blocks: Dict[str, bytes] = {}
+        self.rom_snapshot: Dict[str, bytes] = {}
         self.fb_statics: Dict[str, Dict[str, Any]] = {}
         self.sfc_states: Dict[str, Dict[str, Any]] = {}
         self.last_unsupported_instructions: List[str] = []
@@ -1465,6 +1978,64 @@ class VirtualS7PLC:
         self.ob35_count: int = 0
         self.ob35_interval_ms: int = 100
         self._ob35_accum_ms: int = 0
+
+    def store_mc7_block(self, block_name: str, raw_bytes: bytes) -> Dict[str, Any]:
+        """Store a downloaded MC7 binary block image in VirtualS7PLC memory (mirroring DB data into self.dbs)."""
+        bt, bnum = parse_block_identifier(block_name)
+        key = f"{bt}{bnum}"
+        parsed = parse_mc7_block(raw_bytes)
+        with self._lock:
+            self.mc7_blocks[key] = bytes(raw_bytes)
+            self.block_meta[key] = {
+                "block_type": bt,
+                "block_number": bnum,
+                "language": parsed["language"],
+                "mc7_size": parsed["mc7_size"],
+                "load_size": parsed["load_size"],
+                "source": "mc7_binary",
+            }
+            if bt == "DB":
+                body_end = MC7_HEADER_SIZE + int(parsed["mc7_size"])
+                db_payload = bytes(raw_bytes[MC7_HEADER_SIZE:body_end])
+                self.dbs[bnum] = bytearray(db_payload)
+        return parsed
+
+    def get_mc7_block(self, block_name: str) -> Optional[bytes]:
+        """Retrieve a raw MC7 binary image for upload; synthesizes authentic DB MC7 if DB exists in RAM."""
+        bt, bnum = parse_block_identifier(block_name)
+        key = f"{bt}{bnum}"
+        with self._lock:
+            if key in self.mc7_blocks:
+                return self.mc7_blocks[key]
+            if bt == "DB" and bnum in self.dbs:
+                return build_mc7_block("DB", bnum, bytes(self.dbs[bnum]), language="DB")
+        return None
+
+    def delete_block(self, block_name: str) -> bool:
+        """Delete a block from VirtualS7PLC memory."""
+        bt, bnum = parse_block_identifier(block_name)
+        key = f"{bt}{bnum}"
+        with self._lock:
+            removed = False
+            if key in self.mc7_blocks:
+                del self.mc7_blocks[key]
+                removed = True
+            if key in self.blocks:
+                del self.blocks[key]
+                removed = True
+            if key in self.block_meta:
+                del self.block_meta[key]
+                removed = True
+            if bt == "DB" and bnum in self.dbs:
+                del self.dbs[bnum]
+                removed = True
+            return removed
+
+    def copy_ram_to_rom(self) -> int:
+        """Snapshot all active MC7 blocks into simulated MMC/EPROM storage."""
+        with self._lock:
+            self.rom_snapshot = dict(self.mc7_blocks)
+            return len(self.rom_snapshot)
 
     def reset(self, clear_blocks: bool = False, clear_symbols: bool = False) -> None:
         with self._lock:
@@ -1490,6 +2061,8 @@ class VirtualS7PLC:
             if clear_blocks:
                 self.blocks.clear()
                 self.block_meta.clear()
+                self.mc7_blocks.clear()
+                self.rom_snapshot.clear()
                 self.db_layouts.clear()
                 self.db_names.clear()
             if clear_symbols:
@@ -2985,7 +3558,12 @@ class EnhancedS7LoopbackServer:
     def _collect_plc_blocks(plc_ref: VirtualS7PLC) -> Dict[str, List[int]]:
         by_type: Dict[str, set] = {name: set() for name in S7_BLOCK_TYPE_CODES}
         with plc_ref._lock:
-            for bname in set(list(plc_ref.blocks.keys()) + list(plc_ref.block_meta.keys())):
+            all_names = set(
+                list(plc_ref.blocks.keys())
+                + list(plc_ref.block_meta.keys())
+                + list(plc_ref.mc7_blocks.keys())
+            )
+            for bname in all_names:
                 m = re.match(r"^(OB|FB|FC|DB|SDB|SFB|SFC)(\d+)$", bname.strip().upper())
                 if m:
                     by_type[m.group(1)].add(int(m.group(2)))
@@ -3003,6 +3581,21 @@ class EnhancedS7LoopbackServer:
             def handle(self) -> None:
                 sock: socket.socket = self.request
                 sock.settimeout(10.0)
+                session_pdu = server_max_pdu
+                pending_passive: Dict[str, bytes] = {}
+                active_uploads: Dict[bytes, Tuple[bytes, int]] = {}
+                next_upload_seq = 1
+                plc_job_ref = 0x100
+
+                def _parse_s7_filename(fname_bytes: bytes) -> Optional[str]:
+                    s = fname_bytes.decode("ascii", errors="ignore")
+                    if len(s) >= 8 and s[0] == "_":
+                        bt = S7_COMM_HEX_TO_BLOCK_TYPE.get(s[1:3].upper())
+                        num_s = s[3:8]
+                        if bt and num_s.isdigit():
+                            return f"{bt}{int(num_s)}"
+                    return None
+
                 while True:
                     try:
                         frame = recv_tpkt(sock)
@@ -3047,6 +3640,7 @@ class EnhancedS7LoopbackServer:
                         if fn == 0xF0:  # Setup Communication
                             req_pdu = struct.unpack(">H", param[6:8])[0] if len(param) >= 8 else 480
                             neg = min(req_pdu, server_max_pdu)
+                            session_pdu = neg
                             r_param = struct.pack(">BBHHH", 0xF0, 0x00, 0x0001, 0x0001, neg)
                             hdr = struct.pack(">BBHHHHBB", 0x32, 0x03, 0x0000, pdu_ref, len(r_param), 0, 0, 0)
                             sock.sendall(wrap_tpkt_cotp_dt(hdr + r_param))
@@ -3122,9 +3716,147 @@ class EnhancedS7LoopbackServer:
                             r_param = bytes([0x05, item_cnt])
                             hdr = struct.pack(">BBHHHHBB", 0x32, 0x03, 0x0000, pdu_ref, len(r_param), len(rcs), 0, 0)
                             sock.sendall(wrap_tpkt_cotp_dt(hdr + r_param + bytes(rcs)))
-                        elif fn in (0x28, 0x29):  # PLC Start / Stop
-                            plc_ref.set_mode("RUN" if fn == 0x28 else "STOP")
-                            r_param = bytes([fn, 0x00])
+                        elif fn == 0x1A:  # Request Download (PC -> PLC)
+                            fname_len = param[8] if len(param) > 8 else 0
+                            fname = param[9:9 + fname_len]
+                            blk_key = _parse_s7_filename(fname)
+                            if not blk_key:
+                                hdr = struct.pack(">BBHHHHBB", 0x32, 0x03, 0x0000, pdu_ref, 1, 0, 0xD2, 0x01)
+                                sock.sendall(wrap_tpkt_cotp_dt(hdr + b"\x1a"))
+                                continue
+                            # 1. Acknowledge 0x1A Request Download
+                            hdr = struct.pack(">BBHHHHBB", 0x32, 0x03, 0x0000, pdu_ref, 1, 0, 0, 0)
+                            sock.sendall(wrap_tpkt_cotp_dt(hdr + b"\x1a"))
+
+                            # 2. PLC initiates 0x1B Download Block Jobs until client sends more_data=0
+                            received_buf = bytearray()
+                            transfer_ok = True
+                            while True:
+                                plc_job_ref = (plc_job_ref + 1) & 0xFFFF
+                                req_1b = bytes([0x1B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, fname_len]) + fname
+                                j_hdr = struct.pack(">BBHHHH", 0x32, 0x01, 0x0000, plc_job_ref, len(req_1b), 0)
+                                sock.sendall(wrap_tpkt_cotp_dt(j_hdr + req_1b))
+                                try:
+                                    c_ros, _, c_err, c_param, c_data = parse_s7_frame(recv_tpkt(sock))
+                                except Exception:
+                                    transfer_ok = False
+                                    break
+                                if c_ros != 0x03 or c_err != 0 or not c_param or c_param[0] != 0x1B:
+                                    transfer_ok = False
+                                    break
+                                if len(c_data) >= 4:
+                                    c_len = struct.unpack(">H", c_data[0:2])[0]
+                                    received_buf.extend(c_data[4:4 + c_len])
+                                more_flag = c_param[1] if len(c_param) >= 2 else 0
+                                if more_flag == 0:
+                                    break
+
+                            # 3. Validate received MC7 block & initiate 0x1C Download Ended Job
+                            end_err_hi, end_err_lo = 0x00, 0x00
+                            if transfer_ok:
+                                try:
+                                    parse_mc7_block(bytes(received_buf))
+                                    pending_passive[blk_key] = bytes(received_buf)
+                                except Exception:
+                                    end_err_hi, end_err_lo = 0xD2, 0x01
+                            else:
+                                end_err_hi, end_err_lo = 0xD0, 0x01
+                            plc_job_ref = (plc_job_ref + 1) & 0xFFFF
+                            req_1c = (
+                                bytes([0x1C, 0x00, end_err_hi, end_err_lo, 0x00, 0x00, 0x00, 0x00, fname_len])
+                                + fname
+                            )
+                            j_hdr = struct.pack(">BBHHHH", 0x32, 0x01, 0x0000, plc_job_ref, len(req_1c), 0)
+                            sock.sendall(wrap_tpkt_cotp_dt(j_hdr + req_1c))
+                            try:
+                                recv_tpkt(sock)  # consume client's 0x1C Ack_Data
+                            except Exception:
+                                break
+                        elif fn == 0x1D:  # Start Upload (PLC -> PC)
+                            fname_len = param[8] if len(param) > 8 else 0
+                            fname = param[9:9 + fname_len]
+                            blk_key = _parse_s7_filename(fname)
+                            raw_blk = plc_ref.get_mc7_block(blk_key) if blk_key else None
+                            if raw_blk is None:
+                                hdr = struct.pack(">BBHHHHBB", 0x32, 0x03, 0x0000, pdu_ref, 1, 0, 0xD2, 0x09)
+                                sock.sendall(wrap_tpkt_cotp_dt(hdr + b"\x1d"))
+                                continue
+                            uid = struct.pack(">I", next_upload_seq)
+                            next_upload_seq += 1
+                            active_uploads[uid] = (raw_blk, 0)
+                            len_ascii = f"{len(raw_blk):07d}".encode("ascii")
+                            r_param = bytes([0x1D, 0x00, 0x01, 0x00]) + uid + bytes([len(len_ascii)]) + len_ascii
+                            hdr = struct.pack(">BBHHHHBB", 0x32, 0x03, 0x0000, pdu_ref, len(r_param), 0, 0, 0)
+                            sock.sendall(wrap_tpkt_cotp_dt(hdr + r_param))
+                        elif fn == 0x1E:  # Upload Block chunk
+                            uid = param[4:8]
+                            entry = active_uploads.get(uid)
+                            if entry is None:
+                                hdr = struct.pack(">BBHHHHBB", 0x32, 0x03, 0x0000, pdu_ref, 1, 0, 0xD2, 0x0E)
+                                sock.sendall(wrap_tpkt_cotp_dt(hdr + b"\x1e"))
+                                continue
+                            raw_blk, off = entry
+                            max_chunk = max(32, ((session_pdu - 24) // 2) * 2)
+                            chunk = raw_blk[off:off + max_chunk]
+                            new_off = off + len(chunk)
+                            more = 1 if new_off < len(raw_blk) else 0
+                            active_uploads[uid] = (raw_blk, new_off)
+                            r_param = bytes([0x1E, more])
+                            r_data = struct.pack(">HH", len(chunk), 0x00FB) + chunk
+                            hdr = struct.pack(">BBHHHHBB", 0x32, 0x03, 0x0000, pdu_ref, len(r_param), len(r_data), 0, 0)
+                            sock.sendall(wrap_tpkt_cotp_dt(hdr + r_param + r_data))
+                        elif fn == 0x1F:  # End Upload
+                            uid = param[4:8]
+                            active_uploads.pop(uid, None)
+                            r_param = b"\x1f"
+                            hdr = struct.pack(">BBHHHHBB", 0x32, 0x03, 0x0000, pdu_ref, len(r_param), 0, 0, 0)
+                            sock.sendall(wrap_tpkt_cotp_dt(hdr + r_param))
+                        elif fn == 0x28:  # PLC Control PI-Services (P_PROGRAM, _INSE, _DELE, _MODU)
+                            err_hi, err_lo = 0x00, 0x00
+                            if len(param) >= 11 and param[7] == 0xFD:
+                                pb_len = struct.unpack(">H", param[8:10])[0]
+                                p_block = param[10:10 + pb_len]
+                                svc_off = 10 + pb_len
+                                svc_name = ""
+                                if svc_off < len(param):
+                                    svc_len = param[svc_off]
+                                    svc_name = param[svc_off + 1:svc_off + 1 + svc_len].decode("ascii", errors="ignore")
+                                if svc_name == "_INSE":
+                                    if len(p_block) >= 10:
+                                        bt = S7_COMM_HEX_TO_BLOCK_TYPE.get(p_block[2:4].decode("ascii", errors="ignore").upper())
+                                        num_s = p_block[4:9].decode("ascii", errors="ignore")
+                                        blk_key = f"{bt}{int(num_s)}" if (bt and num_s.isdigit()) else None
+                                        if blk_key and blk_key in pending_passive:
+                                            plc_ref.store_mc7_block(blk_key, pending_passive.pop(blk_key))
+                                        else:
+                                            err_hi, err_lo = 0xD2, 0x0E
+                                    else:
+                                        err_hi, err_lo = 0xD2, 0x02
+                                elif svc_name == "_DELE":
+                                    if len(p_block) >= 10:
+                                        bt = S7_COMM_HEX_TO_BLOCK_TYPE.get(p_block[2:4].decode("ascii", errors="ignore").upper())
+                                        num_s = p_block[4:9].decode("ascii", errors="ignore")
+                                        blk_key = f"{bt}{int(num_s)}" if (bt and num_s.isdigit()) else None
+                                        if blk_key:
+                                            pending_passive.pop(blk_key, None)
+                                            if not plc_ref.delete_block(blk_key):
+                                                err_hi, err_lo = 0xD2, 0x09
+                                        else:
+                                            err_hi, err_lo = 0xD2, 0x01
+                                    else:
+                                        err_hi, err_lo = 0xD2, 0x02
+                                elif svc_name == "_MODU":
+                                    plc_ref.copy_ram_to_rom()
+                                else:
+                                    plc_ref.set_mode("RUN")
+                            else:
+                                plc_ref.set_mode("RUN")
+                            r_param = bytes([0x28, 0x00])
+                            hdr = struct.pack(">BBHHHHBB", 0x32, 0x03, 0x0000, pdu_ref, len(r_param), 0, err_hi, err_lo)
+                            sock.sendall(wrap_tpkt_cotp_dt(hdr + r_param))
+                        elif fn == 0x29:  # PLC Stop
+                            plc_ref.set_mode("STOP")
+                            r_param = bytes([0x29, 0x00])
                             hdr = struct.pack(">BBHHHHBB", 0x32, 0x03, 0x0000, pdu_ref, len(r_param), 0, 0, 0)
                             sock.sendall(wrap_tpkt_cotp_dt(hdr + r_param))
                     elif rosctr == 0x07 and len(param) >= 7:
@@ -3200,6 +3932,7 @@ __all__ = [
     "S7_CONN_TYPES",
     "S7_BLOCK_TYPE_CODES",
     "S7_BLOCK_TYPE_NAMES",
+    "S7_ERROR_DESCRIPTIONS",
     "ParsedS7Address",
     "parse_s7_address",
     "encode_s7_value",
@@ -3207,6 +3940,17 @@ __all__ = [
     "build_cotp_cr",
     "build_list_blocks_count_pdu",
     "build_list_blocks_of_type_pdu",
+    "build_request_download_pdu",
+    "build_download_block_ack_pdu",
+    "build_download_ended_ack_pdu",
+    "build_pi_insert_block_pdu",
+    "build_pi_delete_block_pdu",
+    "build_pi_copy_ram_to_rom_pdu",
+    "build_start_upload_pdu",
+    "build_upload_block_pdu",
+    "build_end_upload_pdu",
+    "parse_s7_frame",
+    "describe_s7_error",
     "S7ConnectionPool",
     "WatchTableMonitor",
     "PLCDataCollector",

@@ -72,6 +72,7 @@ import ctypes
 import datetime
 import difflib
 import fnmatch
+import hashlib
 import inspect
 import io
 import json
@@ -106,6 +107,7 @@ from simatic_s7_mcp import (
     VirtualS7PLC,
     WatchTableMonitor,
     build_catalog_resource_text,
+    build_db_mc7_block,
     build_iec_reference_resource_text,
     build_prompt_convert_and_verify_lad,
     build_prompt_new_project_wizard,
@@ -114,10 +116,13 @@ from simatic_s7_mcp import (
     compile_scl_via_cli,
     compute_content_hash,
     convert_awl_to_pure_fbd,
+    extract_mc7_blocks_from_step7_project,
     generate_client_config,
     generate_data_block_source,
     generate_udt_source,
     make_tool_annotations,
+    parse_block_identifier,
+    parse_mc7_block,
     parse_station_cfg,
     resolve_access_mode,
     run_closed_loop_plant_sim,
@@ -5029,7 +5034,12 @@ class S7RuntimeClient:
         if h_low == "virtual":
             inv: Dict[str, List[int]] = {k: [] for k in ("OB", "DB", "SDB", "FC", "SFC", "FB", "SFB")}
             with VIRTUAL_PLC._lock:
-                for bname in set(list(VIRTUAL_PLC.blocks.keys()) + list(VIRTUAL_PLC.block_meta.keys())):
+                all_names = set(
+                    list(VIRTUAL_PLC.blocks.keys())
+                    + list(VIRTUAL_PLC.block_meta.keys())
+                    + list(VIRTUAL_PLC.mc7_blocks.keys())
+                )
+                for bname in all_names:
                     m = re.match(r"^(OB|FB|FC|DB|SDB|SFB|SFC)(\d+)$", bname.strip().upper())
                     if m:
                         inv[m.group(1)].append(int(m.group(2)))
@@ -5061,6 +5071,256 @@ class S7RuntimeClient:
         res["transport"] = "s7comm_iso_tcp"
         return res
 
+    def _safe_backup_path(self, block_name: str, host: str, output_path: Optional[str] = None) -> Path:
+        backups_dir = (WORKSPACE_DIR / "Backups").resolve()
+        backups_dir.mkdir(parents=True, exist_ok=True)
+        if output_path:
+            cand = Path(output_path).expanduser()
+            if not cand.is_absolute():
+                cand = (backups_dir / cand).resolve()
+                if not str(cand).startswith(str(backups_dir)):
+                    raise ValueError("Relative backup output_path must remain inside Backups directory.")
+            cand.parent.mkdir(parents=True, exist_ok=True)
+            return cand
+        safe_host = re.sub(r"[^A-Za-z0-9_.-]+", "_", host.strip() or "plc")
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        return backups_dir / f"{block_name}_{safe_host}_{stamp}_{uuid.uuid4().hex[:6]}.mc7"
+
+    def upload_block(
+        self,
+        block_name: str,
+        host: str = "127.0.0.1",
+        port: int = 102,
+        rack: int = 0,
+        slot: int = 2,
+        save_to_backup: bool = True,
+        output_path: Optional[str] = None,
+        include_hex: bool = False,
+        timeout_s: float = 15.0,
+        connection_type: str = "AUTO",
+    ) -> Dict[str, Any]:
+        """Upload an MC7 binary block directly from a physical S7-300/400 PLC (0x1D..0x1F) or VirtualS7PLC."""
+        bt, bnum = parse_block_identifier(block_name)
+        canonical_name = f"{bt}{bnum}"
+        h_low = host.strip().lower()
+        if h_low == "virtual":
+            raw = VIRTUAL_PLC.get_mc7_block(canonical_name)
+            if raw is None:
+                return {
+                    "ok": False,
+                    "transport": "virtual_s7_plc",
+                    "host": "virtual",
+                    "block_name": canonical_name,
+                    "error": f"Block {canonical_name} not found in VirtualS7PLC.",
+                }
+            parsed = parse_mc7_block(raw)
+            res: Dict[str, Any] = {
+                "ok": True,
+                "transport": "virtual_s7_plc",
+                "host": "virtual",
+                "port": 0,
+                "block_name": canonical_name,
+                "block_type": bt,
+                "block_number": bnum,
+                "byte_length": len(raw),
+                "chunks_received": 1,
+                "parsed_header": parsed,
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "latency_ms": 0.1,
+            }
+        else:
+            raw_res = self.pool.upload_block(
+                host=host,
+                block_type=bt,
+                block_number=bnum,
+                port=port,
+                rack=rack,
+                slot=slot,
+                timeout_s=timeout_s,
+                connection_type=connection_type,
+            )
+            raw = raw_res.pop("block_bytes")
+            res = raw_res
+            res["sha256"] = hashlib.sha256(raw).hexdigest()
+
+        if save_to_backup or output_path:
+            bpath = self._safe_backup_path(canonical_name, host, output_path=output_path)
+            bpath.write_bytes(raw)
+            res["backup_file"] = str(bpath)
+        if include_hex:
+            res["mc7_hex"] = raw.hex()
+        return res
+
+    def download_block(
+        self,
+        block_bytes: bytes,
+        host: str = "127.0.0.1",
+        port: int = 102,
+        rack: int = 0,
+        slot: int = 2,
+        block_type: Optional[str] = None,
+        block_number: Optional[int] = None,
+        activate: bool = True,
+        copy_ram_to_rom: bool = False,
+        timeout_s: float = 15.0,
+        connection_type: str = "AUTO",
+        confirm_live_write: bool = False,
+    ) -> Dict[str, Any]:
+        """Download a compiled MC7 block image directly to a physical PLC (0x1A..0x1C + _INSE) or VirtualS7PLC."""
+        if not self.writes_enabled(confirm_live_write, host=host, port=port):
+            return {
+                "ok": False,
+                "status": "WRITE_GUARDRAIL_BLOCKED",
+                "failure_category": FailureCategory.WRITE_GUARDRAIL_BLOCKED.value,
+                "error": (
+                    "Deploying/downloading blocks to a live PLC requires BOTH "
+                    "confirm_live_write=True AND S7_WRITES_ENABLED=true."
+                ),
+            }
+        parsed = parse_mc7_block(block_bytes)
+        bt = (block_type or parsed["block_type"]).strip().upper()
+        bnum = int(parsed["block_number"] if block_number is None else block_number)
+        canonical_name = f"{bt}{bnum}"
+        h_low = host.strip().lower()
+        if h_low == "virtual":
+            stored = VIRTUAL_PLC.store_mc7_block(canonical_name, block_bytes)
+            rom_count = VIRTUAL_PLC.copy_ram_to_rom() if copy_ram_to_rom else 0
+            return {
+                "ok": True,
+                "transport": "virtual_s7_plc",
+                "host": "virtual",
+                "port": 0,
+                "block_name": canonical_name,
+                "block_type": bt,
+                "block_number": bnum,
+                "bytes_transferred": len(block_bytes),
+                "mc7_size": stored["mc7_size"],
+                "chunks_sent": 1,
+                "activated": bool(activate),
+                "copied_ram_to_rom": bool(copy_ram_to_rom),
+                "rom_block_count": rom_count,
+                "parsed_header": stored,
+                "latency_ms": 0.1,
+            }
+        return self.pool.download_block(
+            host=host,
+            block_bytes=block_bytes,
+            block_type=bt,
+            block_number=bnum,
+            port=port,
+            rack=rack,
+            slot=slot,
+            activate=activate,
+            copy_ram_to_rom=copy_ram_to_rom,
+            timeout_s=timeout_s,
+            connection_type=connection_type,
+        )
+
+    def delete_block(
+        self,
+        block_name: str,
+        host: str = "127.0.0.1",
+        port: int = 102,
+        rack: int = 0,
+        slot: int = 2,
+        backup_before_delete: bool = True,
+        timeout_s: float = 10.0,
+        connection_type: str = "AUTO",
+        confirm_live_write: bool = False,
+    ) -> Dict[str, Any]:
+        """Delete a block from a physical PLC via S7comm 0x28 '_DELE' or VirtualS7PLC."""
+        if not self.writes_enabled(confirm_live_write, host=host, port=port):
+            return {
+                "ok": False,
+                "status": "WRITE_GUARDRAIL_BLOCKED",
+                "failure_category": FailureCategory.WRITE_GUARDRAIL_BLOCKED.value,
+                "error": (
+                    "Deleting blocks on a live PLC requires BOTH "
+                    "confirm_live_write=True AND S7_WRITES_ENABLED=true."
+                ),
+            }
+        bt, bnum = parse_block_identifier(block_name)
+        canonical_name = f"{bt}{bnum}"
+        backup_info: Optional[Dict[str, Any]] = None
+        if backup_before_delete:
+            try:
+                up = self.upload_block(
+                    block_name=canonical_name,
+                    host=host,
+                    port=port,
+                    rack=rack,
+                    slot=slot,
+                    save_to_backup=True,
+                    timeout_s=timeout_s,
+                    connection_type=connection_type,
+                )
+                if up.get("ok"):
+                    backup_info = {"backup_file": up.get("backup_file"), "sha256": up.get("sha256")}
+            except Exception as b_exc:
+                backup_info = {"skipped": True, "reason": str(b_exc)}
+
+        if host.strip().lower() == "virtual":
+            removed = VIRTUAL_PLC.delete_block(canonical_name)
+            return {
+                "ok": removed,
+                "transport": "virtual_s7_plc",
+                "host": "virtual",
+                "block_name": canonical_name,
+                "backup": backup_info,
+                "error": None if removed else f"Block {canonical_name} not found in VirtualS7PLC.",
+            }
+        res = self.pool.delete_block(
+            host=host,
+            block_type=bt,
+            block_number=bnum,
+            port=port,
+            rack=rack,
+            slot=slot,
+            timeout_s=timeout_s,
+            connection_type=connection_type,
+        )
+        if backup_info is not None:
+            res["backup"] = backup_info
+        return res
+
+    def copy_ram_to_rom(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 102,
+        rack: int = 0,
+        slot: int = 2,
+        timeout_s: float = 30.0,
+        connection_type: str = "AUTO",
+        confirm_live_write: bool = False,
+    ) -> Dict[str, Any]:
+        """Persist active RAM blocks to MMC / Flash EPROM via S7comm 0x28 '_MODU' or VirtualS7PLC."""
+        if not self.writes_enabled(confirm_live_write, host=host, port=port):
+            return {
+                "ok": False,
+                "status": "WRITE_GUARDRAIL_BLOCKED",
+                "failure_category": FailureCategory.WRITE_GUARDRAIL_BLOCKED.value,
+                "error": (
+                    "Copy RAM to ROM on a live PLC requires BOTH "
+                    "confirm_live_write=True AND S7_WRITES_ENABLED=true."
+                ),
+            }
+        if host.strip().lower() == "virtual":
+            cnt = VIRTUAL_PLC.copy_ram_to_rom()
+            return {
+                "ok": True,
+                "transport": "virtual_s7_plc",
+                "host": "virtual",
+                "rom_block_count": cnt,
+            }
+        return self.pool.copy_ram_to_rom(
+            host=host,
+            port=port,
+            rack=rack,
+            slot=slot,
+            timeout_s=timeout_s,
+            connection_type=connection_type,
+        )
+
     def connection_check(
         self,
         host: str = "127.0.0.1",
@@ -5069,7 +5329,7 @@ class S7RuntimeClient:
         slot: int = 2,
         connection_type: str = "AUTO",
     ) -> Dict[str, Any]:
-        """Comprehensive pre-flight check for physical PLC monitoring, live writes, and program download."""
+        """Comprehensive pre-flight check for physical PLC monitoring, live writes, and program deployment."""
         t0 = time.perf_counter()
         env_writes = os.environ.get("S7_WRITES_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
         access_mode_val = ACTIVE_ACCESS_MODE.value
@@ -5091,6 +5351,8 @@ class S7RuntimeClient:
             "pgpc_interface": pgpc_info,
             "capabilities": {
                 "can_monitor_and_gather_data": False,
+                "can_upload_blocks_via_tcp": False,
+                "can_deploy_program_via_tcp": False,
                 "can_write_memory": False,
                 "can_download_program_via_com": False,
             },
@@ -5109,6 +5371,8 @@ class S7RuntimeClient:
             }
             report["online_blocks"] = blks.get("counts")
             report["capabilities"]["can_monitor_and_gather_data"] = True
+            report["capabilities"]["can_upload_blocks_via_tcp"] = True
+            report["capabilities"]["can_deploy_program_via_tcp"] = True
             report["capabilities"]["can_write_memory"] = True
             report["latency_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
             return report
@@ -5129,6 +5393,8 @@ class S7RuntimeClient:
                 "negotiated_pdu": conn.negotiated_pdu,
             }
             report["capabilities"]["can_monitor_and_gather_data"] = True
+            report["capabilities"]["can_upload_blocks_via_tcp"] = True
+            report["capabilities"]["can_deploy_program_via_tcp"] = is_full_mode and env_writes
             report["capabilities"]["can_write_memory"] = is_full_mode and env_writes
 
             # 2. Query CPU SZL identity & RUN/STOP mode
@@ -5172,27 +5438,28 @@ class S7RuntimeClient:
                 "Verify PLC Ethernet/PROFINET/CP343-1 IP, firewall TCP port 102, and rack/slot (S7-300 CPU is typically rack=0, slot=2; S7-400 is often rack=0, slot=3)."
             )
 
-        # 4. Evaluate physical PLC download readiness via Windows STEP 7 COM
+        # 4. Evaluate physical PLC download readiness via Direct S7comm TCP & Windows STEP 7 COM
         com_ready = com_available and is_full_mode and env_writes
         if com_available and pgpc_info.get("is_plcsim"):
             report["actionable_notes"].append(
                 f"Windows PG/PC Interface 'S7ONLINE' is set to '{pgpc_info.get('device_name')}' (PLCSIM). "
-                "Switch S7ONLINE in Windows 'Set PG/PC Interface' to TCP/IP or your MPI/PROFIBUS PC Adapter before downloading to a physical PLC."
+                "You can still deploy compiled MC7 blocks directly to the physical PLC over Ethernet/PROFINET TCP port 102 using s7_plc_deploy_program, "
+                "or switch S7ONLINE to TCP/IP / MPI / PROFIBUS for s7_com_download_blocks."
             )
             com_ready = False
         if not com_available:
             report["actionable_notes"].append(
-                "Program download (s7_com_download_blocks) uses Siemens STEP 7 Command Interface (32-bit Windows COM). "
-                "Run this MCP server on the Windows engineering workstation with STEP 7 Classic installed to download programs; "
-                "live monitoring and data gathering over S7comm TCP port 102 work on any OS."
+                "Direct physical PLC program deployment (s7_plc_deploy_program) and block upload/backup (s7_plc_upload_block) "
+                "work cross-platform over S7comm ISO-on-TCP port 102 for .s7p compiled projects, .mc7 binaries, and Global DBs; "
+                "STEP 7 COM compilation/download (s7_com_download_blocks) additionally requires Windows with STEP 7 Classic."
             )
         if not is_full_mode:
             report["actionable_notes"].append(
-                f"Server is in '--mode {access_mode_val}'. Start with '--mode full' (or S7_ACCESS_MODE=full) to enable PLC program downloads and live writes."
+                f"Server is in '--mode {access_mode_val}'. Start with '--mode full' (or S7_ACCESS_MODE=full) to enable PLC program deployment and live writes."
             )
         if not env_writes:
             report["actionable_notes"].append(
-                "Environment variable S7_WRITES_ENABLED is not 'true'. Set S7_WRITES_ENABLED=true and pass confirm_live_write=True for live PLC downloads/writes."
+                "Environment variable S7_WRITES_ENABLED is not 'true'. Set S7_WRITES_ENABLED=true and pass confirm_live_write=True for live PLC program deployments/writes."
             )
         report["capabilities"]["can_download_program_via_com"] = com_ready
         report["latency_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
@@ -8882,17 +9149,22 @@ def s7_com_download_blocks(
     slot: int = 2,
     timeout_s: float = 90.0,
     confirm_live_write: bool = False,
+    host: Optional[str] = None,
+    port: int = 102,
+    project_path: Optional[str] = None,
+    fallback_to_tcp: bool = True,
+    copy_ram_to_rom: bool = False,
 ) -> str:
     """
     Downloads compiled blocks, full program, or entire station (HW Config SDBs + blocks) to a physical PLC or S7-PLCSIM
-    via 32-bit STEP 7 COM (`download_target`: 'blocks' | 'program' | 'station'). Requires `--mode full` +
-    `S7_WRITES_ENABLED=true` + `confirm_live_write=True`. Optionally verifies online blocks via S7comm TCP when
-    `verify_host` is specified.
+    via 32-bit STEP 7 COM (`download_target`: 'blocks' | 'program' | 'station'), with automatic fallback to direct
+    S7comm ISO-on-TCP port 102 block download when `host` (or `verify_host`) + compiled `.s7p` project are available.
+    Requires `--mode full` + `S7_WRITES_ENABLED=true` + `confirm_live_write=True`.
     """
     denied = _check_access_mode("s7_com_download_blocks", AccessMode.FULL)
     if denied:
         return denied
-    if not runtime_client.writes_enabled(confirm_live_write, host="plc-download", port=102):
+    if not runtime_client.writes_enabled(confirm_live_write, host=host or verify_host or "plc-download", port=port):
         return json.dumps(
             {
                 "success": False,
@@ -8914,33 +9186,88 @@ def s7_com_download_blocks(
         download_target=download_target,
         timeout_s=timeout_s,
     )
+
+    tcp_host = host or verify_host
+    tcp_port = port if host else verify_port
+    tcp_fallback_details: Optional[Dict[str, Any]] = None
+    if (not ok) and fallback_to_tcp and tcp_host:
+        cand_proj = Path(project_path).expanduser() if project_path else (
+            WORKSPACE_DIR / "Projects" / (project_name or controller.project_name or "")
+        )
+        if cand_proj.exists():
+            extracted = extract_mc7_blocks_from_step7_project(cand_proj, block_names=blocks or None)
+            if extracted.get("blocks"):
+                transferred: List[Dict[str, Any]] = []
+                errors: List[Dict[str, Any]] = []
+                for b_name, b_raw in extracted["blocks"].items():
+                    try:
+                        dl = runtime_client.download_block(
+                            block_bytes=b_raw,
+                            host=tcp_host,
+                            port=tcp_port,
+                            rack=rack,
+                            slot=slot,
+                            activate=True,
+                            copy_ram_to_rom=False,
+                            timeout_s=min(timeout_s, 30.0),
+                            confirm_live_write=confirm_live_write,
+                        )
+                        if dl.get("ok"):
+                            transferred.append(dl)
+                        else:
+                            errors.append({"block_name": b_name, "error": dl.get("error")})
+                    except Exception as dl_exc:
+                        errors.append({"block_name": b_name, "error": str(dl_exc)})
+                rom_res = None
+                if copy_ram_to_rom and transferred and not errors:
+                    rom_res = runtime_client.copy_ram_to_rom(
+                        host=tcp_host, port=tcp_port, rack=rack, slot=slot, confirm_live_write=confirm_live_write
+                    )
+                if transferred and not errors:
+                    ok = True
+                    msg = (
+                        f"COM download unavailable ({msg}); automatically deployed {len(transferred)} compiled MC7 "
+                        f"block(s) directly to physical PLC {tcp_host}:{tcp_port} via S7comm ISO-on-TCP."
+                    )
+                tcp_fallback_details = {
+                    "transport": "s7comm_iso_tcp_fallback",
+                    "project_dir": str(cand_proj),
+                    "transferred": transferred,
+                    "errors": errors,
+                    "copy_ram_to_rom": rom_res,
+                }
+
     online_verification: Optional[Dict[str, Any]] = None
-    if ok and verify_host:
+    check_host = verify_host or (host if ok and tcp_fallback_details else None)
+    check_port = verify_port if verify_host else port
+    if ok and check_host:
         try:
-            diag = runtime_client.read_cpu_diagnostics(host=verify_host, port=verify_port, rack=rack, slot=slot)
+            diag = runtime_client.read_cpu_diagnostics(host=check_host, port=check_port, rack=rack, slot=slot)
             online_blks = runtime_client.list_online_blocks(
-                host=verify_host, port=verify_port, rack=rack, slot=slot, include_block_numbers=True
+                host=check_host, port=check_port, rack=rack, slot=slot, include_block_numbers=True
             )
             online_verification = {
                 "ok": True,
-                "host": verify_host,
-                "port": verify_port,
+                "host": check_host,
+                "port": check_port,
                 "cpu_mode": diag.get("cpu_mode"),
                 "order_number": diag.get("order_number"),
                 "online_block_counts": online_blks.get("counts"),
                 "online_block_names": online_blks.get("block_names"),
             }
         except Exception as ver_exc:
-            online_verification = {"ok": False, "host": verify_host, "error": str(ver_exc)}
+            online_verification = {"ok": False, "host": check_host, "error": str(ver_exc)}
 
     AUDIT_LOGGER.record(
         tool="s7_com_download_blocks",
         action=f"download_{download_target}",
-        target=f"{project_name}:{','.join(blocks) if blocks else '*'}",
+        target=f"{project_name or project_path}:{','.join(blocks) if blocks else '*'}",
         success=ok,
         status="SUCCESS" if ok else "FAILED",
     )
     payload: Dict[str, Any] = {"success": ok, "message": msg, "details": meta}
+    if tcp_fallback_details is not None:
+        payload["tcp_fallback"] = tcp_fallback_details
     if online_verification is not None:
         payload["online_verification"] = online_verification
     return json.dumps(payload, indent=2)
@@ -9842,6 +10169,522 @@ def s7_runtime_cpu_control(
         AUDIT_LOGGER.record(
             tool="s7_runtime_cpu_control",
             action=action.upper(),
+            target=f"{host}:{port}",
+            success=res["success"],
+            status=res.get("status", "SUCCESS" if res["success"] else "FAILED"),
+            failure_category=res.get("failure_category"),
+        )
+        return json.dumps(res, indent=2)
+    except Exception as exc:
+        return json.dumps(
+            {"success": False, "failure_category": FailureCategory.TRANSPORT_ERROR.value, "error": str(exc)},
+            indent=2,
+        )
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=False, destructive=True, open_world=True, title="Deploy Program/Blocks Directly to Physical PLC"))
+def s7_plc_deploy_program(
+    host: str = "127.0.0.1",
+    port: int = 102,
+    rack: int = 0,
+    slot: int = 2,
+    blocks: Optional[List[str]] = None,
+    project_path: Optional[str] = None,
+    project_name: Optional[str] = None,
+    mc7_file_path: Optional[str] = None,
+    mc7_hex: Optional[str] = None,
+    block_name: Optional[str] = None,
+    source_code: Optional[str] = None,
+    db_number: Optional[int] = None,
+    db_fields: Optional[List[Dict[str, Any]]] = None,
+    db_byte_size: Optional[int] = None,
+    compile_via_step7: bool = True,
+    backup_before_overwrite: bool = True,
+    stop_cpu_for_download: bool = False,
+    activate: bool = True,
+    copy_ram_to_rom: bool = False,
+    verify_online: bool = True,
+    connection_type: str = "AUTO",
+    timeout_s: float = 20.0,
+    confirm_live_write: bool = False,
+) -> str:
+    """
+    Directly deploys/downloads compiled MC7 program blocks (OB/FC/FB/DB/SDB) to a physical Siemens S7-300/S7-400 PLC
+    over Ethernet/PROFINET S7comm ISO-on-TCP port 102 (0x1A -> 0x1B -> 0x1C -> 0x28 _INSE -> optional 0x28 _MODU),
+    working cross-platform without requiring SIMATIC Manager S7ONLINE COM download!
+
+    Accepted input sources (supply any one):
+      1. `project_path` or `project_name` (+ optional `blocks` filter): extracts authentic Siemens-compiled MC7 blocks
+         from STEP 7 Classic `.s7p` (`ombstx/offline/*/SUBBLK.DBF` + `SUBBLK.DBT`).
+      2. `mc7_file_path` or `mc7_hex`: deploys raw `.mc7` binary block image(s) directly.
+      3. `db_number` + `db_fields` / `db_byte_size` (or `DATA_BLOCK` in `source_code`): compiles a 100% authentic
+         Siemens Global Data Block (DB) MC7 binary in pure Python and deploys directly.
+      4. `source_code` (AWL/LAD/FBD/SCL) + `block_name`: on `host='virtual'`, loads into VirtualS7PLC; on Windows
+         with STEP 7 Classic (`compile_via_step7=True`), imports & compiles via STEP 7 COM into the project's offline
+         database, extracts authentic MC7 from `SUBBLK.DBF`/`SUBBLK.DBT`, and downloads over TCP port 102!
+
+    Safety: Requires `--mode full` + `S7_WRITES_ENABLED=true` + `confirm_live_write=True`. Automatically backs up
+    existing online PLC blocks to `~/Documents/Codex-Simatic7/Backups/` before overwriting (`backup_before_overwrite=True`).
+    """
+    denied = _check_access_mode("s7_plc_deploy_program", AccessMode.FULL)
+    if denied:
+        return denied
+    if not runtime_client.writes_enabled(confirm_live_write, host=host, port=port):
+        return json.dumps(
+            {
+                "success": False,
+                "status": "WRITE_GUARDRAIL_BLOCKED",
+                "failure_category": FailureCategory.WRITE_GUARDRAIL_BLOCKED.value,
+                "error": (
+                    "Deploying programs/blocks to a live PLC requires ALL THREE safety prerequisites: "
+                    "(1) server started with '--mode full' (or S7_ACCESS_MODE=full), "
+                    "(2) environment variable S7_WRITES_ENABLED=true, and "
+                    "(3) confirm_live_write=True."
+                ),
+            },
+            indent=2,
+        )
+
+    t0 = time.perf_counter()
+    h_low = host.strip().lower()
+    blocks_to_deploy: Dict[str, bytes] = {}
+    source_origin = "unknown"
+
+    try:
+        # Source 1: Raw MC7 binary file or hex string
+        if mc7_file_path:
+            fpath = Path(mc7_file_path).expanduser().resolve()
+            if not fpath.is_file():
+                return json.dumps(
+                    {
+                        "success": False,
+                        "failure_category": FailureCategory.VALIDATION_ERROR.value,
+                        "error": f"MC7 binary file not found: {fpath}",
+                    },
+                    indent=2,
+                )
+            raw_mc7 = fpath.read_bytes()
+            parsed = parse_mc7_block(raw_mc7)
+            bkey = block_name.strip().upper() if block_name else parsed["block_name"]
+            bt, bnum = parse_block_identifier(bkey)
+            blocks_to_deploy[f"{bt}{bnum}"] = raw_mc7
+            source_origin = f"mc7_file:{fpath.name}"
+        elif mc7_hex:
+            clean_hex = re.sub(r"\s+", "", mc7_hex)
+            raw_mc7 = bytes.fromhex(clean_hex)
+            parsed = parse_mc7_block(raw_mc7)
+            bkey = block_name.strip().upper() if block_name else parsed["block_name"]
+            bt, bnum = parse_block_identifier(bkey)
+            blocks_to_deploy[f"{bt}{bnum}"] = raw_mc7
+            source_origin = "mc7_hex"
+
+        # Source 2: Pure-Python Global Data Block (DB) compilation (fields, byte_size, or DATA_BLOCK source)
+        elif db_number is not None or db_fields is not None or (
+            source_code and re.search(r"\bDATA_BLOCK\s+DB\s*\d+", source_code, re.IGNORECASE)
+        ):
+            eff_db_num = int(db_number) if db_number is not None else 0
+            if eff_db_num <= 0 and block_name:
+                bt, bnum = parse_block_identifier(block_name)
+                if bt == "DB":
+                    eff_db_num = bnum
+            raw_db, db_meta = build_db_mc7_block(
+                db_number=eff_db_num,
+                fields=db_fields,
+                byte_size=db_byte_size,
+                db_source=source_code,
+            )
+            blocks_to_deploy[db_meta["block_name"]] = raw_db
+            source_origin = "pure_python_db_mc7"
+
+        # Source 3: Raw AWL/LAD/FBD/SCL logic source code
+        elif source_code:
+            if h_low == "virtual":
+                target_bname = (block_name or "OB1").strip().upper()
+                loaded = VIRTUAL_PLC.load_program(target_bname, source_code)
+                return json.dumps(
+                    {
+                        "success": True,
+                        "transport": "virtual_s7_plc",
+                        "host": "virtual",
+                        "source_origin": "source_code_virtual",
+                        "deployed_blocks": [loaded],
+                        "latency_ms": round((time.perf_counter() - t0) * 1000.0, 2),
+                    },
+                    indent=2,
+                )
+            # On Windows with STEP 7 Classic installed, compile via COM first then extract authentic MC7!
+            compiled_dir: Optional[Path] = None
+            if compile_via_step7 and sys.platform == "win32":
+                src_name = (block_name or "MCP_DEPLOY").strip().upper()
+                tmp_src = new_s7_artifact_path(f"deploy-{src_name.lower()}", suffix=".awl")
+                tmp_src.write_text(source_code, encoding="utf-8")
+                c_ok, c_msg, c_meta = controller.com_bridge.import_and_compile_source(
+                    source_path=tmp_src,
+                    source_name=src_name,
+                    project_name=project_name,
+                )
+                if not c_ok:
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "failure_category": FailureCategory.COMPILE_FAILED.value,
+                            "error": f"STEP 7 COM compilation failed before TCP deployment: {c_msg}",
+                            "details": c_meta,
+                        },
+                        indent=2,
+                    )
+                if project_path:
+                    compiled_dir = Path(project_path).expanduser()
+                elif c_meta.get("project_dir"):
+                    compiled_dir = Path(str(c_meta["project_dir"]))
+                elif project_name or controller.project_name:
+                    compiled_dir = WORKSPACE_DIR / "Projects" / str(project_name or controller.project_name)
+                if compiled_dir and compiled_dir.exists():
+                    wanted_blks = list(blocks) if blocks else ([block_name] if block_name else None)
+                    ext = extract_mc7_blocks_from_step7_project(compiled_dir, block_names=wanted_blks)
+                    if ext.get("blocks"):
+                        blocks_to_deploy.update(ext["blocks"])
+                        source_origin = f"step7_com_compiled:{compiled_dir}"
+            if not blocks_to_deploy:
+                return json.dumps(
+                    {
+                        "success": False,
+                        "failure_category": FailureCategory.COMPILE_FAILED.value,
+                        "error": (
+                            "Deploying raw AWL/LAD/FBD/SCL logic source to a physical S7-300/400 PLC requires "
+                            "authentic Siemens MC7 machine code. Provide either: "
+                            "(1) `project_path` pointing to a STEP 7 Classic `.s7p` project folder with compiled blocks (`SUBBLK.DBF`/`SUBBLK.DBT`), "
+                            "(2) `mc7_file_path` or `mc7_hex` containing a compiled MC7 block binary, "
+                            "(3) run on Windows with STEP 7 Classic installed so `compile_via_step7=True` compiles it automatically, "
+                            "or (4) pass a `DATA_BLOCK` / `db_fields` to compile & deploy a Global Data Block directly in pure Python."
+                        ),
+                    },
+                    indent=2,
+                )
+
+        # Source 4: STEP 7 Classic offline project (.s7p / project_path / project_name -> SUBBLK.DBF + SUBBLK.DBT)
+        elif project_path or project_name:
+            if project_path:
+                proj_target = Path(project_path).expanduser()
+            else:
+                proj_target = WORKSPACE_DIR / "Projects" / str(project_name)
+            ext = extract_mc7_blocks_from_step7_project(proj_target, block_names=blocks or None)
+            if not ext.get("blocks"):
+                return json.dumps(
+                    {
+                        "success": False,
+                        "failure_category": FailureCategory.VALIDATION_ERROR.value,
+                        "error": ext.get("error") or f"No matching compiled MC7 blocks found in {proj_target}.",
+                        "missing_requested": ext.get("missing_requested", []),
+                    },
+                    indent=2,
+                )
+            if ext.get("missing_requested"):
+                return json.dumps(
+                    {
+                        "success": False,
+                        "failure_category": FailureCategory.VALIDATION_ERROR.value,
+                        "error": f"Requested block(s) not found in compiled STEP 7 project: {ext['missing_requested']}",
+                        "available_blocks": ext.get("block_names", []),
+                    },
+                    indent=2,
+                )
+            blocks_to_deploy.update(ext["blocks"])
+            source_origin = f"step7_offline_project:{proj_target}"
+        else:
+            return json.dumps(
+                {
+                    "success": False,
+                    "failure_category": FailureCategory.VALIDATION_ERROR.value,
+                    "error": (
+                        "Provide at least one deployment source: `project_path`/`project_name` (compiled .s7p project), "
+                        "`mc7_file_path`/`mc7_hex`, `db_number`+`db_fields`/`db_byte_size`, or `source_code`."
+                    ),
+                },
+                indent=2,
+            )
+
+        # Order blocks safely: SDB -> DB -> FC -> FB -> OB (so dependencies exist before OB1 executes them!)
+        type_priority = {"SDB": 0, "DB": 1, "SFC": 2, "FC": 3, "SFB": 4, "FB": 5, "OB": 6}
+        ordered_items = sorted(
+            blocks_to_deploy.items(),
+            key=lambda kv: (
+                type_priority.get(parse_block_identifier(kv[0])[0], 9),
+                parse_block_identifier(kv[0])[1],
+            ),
+        )
+
+        # Optional Step A: Backup existing online blocks before overwriting
+        backups: Dict[str, Any] = {}
+        if backup_before_overwrite:
+            for b_key, _ in ordered_items:
+                try:
+                    up = runtime_client.upload_block(
+                        block_name=b_key,
+                        host=host,
+                        port=port,
+                        rack=rack,
+                        slot=slot,
+                        save_to_backup=True,
+                        timeout_s=timeout_s,
+                        connection_type=connection_type,
+                    )
+                    if up.get("ok"):
+                        backups[b_key] = {
+                            "backed_up": True,
+                            "backup_file": up.get("backup_file"),
+                            "sha256": up.get("sha256"),
+                            "byte_length": up.get("byte_length"),
+                        }
+                    else:
+                        backups[b_key] = {"backed_up": False, "reason": up.get("error", "not_present_online")}
+                except Exception as up_exc:
+                    backups[b_key] = {"backed_up": False, "reason": str(up_exc)}
+
+        # Optional Step B: Stop CPU before transfer if requested
+        cpu_stopped = False
+        cpu_restarted = False
+        if stop_cpu_for_download:
+            stop_res = runtime_client.cpu_control(
+                action="STOP", host=host, port=port, rack=rack, slot=slot, confirm_live_write=confirm_live_write
+            )
+            cpu_stopped = bool(stop_res.get("ok"))
+
+        # Step C: Transfer & activate every block over S7comm ISO-on-TCP
+        deployed_results: List[Dict[str, Any]] = []
+        failed_results: List[Dict[str, Any]] = []
+        for b_key, raw_bytes in ordered_items:
+            bt, bnum = parse_block_identifier(b_key)
+            try:
+                dl = runtime_client.download_block(
+                    block_bytes=raw_bytes,
+                    host=host,
+                    port=port,
+                    rack=rack,
+                    slot=slot,
+                    block_type=bt,
+                    block_number=bnum,
+                    activate=activate,
+                    copy_ram_to_rom=False,
+                    timeout_s=timeout_s,
+                    connection_type=connection_type,
+                    confirm_live_write=confirm_live_write,
+                )
+                if dl.get("ok"):
+                    deployed_results.append(dl)
+                else:
+                    failed_results.append({"block_name": b_key, "error": dl.get("error")})
+            except Exception as dl_exc:
+                failed_results.append({"block_name": b_key, "error": str(dl_exc)})
+
+        # Optional Step D: Copy RAM to ROM (_MODU) once after all blocks activated
+        rom_result: Optional[Dict[str, Any]] = None
+        if copy_ram_to_rom and deployed_results and not failed_results:
+            rom_result = runtime_client.copy_ram_to_rom(
+                host=host,
+                port=port,
+                rack=rack,
+                slot=slot,
+                timeout_s=max(timeout_s, 30.0),
+                connection_type=connection_type,
+                confirm_live_write=confirm_live_write,
+            )
+
+        # Optional Step E: Restart CPU if we stopped it
+        if cpu_stopped and not failed_results:
+            run_res = runtime_client.cpu_control(
+                action="RUN", host=host, port=port, rack=rack, slot=slot, confirm_live_write=confirm_live_write
+            )
+            cpu_restarted = bool(run_res.get("ok"))
+
+        # Optional Step F: Online verification (block inventory + SZL CPU mode)
+        online_verification: Optional[Dict[str, Any]] = None
+        if verify_online and deployed_results:
+            try:
+                diag = runtime_client.read_cpu_diagnostics(host=host, port=port, rack=rack, slot=slot)
+                inv = runtime_client.list_online_blocks(
+                    host=host, port=port, rack=rack, slot=slot, include_block_numbers=True, connection_type=connection_type
+                )
+                online_names = set(inv.get("block_names", []))
+                deployed_names = [d["block_name"] for d in deployed_results]
+                missing_online = [n for n in deployed_names if n not in online_names]
+                online_verification = {
+                    "ok": len(missing_online) == 0,
+                    "cpu_mode": diag.get("cpu_mode"),
+                    "order_number": diag.get("order_number"),
+                    "online_block_counts": inv.get("counts"),
+                    "verified_blocks": [n for n in deployed_names if n in online_names],
+                    "missing_online": missing_online,
+                }
+            except Exception as ver_exc:
+                online_verification = {"ok": False, "error": str(ver_exc)}
+
+        overall_ok = bool(deployed_results) and not failed_results and (rom_result is None or bool(rom_result.get("ok")))
+        AUDIT_LOGGER.record(
+            tool="s7_plc_deploy_program",
+            action="deploy_mc7_blocks",
+            target=f"{host}:{port}/{','.join(k for k, _ in ordered_items)}",
+            success=overall_ok,
+            status="SUCCESS" if overall_ok else "FAILED",
+        )
+        return json.dumps(
+            {
+                "success": overall_ok,
+                "transport": "virtual_s7_plc" if h_low == "virtual" else "s7comm_iso_tcp",
+                "host": host,
+                "port": port,
+                "rack": rack,
+                "slot": slot,
+                "source_origin": source_origin,
+                "deployed_count": len(deployed_results),
+                "deployed_blocks": deployed_results,
+                "failed_blocks": failed_results,
+                "pre_overwrite_backups": backups if backup_before_overwrite else {},
+                "cpu_stopped_for_download": cpu_stopped,
+                "cpu_restarted": cpu_restarted,
+                "copy_ram_to_rom": rom_result,
+                "online_verification": online_verification,
+                "latency_ms": round((time.perf_counter() - t0) * 1000.0, 2),
+            },
+            indent=2,
+        )
+    except Exception as exc:
+        AUDIT_LOGGER.record(
+            tool="s7_plc_deploy_program",
+            action="deploy_mc7_blocks",
+            target=f"{host}:{port}",
+            success=False,
+            status="FAILED",
+            failure_category=FailureCategory.TRANSPORT_ERROR.value,
+        )
+        return json.dumps(
+            {"success": False, "failure_category": FailureCategory.TRANSPORT_ERROR.value, "error": str(exc)},
+            indent=2,
+        )
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, open_world=True, title="Upload Block from Physical PLC"))
+def s7_plc_upload_block(
+    block_name: str,
+    host: str = "127.0.0.1",
+    port: int = 102,
+    rack: int = 0,
+    slot: int = 2,
+    save_to_backup: bool = True,
+    output_path: Optional[str] = None,
+    include_hex: bool = False,
+    connection_type: str = "AUTO",
+    timeout_s: float = 15.0,
+) -> str:
+    """
+    Uploads (retrieves) a compiled MC7 program or data block (e.g. 'OB1', 'FC10', 'FB5', 'DB1', 'SDB0')
+    directly FROM a physical Siemens S7-300/S7-400 PLC over S7comm ISO-on-TCP port 102 (0x1D -> 0x1E -> 0x1F).
+    Parses the 36-byte Siemens MC7 header metadata, computes SHA-256 checksum, and saves a `.mc7` backup file
+    in `~/Documents/Codex-Simatic7/Backups/` (read-only safe; works in `--mode read-only`).
+    """
+    try:
+        res = runtime_client.upload_block(
+            block_name=block_name,
+            host=host,
+            port=port,
+            rack=rack,
+            slot=slot,
+            save_to_backup=save_to_backup,
+            output_path=output_path,
+            include_hex=include_hex,
+            timeout_s=timeout_s,
+            connection_type=connection_type,
+        )
+        res["success"] = bool(res.get("ok"))
+        return json.dumps(res, indent=2)
+    except Exception as exc:
+        return json.dumps(
+            {"success": False, "failure_category": FailureCategory.TRANSPORT_ERROR.value, "error": str(exc)},
+            indent=2,
+        )
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=False, destructive=True, open_world=True, title="Delete Block on Physical PLC"))
+def s7_plc_delete_block(
+    block_name: str,
+    host: str = "127.0.0.1",
+    port: int = 102,
+    rack: int = 0,
+    slot: int = 2,
+    backup_before_delete: bool = True,
+    connection_type: str = "AUTO",
+    timeout_s: float = 10.0,
+    confirm_live_write: bool = False,
+) -> str:
+    """
+    Deletes a block (e.g. 'FC10', 'DB50') directly on a physical S7-300/S7-400 PLC over S7comm ISO-on-TCP
+    using PI-Service `_DELE` (0x28). Automatically backs up the block via upload before deleting when
+    `backup_before_delete=True`. Requires `--mode full` + `S7_WRITES_ENABLED=true` + `confirm_live_write=True`.
+    """
+    denied = _check_access_mode("s7_plc_delete_block", AccessMode.FULL)
+    if denied:
+        return denied
+    try:
+        res = runtime_client.delete_block(
+            block_name=block_name,
+            host=host,
+            port=port,
+            rack=rack,
+            slot=slot,
+            backup_before_delete=backup_before_delete,
+            timeout_s=timeout_s,
+            connection_type=connection_type,
+            confirm_live_write=confirm_live_write,
+        )
+        res["success"] = bool(res.get("ok"))
+        AUDIT_LOGGER.record(
+            tool="s7_plc_delete_block",
+            action="delete_online_block",
+            target=f"{host}:{port}/{block_name}",
+            success=res["success"],
+            status=res.get("status", "SUCCESS" if res["success"] else "FAILED"),
+            failure_category=res.get("failure_category"),
+        )
+        return json.dumps(res, indent=2)
+    except Exception as exc:
+        return json.dumps(
+            {"success": False, "failure_category": FailureCategory.TRANSPORT_ERROR.value, "error": str(exc)},
+            indent=2,
+        )
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=False, destructive=False, open_world=True, title="Copy PLC RAM to ROM"))
+def s7_plc_copy_ram_to_rom(
+    host: str = "127.0.0.1",
+    port: int = 102,
+    rack: int = 0,
+    slot: int = 2,
+    connection_type: str = "AUTO",
+    timeout_s: float = 30.0,
+    confirm_live_write: bool = False,
+) -> str:
+    """
+    Executes S7comm PI-Service `_MODU` (0x28) on a physical S7-300/S7-400 PLC to persist active RAM blocks
+    into MMC / Flash EPROM so deployed programs survive power cycles. Requires `--mode full` +
+    `S7_WRITES_ENABLED=true` + `confirm_live_write=True`.
+    """
+    denied = _check_access_mode("s7_plc_copy_ram_to_rom", AccessMode.FULL)
+    if denied:
+        return denied
+    try:
+        res = runtime_client.copy_ram_to_rom(
+            host=host,
+            port=port,
+            rack=rack,
+            slot=slot,
+            timeout_s=timeout_s,
+            connection_type=connection_type,
+            confirm_live_write=confirm_live_write,
+        )
+        res["success"] = bool(res.get("ok"))
+        AUDIT_LOGGER.record(
+            tool="s7_plc_copy_ram_to_rom",
+            action="copy_ram_to_rom",
             target=f"{host}:{port}",
             success=res["success"],
             status=res.get("status", "SUCCESS" if res["success"] else "FAILED"),

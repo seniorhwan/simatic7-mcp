@@ -25,7 +25,8 @@ A production-grade **Model Context Protocol (MCP)** stdio server giving AI codin
   - S7-PLCSIM lifecycle (`connect`, `disconnect`, `set_state`, `set_scan_mode`, `step_scan`, `save_plc`, `load_plc`), exact IEEE-754 `REAL` float preservation, and `I`-area reads.
   - Deterministic **Virtual S7-300/400 PLC** (`VirtualS7PLC`) executing STL/LAD, SCL, S7-GRAPH, DBs, periodic `OB35`, and authentic Siemens S7-300 standard/system library blocks (`SFB0` CTU, `SFB1` CTD, `SFB2` CTUD, `SFB3` TP, `SFB4` TON, `SFB5` TOF, `FC105` SCALE, `FC106` UNSCALE, `FB41` CONT_C PID, `SFC20` BLKMOV, `SFC21` FILL, `SFC64` TIME_TCK).
   - Deterministic closed-loop physical plant simulator (`s7_run_closed_loop_sim`) for verifying PID tuning, tank levels, thermal systems, and disturbance rejection with quantitative control assertions.
-- **High-Speed Physical PLC Monitoring, Online Diagnostics & AI Data Historian (`simatic_s7_mcp/runtime_engine.py`)**
+- **High-Speed Physical PLC Monitoring, Direct Program Deployment & AI Data Historian (`simatic_s7_mcp/runtime_engine.py` + `simatic_s7_mcp/s7_mc7.py`)**
+  - **Direct S7comm ISO-on-TCP Program Transfer (port 102, cross-platform)**: Deploy compiled MC7 blocks (`OB`/`FC`/`FB`/`DB`/`SDB`) directly to physical S7-300/S7-400 PLCs (`0x1A` → `0x1B` → `0x1C` → `0x28 _INSE`), upload & back up blocks from physical PLCs (`0x1D` → `0x1E` → `0x1F`), delete blocks (`0x28 _DELE`), and persist RAM to MMC/EPROM (`0x28 _MODU`). Extracts authentic Siemens-compiled MC7 blocks directly from STEP 7 Classic `.s7p` projects (`ombstx/offline/*/SUBBLK.DBF` + `SUBBLK.DBT`) and compiles Global Data Blocks (DBs) directly in pure Python.
   - Persistent RFC1006 / ISO-on-TCP `S7ConnectionPool` with automatic **PG -> OP -> S7_BASIC TSAP fallback** (critical when SIMATIC Manager already occupies the single PG resource on an S7-300), **dynamic negotiated-PDU chunking** (respects classic S7-300 240-byte PDUs), Timer/Counter area access, online block inventory (`s7_runtime_list_online_blocks`), pre-flight readiness check (`s7_plc_connection_check`), Watch Table (VAT) snapshots, CPU SZL diagnostics, and a dedicated **AI time-series historian** (`s7_collect_plc_data`) with per-tag analytics, threshold alerting, and CSV/JSONL export.
 - **Industrial Safety & AI-Agent Ergonomics (`simatic_s7_mcp/contracts.py`)**
   - Strict dual-guard (`confirm_live_write=True` **AND** `S7_WRITES_ENABLED=true`) for all physical/remote PLC writes and CPU RUN/STOP control.
@@ -103,7 +104,7 @@ S7_WRITES_ENABLED = "false"
 
 ---
 
-## Complete MCP Tool Catalog (72 Tools)
+## Complete MCP Tool Catalog (76 Tools)
 
 ### Environment, Diagnostics & Project Lifecycle (12 Tools)
 - `s7_get_status` — Inspect controller connection, workspace, and active project state.
@@ -178,8 +179,12 @@ S7_WRITES_ENABLED = "false"
 - `s7_plcsim_run_scenario` — Run multi-step input/expectation test scenarios on Virtual PLC or S7-PLCSIM.
 - `s7_run_closed_loop_sim` — Run closed-loop PLC + physical plant simulation with `FB41` PID, `FC105`/`FC106`, `SFB0`-`SFB5`, `SFC20`/`SFC21`/`SFC64`, disturbances, and control assertions.
 
-### Live S7comm Runtime, Physical PLC Preflight & AI Data Historian (11 Tools)
+### Live S7comm Runtime, Physical PLC Deployment & AI Data Historian (15 Tools)
 - `s7_plc_connection_check` — Non-destructive pre-flight check for physical PLCs (TCP port 102, PG/OP/S7-Basic TSAP, negotiated PDU, CPU MLFB/mode, online blocks, Windows `S7ONLINE` PG/PC interface, and write/download guardrails).
+- `s7_plc_deploy_program` — Directly deploy/download compiled MC7 blocks (`OB`/`FC`/`FB`/`DB`/`SDB`) to a physical S7-300/S7-400 PLC over S7comm ISO-on-TCP port 102 (`0x1A`→`0x1B`→`0x1C`→`_INSE`→optional `_MODU`) from a compiled `.s7p` project (`SUBBLK.DBF`/`SUBBLK.DBT`), `.mc7` binary, pure-Python Global DB definition, or Windows STEP 7 COM compilation, with automatic pre-overwrite online backup & online verification (dual-guarded).
+- `s7_plc_upload_block` — Upload (retrieve & back up) any block (`OB1`, `FC10`, `FB5`, `DB1`, `SDB0`) directly from a physical PLC over S7comm ISO-on-TCP (`0x1D`→`0x1E`→`0x1F`) into `~/Documents/Codex-Simatic7/Backups/*.mc7` (read-only safe).
+- `s7_plc_delete_block` — Safely back up and delete a block on a physical PLC via S7comm PI-Service `_DELE` (`0x28`, dual-guarded).
+- `s7_plc_copy_ram_to_rom` — Persist active RAM blocks to MMC / Flash EPROM via S7comm PI-Service `_MODU` (`0x28`, dual-guarded).
 - `s7_runtime_ping` — Test TCP/RFC1006 reachability to a PLC or loopback server.
 - `s7_runtime_read` — Read an S7 address/symbol via RFC1006/S7comm or S7ProSim.
 - `s7_runtime_write` — Dual-guarded write to an S7 address/symbol.
@@ -199,18 +204,19 @@ S7_WRITES_ENABLED = "false"
 
 ## Connecting to a Physical S7-300 / S7-400 PLC
 
-### 1. Live Monitoring & AI Data Gathering (Works on Windows, Linux, or macOS — No STEP 7 GUI Required)
+### 1. Live Monitoring, Block Upload & AI Data Gathering (Windows, Linux, or macOS — No STEP 7 GUI Required)
 Any physical S7-300/400 PLC with onboard PROFINET (`CPU 315-2 PN/DP`, `CPU 317-2 PN/DP`, etc.) or Ethernet CP (`CP 343-1`, `CP 443-1`) listens on **ISO-on-TCP port 102**:
 1. Run `s7_plc_connection_check(host="192.168.0.10", rack=0, slot=2)` (use `slot=2` for S7-300; typically `slot=3` for S7-400).
-2. Read tags or gather datasets with `s7_runtime_batch_read`, `s7_monitor_watch_table`, `s7_runtime_list_online_blocks`, `s7_runtime_cpu_diagnostics`, and `s7_collect_plc_data(..., export_format="both")`.
-3. Monitoring is **read-only** and works in every access mode (`read-only`, `read-write`, `full`).
+2. Read tags, back up live blocks, or gather datasets with `s7_runtime_batch_read`, `s7_monitor_watch_table`, `s7_runtime_list_online_blocks`, `s7_plc_upload_block`, `s7_runtime_cpu_diagnostics`, and `s7_collect_plc_data(..., export_format="both")`.
+3. Monitoring and block upload/backup are **read-only** and work in every access mode (`read-only`, `read-write`, `full`).
 
-### 2. Downloading Programs to a Physical PLC (`s7_com_download_blocks`)
-Program download uses Siemens' 32-bit STEP 7 Command Interface (`Simatic.Simatic` COM) on Windows and requires:
-1. **Windows host with STEP 7 Classic installed** and your **PG/PC Interface (`S7ONLINE`)** set in Windows Control Panel to your physical PLC adapter (`TCP/IP (Auto)` / `PC Adapter (MPI/PROFIBUS)` — **not** `PLCSIM`).
-2. **Server started with `--mode full` AND `S7_WRITES_ENABLED=true`**, plus passing `confirm_live_write=True`.
-3. **CPU keyswitch in `RUN-P` or `STOP`** (not `RUN`-only), and hardware configuration matching your target CPU/IP/MPI address.
-4. Use `download_target="blocks"` (default) for compiled blocks, `download_target="station"` to download Hardware Config SDBs + blocks, and optionally pass `verify_host="192.168.0.10"` to automatically verify the loaded blocks over S7comm TCP right after download.
+### 2. Deploying / Downloading Programs Directly to a Physical PLC (`s7_plc_deploy_program` & `s7_com_download_blocks`)
+- **Direct S7comm ISO-on-TCP Deployment (`s7_plc_deploy_program` — Works on Windows, Linux, or macOS, NO `S7ONLINE` Required!)**:
+  1. Start the server with `--mode full` AND `S7_WRITES_ENABLED=true`, pass `confirm_live_write=True`, and ensure the CPU keyswitch is in `RUN-P` or `STOP`.
+  2. Supply a compiled STEP 7 `.s7p` project (`project_path="C:/Projects/MyPlant"`), a `.mc7` binary file (`mc7_file_path`), a Global Data Block (`db_number` + `db_fields`), or raw AWL/LAD/SCL source on Windows (`compile_via_step7=True`).
+  3. The tool automatically backs up existing online blocks via `0x1D..0x1F`, transfers blocks in exact dependency order (`SDB`→`DB`→`FC`→`FB`→`OB`) over TCP port 102 (`0x1A`→`0x1B`→`0x1C`→`_INSE`), optionally persists to MMC/EPROM (`copy_ram_to_rom=True`), and verifies online via `list_online_blocks` + SZL diagnostics.
+- **STEP 7 COM Download (`s7_com_download_blocks` — Windows with STEP 7 Classic)**:
+  - Uses `Simatic.Simatic` COM over `S7ONLINE` (MPI/PROFIBUS/TCP) and can automatically fall back to direct S7comm TCP (`fallback_to_tcp=True`) when `host` + compiled project are supplied.
 
 ---
 
