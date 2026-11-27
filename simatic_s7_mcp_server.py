@@ -64,8 +64,6 @@ Running via Antigravity or VS Code MCP Configuration:
     Args: ["C:/path/to/simatic_s7_mcp_server.py"]
 """
 
-from __future__ import annotations
-
 import argparse
 import csv
 import ctypes
@@ -6960,7 +6958,10 @@ def serialized_gui(function):
             finally:
                 if function.__name__ == "s7_write_program":
                     GUI_ACTIVE_WRITE.clear()
-    wrapper.__signature__ = inspect.signature(function)  # type: ignore[attr-defined]
+    try:
+        wrapper.__signature__ = inspect.signature(function, eval_str=True)  # type: ignore[attr-defined]
+    except Exception:
+        wrapper.__signature__ = inspect.signature(function)  # type: ignore[attr-defined]
     return wrapper
 
 

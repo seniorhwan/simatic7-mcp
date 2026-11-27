@@ -538,15 +538,46 @@ class TestPhysicalPLCTCPTransferEndToEnd(unittest.TestCase):
             "s7_plc_copy_ram_to_rom",
         }
         tool_mgr = getattr(srv.mcp, "_tool_manager", None)
-        if tool_mgr is not None and hasattr(tool_mgr, "_tools"):
-            tools = tool_mgr._tools
+        if tool_mgr is not None and hasattr(tool_mgr, "list_tools"):
+            tools_by_name = {t.name: t for t in tool_mgr.list_tools()}
             for name in expected:
-                self.assertIn(name, tools)
-                ann = getattr(tools[name], "annotations", None)
+                self.assertIn(name, tools_by_name)
+                ann = getattr(tools_by_name[name], "annotations", None)
                 self.assertIsNotNone(ann, f"Missing ToolAnnotations on {name}")
         else:
+            tools_map = getattr(srv.mcp, "_tools", {})
             for name in expected:
+                self.assertIn(name, tools_map)
+                self.assertIsNotNone(tools_map[name].get("annotations"), f"Missing ToolAnnotations on {name}")
                 self.assertTrue(callable(getattr(srv, name, None)))
+
+    def test_all_mcp_tools_have_evaluated_non_string_annotations(self) -> None:
+        import inspect
+
+        # Every MCP tool (including @serialized_gui-wrapped tools) must expose real evaluated
+        # Python types in inspect.signature(..., eval_str=True) so FastMCP + Pydantic v2
+        # never crash with PydanticUndefinedAnnotation during schema creation.
+        tool_mgr = getattr(srv.mcp, "_tool_manager", None)
+        if tool_mgr is not None and hasattr(tool_mgr, "list_tools"):
+            tool_names = [t.name for t in tool_mgr.list_tools()]
+        else:
+            tool_names = list(getattr(srv.mcp, "_tools", {}).keys())
+        self.assertGreaterEqual(len(tool_names), 75)
+
+        for name in tool_names:
+            fn = getattr(srv, name)
+            sig = inspect.signature(fn, eval_str=True)
+            for pname, param in sig.parameters.items():
+                self.assertNotIsInstance(
+                    param.annotation,
+                    str,
+                    f"Tool {name}({pname}) has unevaluated string annotation {param.annotation!r}",
+                )
+            self.assertNotIsInstance(
+                sig.return_annotation,
+                str,
+                f"Tool {name} has unevaluated string return annotation {sig.return_annotation!r}",
+            )
 
 
 class TestPreUploadConnectivityDiagnostics(unittest.TestCase):

@@ -9,6 +9,7 @@ description = "Production-grade Siemens SIMATIC STEP 7 Classic (V5.x) MCP Server
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
+license-files = ["LICENSE"]
 keywords = ["siemens", "simatic", "step7", "s7-300", "s7-400", "plc", "mcp", "plcsim", "iec-61131-3"]
 dependencies = [
     "mcp>=1.6.0,<2.0.0",
@@ -30,3 +31,7 @@ simatic-s7-mcp = "simatic_s7_mcp_server:main"
 [tool.setuptools]
 py-modules = ["simatic_s7_mcp_server", "lad_converter"]
 packages = ["simatic_s7_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
