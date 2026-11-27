@@ -1410,5 +1410,239 @@ class TestAuditRemediationBugs01To14(unittest.TestCase):
             self.assertFalse(kwargs.get("shell", True))
 
 
+class TestPlcsimStartStopComTool(unittest.TestCase):
+    """Tests for s7_plcsim_start_stop and 32-bit S7ProSim COM simulation start/stop automation."""
+
+    def setUp(self):
+        self._orig_mode = SERVER.ACTIVE_ACCESS_MODE
+        self._orig_worker = SERVER.runtime_client.com_bridge.worker
+        self._orig_audit_path = SERVER.AUDIT_LOGGER._log_path
+        SERVER.set_access_mode(AccessMode.READ_WRITE)
+
+    def tearDown(self):
+        SERVER.set_access_mode(self._orig_mode)
+        SERVER.runtime_client.com_bridge.worker = self._orig_worker
+        SERVER.AUDIT_LOGGER._log_path = self._orig_audit_path
+
+    def _make_stateful_prosim_worker(self):
+        state = {"connected": False, "cpu_state": "STOP", "scan_mode": "CONTINUOUS", "calls": []}
+
+        def _handler(req):
+            state["calls"].append(dict(req))
+            cmd = req.get("cmd")
+            if cmd == "plcsim_start_simulation":
+                prev_state = state["cpu_state"]
+                prev_scan = state["scan_mode"]
+                if req.get("auto_connect", True) or not state["connected"]:
+                    state["connected"] = True
+                if req.get("scan_mode"):
+                    state["scan_mode"] = str(req["scan_mode"]).upper()
+                target = str(req.get("run_mode") or "RUN_P").upper()
+                state["cpu_state"] = target
+                return {
+                    "ok": True,
+                    "action": "start",
+                    "com_progid": "S7wspsmx.S7ProSim.1",
+                    "com_architecture": "32-bit",
+                    "connected": state["connected"],
+                    "previous_state": prev_state,
+                    "target_state": target,
+                    "cpu_state": state["cpu_state"],
+                    "previous_scan_mode": prev_scan,
+                    "scan_mode": state["scan_mode"],
+                    "verified": True,
+                }
+            if cmd == "plcsim_stop_simulation":
+                prev_state = state["cpu_state"]
+                prev_scan = state["scan_mode"]
+                if req.get("auto_connect", True) or not state["connected"]:
+                    state["connected"] = True
+                state["cpu_state"] = "STOP"
+                disc = bool(req.get("disconnect", False))
+                if disc:
+                    state["connected"] = False
+                return {
+                    "ok": True,
+                    "action": "stop",
+                    "com_progid": "S7wspsmx.S7ProSim.1",
+                    "com_architecture": "32-bit",
+                    "connected": state["connected"],
+                    "disconnected": disc,
+                    "previous_state": prev_state,
+                    "target_state": "STOP",
+                    "cpu_state": state["cpu_state"],
+                    "previous_scan_mode": prev_scan,
+                    "scan_mode": state["scan_mode"],
+                    "verified": True,
+                }
+            return {"ok": False, "error": f"Unexpected cmd: {cmd}"}
+
+        return PersistentComWorker(mock_handler=_handler), state
+
+    def test_plcsim_start_default_run_p_and_stop_verified_with_audit_log(self):
+        worker, state = self._make_stateful_prosim_worker()
+        SERVER.runtime_client.com_bridge.worker = worker
+
+        with tempfile.TemporaryDirectory() as td:
+            audit_file = Path(td) / "plcsim_audit.jsonl"
+            SERVER.AUDIT_LOGGER.set_log_path(audit_file)
+
+            # 1. Start simulation with default RUN_P and CONTINUOUS scan mode
+            res_start = json.loads(SERVER.s7_plcsim_start_stop(action="start", scan_mode="CONTINUOUS"))
+            self.assertTrue(res_start["success"], res_start)
+            self.assertEqual(res_start["action"], "start")
+            self.assertEqual(res_start["com_progid"], "S7wspsmx.S7ProSim.1")
+            self.assertEqual(res_start["com_architecture"], "32-bit")
+            self.assertEqual(res_start["transport"], "plcsim_s7prosim_com")
+            self.assertEqual(res_start["previous_state"], "STOP")
+            self.assertEqual(res_start["target_state"], "RUN_P")
+            self.assertEqual(res_start["cpu_state"], "RUN_P")
+            self.assertEqual(res_start["scan_mode"], "CONTINUOUS")
+            self.assertTrue(res_start["connected"])
+            self.assertTrue(res_start["verified"])
+
+            # 2. Stop simulation without disconnecting
+            res_stop = json.loads(SERVER.s7_plcsim_start_stop(action="stop"))
+            self.assertTrue(res_stop["success"], res_stop)
+            self.assertEqual(res_stop["previous_state"], "RUN_P")
+            self.assertEqual(res_stop["cpu_state"], "STOP")
+            self.assertTrue(res_stop["connected"])
+            self.assertFalse(res_stop["disconnected"])
+            self.assertTrue(res_stop["verified"])
+
+            # 3. Start in RUN + SINGLE scan mode, then stop with disconnect_on_stop=True
+            res_run = json.loads(SERVER.s7_plcsim_start_stop(action="start", run_mode="RUN", scan_mode="SINGLE"))
+            self.assertTrue(res_run["success"], res_run)
+            self.assertEqual(res_run["cpu_state"], "RUN")
+            self.assertEqual(res_run["scan_mode"], "SINGLE")
+
+            res_stop_disc = json.loads(SERVER.s7_plcsim_start_stop(action="stop", disconnect_on_stop=True))
+            self.assertTrue(res_stop_disc["success"], res_stop_disc)
+            self.assertEqual(res_stop_disc["cpu_state"], "STOP")
+            self.assertFalse(res_stop_disc["connected"])
+            self.assertTrue(res_stop_disc["disconnected"])
+
+            # Verify 4 structured audit log lines were written
+            lines = audit_file.read_text(encoding="utf-8").strip().splitlines()
+            self.assertEqual(len(lines), 4)
+            first_entry = json.loads(lines[0])
+            self.assertEqual(first_entry["tool"], "s7_plcsim_start_stop")
+            self.assertEqual(first_entry["action"], "start")
+            self.assertTrue(first_entry["success"])
+            self.assertEqual(len(state["calls"]), 4)
+
+    def test_plcsim_start_stop_normalizes_aliases_and_control_routing(self):
+        worker, state = self._make_stateful_prosim_worker()
+        SERVER.runtime_client.com_bridge.worker = worker
+
+        res = json.loads(SERVER.s7_plcsim_start_stop(action="START", run_mode="RUN-P", scan_mode="SINGLE_SCAN"))
+        self.assertTrue(res["success"], res)
+        self.assertEqual(res["target_state"], "RUN_P")
+        self.assertEqual(res["scan_mode"], "SINGLE")
+        self.assertEqual(state["calls"][-1]["cmd"], "plcsim_start_simulation")
+        self.assertEqual(state["calls"][-1]["run_mode"], "RUN_P")
+        self.assertEqual(state["calls"][-1]["scan_mode"], "SINGLE")
+
+        # s7_plcsim_control also supports 'start' and 'stop' aliases
+        ctrl_stop = json.loads(SERVER.s7_plcsim_control(action="stop"))
+        self.assertTrue(ctrl_stop["success"], ctrl_stop)
+        self.assertEqual(ctrl_stop["cpu_state"], "STOP")
+
+        ctrl_start = json.loads(SERVER.s7_plcsim_control(action="start", state="RUN", scan_mode="CONTINUOUS"))
+        self.assertTrue(ctrl_start["success"], ctrl_start)
+        self.assertEqual(ctrl_start["cpu_state"], "RUN")
+        self.assertEqual(ctrl_start["scan_mode"], "CONTINUOUS")
+
+    def test_plcsim_start_stop_validation_errors(self):
+        worker, _ = self._make_stateful_prosim_worker()
+        SERVER.runtime_client.com_bridge.worker = worker
+
+        bad_act = json.loads(SERVER.s7_plcsim_start_stop(action="pause"))
+        self.assertFalse(bad_act["success"])
+        self.assertEqual(bad_act["failure_category"], FailureCategory.VALIDATION_ERROR.value)
+
+        bad_run = json.loads(SERVER.s7_plcsim_start_stop(action="start", run_mode="FREEZE"))
+        self.assertFalse(bad_run["success"])
+        self.assertEqual(bad_run["failure_category"], FailureCategory.VALIDATION_ERROR.value)
+
+        bad_scan = json.loads(SERVER.s7_plcsim_start_stop(action="start", scan_mode="TURBO"))
+        self.assertFalse(bad_scan["success"])
+        self.assertEqual(bad_scan["failure_category"], FailureCategory.VALIDATION_ERROR.value)
+
+    def test_plcsim_start_stop_blocked_in_read_only_mode(self):
+        SERVER.set_access_mode(AccessMode.READ_ONLY)
+        for act in ("start", "stop"):
+            res = json.loads(SERVER.s7_plcsim_start_stop(action=act))
+            self.assertFalse(res["success"])
+            self.assertEqual(res["failure_category"], FailureCategory.ACCESS_DENIED.value)
+
+    def test_plcsim_start_stop_error_categories_for_com_plcsim_and_timeout(self):
+        # 1. 32-bit COM host unavailable
+        SERVER.runtime_client.com_bridge.worker = PersistentComWorker(
+            mock_handler=lambda req: {"ok": False, "error": "32-bit Windows COM host is not available on this platform."}
+        )
+        r_unavail = json.loads(SERVER.s7_plcsim_start_stop(action="start"))
+        self.assertFalse(r_unavail["success"])
+        self.assertEqual(r_unavail["failure_category"], FailureCategory.COM_UNAVAILABLE.value)
+        self.assertIn("hint", r_unavail)
+
+        # 2. S7ProSim COM not registered / PLCSIM closed
+        SERVER.runtime_client.com_bridge.worker = PersistentComWorker(
+            mock_handler=lambda req: {"ok": False, "error": "S7ProSim COM (S7wspsmx.S7ProSim.1) not registered"}
+        )
+        r_plcsim = json.loads(SERVER.s7_plcsim_start_stop(action="start"))
+        self.assertFalse(r_plcsim["success"])
+        self.assertEqual(r_plcsim["failure_category"], FailureCategory.PLCSIM_UNAVAILABLE.value)
+        self.assertIn("S7USSAPX.EXE", r_plcsim["hint"])
+
+        # 3. COM timeout
+        SERVER.runtime_client.com_bridge.worker = PersistentComWorker(
+            mock_handler=lambda req: {"ok": False, "timed_out": True, "error": "32-bit COM command 'plcsim_stop_simulation' timed out after 5.0s."}
+        )
+        r_to = json.loads(SERVER.s7_plcsim_start_stop(action="stop", timeout_s=5.0))
+        self.assertFalse(r_to["success"])
+        self.assertEqual(r_to["failure_category"], FailureCategory.COM_TIMEOUT.value)
+
+    def test_32bit_com_backends_implement_plcsim_start_stop_commands(self):
+        from simatic_s7_mcp.com_worker import _PERSISTENT_PS32_DAEMON_SCRIPT
+
+        for snippet in (
+            "S7wspsmx.S7ProSim.1",
+            "if ($cmd -eq 'plcsim_start_simulation')",
+            "if ($cmd -eq 'plcsim_stop_simulation')",
+            "$null = $psim.Connect()",
+            "$null = $psim.SetScanMode(",
+            "$null = $psim.SetState(",
+            "$null = $psim.Disconnect()",
+            "$psim.GetState()",
+        ):
+            self.assertIn(snippet, _PERSISTENT_PS32_DAEMON_SCRIPT)
+
+        cpp_path = Path(__file__).resolve().parents[1] / "native" / "s7_com_bridge.cpp"
+        cpp_text = cpp_path.read_text(encoding="utf-8")
+        for snippet in (
+            'L"S7wspsmx.S7ProSim.1"',
+            'cmd == "plcsim_start_simulation"',
+            'cmd == "plcsim_stop_simulation"',
+            "ensure_prosim_connected",
+            'L"SetScanMode"',
+            'L"SetState"',
+            'L"Disconnect"',
+        ):
+            self.assertIn(snippet, cpp_text)
+
+    def test_s7_plcsim_start_stop_mcp_registration_and_annotations(self):
+        import inspect
+
+        sig = inspect.signature(SERVER.s7_plcsim_start_stop)
+        for pname, param in sig.parameters.items():
+            self.assertFalse(
+                isinstance(param.annotation, str),
+                f"s7_plcsim_start_stop parameter '{pname}' has unevaluated string annotation",
+            )
+        self.assertFalse(isinstance(sig.return_annotation, str))
+        self.assertTrue(callable(SERVER.s7_plcsim_start_stop))
+
+
 if __name__ == "__main__":
     unittest.main()

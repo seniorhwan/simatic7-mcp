@@ -9,7 +9,8 @@
  *
  * Protocol: Newline-delimited JSON over stdin/stdout.
  *   Startup banner: {"ok":true,"ready":true,"worker":"native_cpp_x86","pid":1234}
- *   Commands: ping, shutdown, plcsim_get_state, plcsim_set_state, plcsim_step_scan
+ *   Commands: ping, shutdown, plcsim_start_simulation, plcsim_stop_simulation,
+ *             plcsim_get_state, plcsim_set_state, plcsim_step_scan
  *             (extended SIMATIC Manager commands return fallback_required=true so Python
  *              routes them to the persistent 32-bit PowerShell COM worker).
  */
@@ -156,6 +157,21 @@ static int extract_json_int(const std::string& line, const std::string& key, int
     return static_cast<int>(val);
 }
 
+static bool extract_json_bool(const std::string& line, const std::string& key, bool defaultValue) {
+    size_t valPos = 0;
+    if (!find_json_value_pos(line, key, valPos)) return defaultValue;
+    if (line.compare(valPos, 4, "true") == 0) return true;
+    if (line.compare(valPos, 5, "false") == 0) return false;
+    return defaultValue;
+}
+
+static std::string to_upper_ascii(std::string s) {
+    for (char& ch : s) {
+        ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    }
+    return s;
+}
+
 static HRESULT create_com_dispatch(const wchar_t* progId, IDispatch** outDisp) {
     CLSID clsid;
     HRESULT hr = CLSIDFromProgID(progId, &clsid);
@@ -187,6 +203,70 @@ static HRESULT invoke_one_bstr(IDispatch* disp, const wchar_t* method, const std
     return hr;
 }
 
+static HRESULT invoke_one_i4(IDispatch* disp, const wchar_t* method, LONG argVal, VARIANT* result) {
+    DISPID dispid;
+    LPOLESTR name = const_cast<LPOLESTR>(method);
+    HRESULT hr = disp->GetIDsOfNames(IID_NULL, &name, 1, LOCALE_USER_DEFAULT, &dispid);
+    if (FAILED(hr)) return hr;
+    VARIANT arg;
+    VariantInit(&arg);
+    arg.vt = VT_I4;
+    arg.lVal = argVal;
+    DISPPARAMS params = { &arg, nullptr, 1, 0 };
+    hr = disp->Invoke(dispid, IID_NULL, LOCALE_USER_DEFAULT, DISPATCH_METHOD, &params, result, nullptr, nullptr);
+    VariantClear(&arg);
+    return hr;
+}
+
+static bool ensure_prosim_connected(IDispatch*& pProSim, bool& connected, bool forceConnect, std::string& errOut) {
+    if (!pProSim && FAILED(create_com_dispatch(L"S7wspsmx.S7ProSim.1", &pProSim))) {
+        errOut = "S7ProSim COM (S7wspsmx.S7ProSim.1) not registered";
+        return false;
+    }
+    if (forceConnect || !connected) {
+        VARIANT res;
+        VariantInit(&res);
+        HRESULT hr = invoke_no_args(pProSim, L"Connect", DISPATCH_METHOD, &res);
+        VariantClear(&res);
+        if (FAILED(hr)) {
+            errOut = "S7ProSim.Connect failed";
+            return false;
+        }
+        connected = true;
+    }
+    return true;
+}
+
+static std::string read_prosim_state(IDispatch* pProSim, bool& okOut) {
+    VARIANT res;
+    VariantInit(&res);
+    std::string state;
+    okOut = false;
+    if (SUCCEEDED(invoke_no_args(pProSim, L"GetState", DISPATCH_METHOD, &res)) && res.vt == VT_BSTR) {
+        state = wide_to_utf8(res.bstrVal);
+        okOut = true;
+    }
+    VariantClear(&res);
+    return state;
+}
+
+static std::string read_prosim_scan_mode(IDispatch* pProSim) {
+    VARIANT res;
+    VariantInit(&res);
+    std::string label;
+    if (SUCCEEDED(invoke_no_args(pProSim, L"GetScanMode", DISPATCH_METHOD, &res))) {
+        if (res.vt == VT_I4) {
+            label = (res.lVal == 0) ? "SINGLE" : ((res.lVal == 1) ? "CONTINUOUS" : std::to_string(res.lVal));
+        } else if (res.vt == VT_I2) {
+            label = (res.iVal == 0) ? "SINGLE" : ((res.iVal == 1) ? "CONTINUOUS" : std::to_string(res.iVal));
+        } else if (res.vt == VT_BSTR) {
+            label = wide_to_utf8(res.bstrVal);
+        }
+    }
+    VariantClear(&res);
+    return label;
+}
+
 int main() {
     HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     if (FAILED(hr)) {
@@ -195,6 +275,7 @@ int main() {
     }
 
     IDispatch* pProSim = nullptr;
+    bool psimConnected = false;
 
     std::cout << "{\"ok\":true,\"ready\":true,\"worker\":\"native_cpp_x86\",\"pid\":" << GetCurrentProcessId() << "}\n" << std::flush;
 
@@ -211,32 +292,139 @@ int main() {
             std::cout << "{\"ok\":true,\"shutting_down\":true}\n" << std::flush;
             break;
         }
-        if (cmd == "plcsim_get_state") {
-            if (!pProSim && FAILED(create_com_dispatch(L"S7wspsmx.S7ProSim.1", &pProSim))) {
-                std::cout << "{\"ok\":false,\"error\":\"S7ProSim COM not registered\"}\n" << std::flush;
+        if (cmd == "plcsim_start_simulation") {
+            bool autoConnect = extract_json_bool(line, "auto_connect", true);
+            std::string errMsg;
+            if (!ensure_prosim_connected(pProSim, psimConnected, autoConnect, errMsg)) {
+                std::cout << "{\"ok\":false,\"error\":\"" << json_escape(errMsg) << "\"}\n" << std::flush;
                 continue;
             }
-            VARIANT res;
-            VariantInit(&res);
-            if (SUCCEEDED(invoke_no_args(pProSim, L"GetState", DISPATCH_METHOD, &res)) && res.vt == VT_BSTR) {
-                std::cout << "{\"ok\":true,\"cpu_state\":\"" << json_escape(wide_to_utf8(res.bstrVal)) << "\"}\n" << std::flush;
+            bool prevOk = false;
+            std::string prevState = read_prosim_state(pProSim, prevOk);
+            std::string prevScan = read_prosim_scan_mode(pProSim);
+
+            std::string reqScan = to_upper_ascii(extract_json_string(line, "scan_mode"));
+            if (!reqScan.empty()) {
+                LONG modeVal = (reqScan.find("SINGLE") != std::string::npos) ? 0 : 1;
+                VARIANT smRes;
+                VariantInit(&smRes);
+                HRESULT smHr = invoke_one_i4(pProSim, L"SetScanMode", modeVal, &smRes);
+                VariantClear(&smRes);
+                if (FAILED(smHr)) {
+                    std::cout << "{\"ok\":false,\"error\":\"S7ProSim.SetScanMode failed\"}\n" << std::flush;
+                    continue;
+                }
+            }
+
+            std::string runMode = to_upper_ascii(extract_json_string(line, "run_mode"));
+            if (runMode.empty() || runMode == "RUN-P" || runMode == "RUNP") runMode = "RUN_P";
+            if (runMode != "RUN" && runMode != "RUN_P") {
+                std::cout << "{\"ok\":false,\"error\":\"Unsupported run_mode; expected RUN_P or RUN\"}\n" << std::flush;
+                continue;
+            }
+
+            VARIANT setRes;
+            VariantInit(&setRes);
+            HRESULT setHr = invoke_one_bstr(pProSim, L"SetState", runMode, &setRes);
+            VariantClear(&setRes);
+            if (FAILED(setHr)) {
+                std::cout << "{\"ok\":false,\"error\":\"S7ProSim.SetState failed\"}\n" << std::flush;
+                continue;
+            }
+
+            bool stateOk = false;
+            std::string cpuState = read_prosim_state(pProSim, stateOk);
+            std::string curScan = read_prosim_scan_mode(pProSim);
+            std::string cpuUpper = to_upper_ascii(cpuState);
+            for (char& ch : cpuUpper) { if (ch == '-') ch = '_'; }
+            bool verified = stateOk && (cpuUpper == runMode || (runMode == "RUN_P" && cpuUpper == "RUN"));
+
+            std::cout << "{\"ok\":true,\"action\":\"start\",\"com_progid\":\"S7wspsmx.S7ProSim.1\","
+                      << "\"com_architecture\":\"32-bit\",\"connected\":" << (psimConnected ? "true" : "false")
+                      << ",\"previous_state\":\"" << json_escape(prevState)
+                      << "\",\"target_state\":\"" << json_escape(runMode)
+                      << "\",\"cpu_state\":\"" << json_escape(cpuState)
+                      << "\",\"previous_scan_mode\":\"" << json_escape(prevScan)
+                      << "\",\"scan_mode\":\"" << json_escape(curScan)
+                      << "\",\"verified\":" << (verified ? "true" : "false") << "}\n" << std::flush;
+            continue;
+        }
+        if (cmd == "plcsim_stop_simulation") {
+            bool autoConnect = extract_json_bool(line, "auto_connect", true);
+            bool disconnectAfter = extract_json_bool(line, "disconnect", false);
+            std::string errMsg;
+            if (!ensure_prosim_connected(pProSim, psimConnected, autoConnect, errMsg)) {
+                std::cout << "{\"ok\":false,\"error\":\"" << json_escape(errMsg) << "\"}\n" << std::flush;
+                continue;
+            }
+            bool prevOk = false;
+            std::string prevState = read_prosim_state(pProSim, prevOk);
+            std::string prevScan = read_prosim_scan_mode(pProSim);
+
+            VARIANT setRes;
+            VariantInit(&setRes);
+            HRESULT setHr = invoke_one_bstr(pProSim, L"SetState", "STOP", &setRes);
+            VariantClear(&setRes);
+            if (FAILED(setHr)) {
+                std::cout << "{\"ok\":false,\"error\":\"S7ProSim.SetState(STOP) failed\"}\n" << std::flush;
+                continue;
+            }
+
+            bool stateOk = false;
+            std::string cpuState = read_prosim_state(pProSim, stateOk);
+            std::string curScan = read_prosim_scan_mode(pProSim);
+            bool verified = stateOk && (to_upper_ascii(cpuState) == "STOP");
+
+            if (disconnectAfter) {
+                VARIANT discRes;
+                VariantInit(&discRes);
+                invoke_no_args(pProSim, L"Disconnect", DISPATCH_METHOD, &discRes);
+                VariantClear(&discRes);
+                psimConnected = false;
+            }
+
+            std::cout << "{\"ok\":true,\"action\":\"stop\",\"com_progid\":\"S7wspsmx.S7ProSim.1\","
+                      << "\"com_architecture\":\"32-bit\",\"connected\":" << (psimConnected ? "true" : "false")
+                      << ",\"disconnected\":" << (disconnectAfter ? "true" : "false")
+                      << ",\"previous_state\":\"" << json_escape(prevState)
+                      << "\",\"target_state\":\"STOP\",\"cpu_state\":\"" << json_escape(cpuState)
+                      << "\",\"previous_scan_mode\":\"" << json_escape(prevScan)
+                      << "\",\"scan_mode\":\"" << json_escape(curScan)
+                      << "\",\"verified\":" << (verified ? "true" : "false") << "}\n" << std::flush;
+            continue;
+        }
+        if (cmd == "plcsim_get_state") {
+            std::string errMsg;
+            if (!ensure_prosim_connected(pProSim, psimConnected, false, errMsg)) {
+                std::cout << "{\"ok\":false,\"error\":\"" << json_escape(errMsg) << "\"}\n" << std::flush;
+                continue;
+            }
+            bool stateOk = false;
+            std::string cpuState = read_prosim_state(pProSim, stateOk);
+            if (stateOk) {
+                std::string scanMode = read_prosim_scan_mode(pProSim);
+                std::cout << "{\"ok\":true,\"cpu_state\":\"" << json_escape(cpuState)
+                          << "\",\"scan_mode\":\"" << json_escape(scanMode) << "\"}\n" << std::flush;
             } else {
                 std::cout << "{\"ok\":false,\"error\":\"S7ProSim.GetState failed\"}\n" << std::flush;
             }
-            VariantClear(&res);
             continue;
         }
         if (cmd == "plcsim_set_state") {
-            if (!pProSim && FAILED(create_com_dispatch(L"S7wspsmx.S7ProSim.1", &pProSim))) {
-                std::cout << "{\"ok\":false,\"error\":\"S7ProSim COM not registered\"}\n" << std::flush;
+            std::string errMsg;
+            if (!ensure_prosim_connected(pProSim, psimConnected, false, errMsg)) {
+                std::cout << "{\"ok\":false,\"error\":\"" << json_escape(errMsg) << "\"}\n" << std::flush;
                 continue;
             }
-            std::string targetState = extract_json_string(line, "state");
-            if (targetState.empty()) targetState = "RUN";
+            std::string targetState = to_upper_ascii(extract_json_string(line, "state"));
+            if (targetState.empty()) targetState = "RUN_P";
+            if (targetState == "RUN-P" || targetState == "RUNP") targetState = "RUN_P";
             VARIANT res;
             VariantInit(&res);
             if (SUCCEEDED(invoke_one_bstr(pProSim, L"SetState", targetState, &res))) {
-                std::cout << "{\"ok\":true,\"cpu_state\":\"" << json_escape(targetState) << "\"}\n" << std::flush;
+                bool stateOk = false;
+                std::string cpuState = read_prosim_state(pProSim, stateOk);
+                std::cout << "{\"ok\":true,\"cpu_state\":\"" << json_escape(stateOk ? cpuState : targetState) << "\"}\n" << std::flush;
             } else {
                 std::cout << "{\"ok\":false,\"error\":\"S7ProSim.SetState failed\"}\n" << std::flush;
             }
@@ -244,8 +432,9 @@ int main() {
             continue;
         }
         if (cmd == "plcsim_step_scan") {
-            if (!pProSim && FAILED(create_com_dispatch(L"S7wspsmx.S7ProSim.1", &pProSim))) {
-                std::cout << "{\"ok\":false,\"error\":\"S7ProSim COM not registered\"}\n" << std::flush;
+            std::string errMsg;
+            if (!ensure_prosim_connected(pProSim, psimConnected, false, errMsg)) {
+                std::cout << "{\"ok\":false,\"error\":\"" << json_escape(errMsg) << "\"}\n" << std::flush;
                 continue;
             }
             int cycles = extract_json_int(line, "cycles", 1);

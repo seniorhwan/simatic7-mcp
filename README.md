@@ -22,7 +22,7 @@ A production-grade **Model Context Protocol (MCP)** stdio server giving AI codin
   - **S7-GRAPH / SFC** (`BLKLANG=00005`): BFS reachability & dead-end sink analyzer + `.gr7` source emission with opt-in COM compilation (`compile_via_com`).
   - **Global/Instance DB & UDT** (`BLKLANG=00006`): Exact S7 bit-packing and even-byte word alignment layout generator.
 - **Full Simulation (Live S7-PLCSIM + Virtual S7-300 PLC + Siemens Standard Library)**
-  - S7-PLCSIM lifecycle (`connect`, `disconnect`, `set_state`, `set_scan_mode`, `step_scan`, `save_plc`, `load_plc`), exact IEEE-754 `REAL` float preservation, and `I`-area reads.
+  - S7-PLCSIM 32-bit COM automation (`s7_plcsim_start_stop` for verified `RUN_P`/`RUN`/`STOP` simulation start/stop with optional scan-mode selection, auto-launch & disconnect, plus `connect`, `disconnect`, `set_state`, `set_scan_mode`, `step_scan`, `save_plc`, `load_plc`), exact IEEE-754 `REAL` float preservation, and `I`-area reads.
   - Deterministic **Virtual S7-300/400 PLC** (`VirtualS7PLC`) executing STL/LAD, SCL, S7-GRAPH, DBs, periodic `OB35`, and authentic Siemens S7-300 standard/system library blocks (`SFB0` CTU, `SFB1` CTD, `SFB2` CTUD, `SFB3` TP, `SFB4` TON, `SFB5` TOF, `FC105` SCALE, `FC106` UNSCALE, `FB41` CONT_C PID, `SFC20` BLKMOV, `SFC21` FILL, `SFC64` TIME_TCK).
   - Deterministic closed-loop physical plant simulator (`s7_run_closed_loop_sim`) for verifying PID tuning, tank levels, thermal systems, and disturbance rejection with quantitative control assertions.
 - **High-Speed Physical PLC Monitoring, Direct Program Deployment & AI Data Historian (`simatic_s7_mcp/runtime_engine.py` + `simatic_s7_mcp/s7_mc7.py`)**
@@ -104,7 +104,7 @@ S7_WRITES_ENABLED = "false"
 
 ---
 
-## Complete MCP Tool Catalog (77 Tools)
+## Complete MCP Tool Catalog (78 Tools)
 
 ### Environment, Diagnostics & Project Lifecycle (12 Tools)
 - `s7_get_status` — Inspect controller connection, workspace, and active project state.
@@ -169,11 +169,12 @@ S7_WRITES_ENABLED = "false"
 - `s7_write_device_comments` — Update/write device comments into symbol table artifacts.
 - `s7_search_symbols_and_comments` — Search symbols, addresses, and comments by pattern.
 
-### Simulation — Live S7-PLCSIM & Virtual S7-300 PLC (8 Tools)
+### Simulation — Live S7-PLCSIM & Virtual S7-300 PLC (9 Tools)
 - `s7_virtual_plc_load` — Load STL/LAD, SCL, S7-GRAPH, or Data Blocks into the in-memory `VirtualS7PLC`.
 - `s7_virtual_plc_step` — Execute deterministic scan cycles (advancing S7 timers, IEC timers/counters, and periodic `OB35`).
 - `s7_virtual_plc_inspect` — Inspect Virtual PLC I/Q/M/PI/PQ/DB memory, timers, counters, and active SFC steps.
-- `s7_plcsim_control` — Control S7-PLCSIM via S7ProSim (`connect`, `disconnect`, `set_state`, `set_scan_mode`, `save_plc`, `load_plc`).
+- `s7_plcsim_start_stop` — Trigger S7-PLCSIM simulation `start` (`RUN_P`/`RUN`, optional `CONTINUOUS`/`SINGLE` scan mode & auto-launch) and `stop` (`STOP`, optional COM disconnect) commands via the 32-bit `S7wspsmx.S7ProSim.1` COM interface with post-command state verification and audit logging.
+- `s7_plcsim_control` — Control S7-PLCSIM via S7ProSim (`start`, `stop`, `connect`, `disconnect`, `set_state`, `set_scan_mode`, `save_plc`, `load_plc`).
 - `s7_plcsim_step_scan` — Execute deterministic single/multi-cycle scans in live S7-PLCSIM.
 - `s7_plcsim_snapshot` — Capture a multi-address state snapshot from S7-PLCSIM or Virtual PLC.
 - `s7_plcsim_run_scenario` — Run multi-step input/expectation test scenarios on Virtual PLC or S7-PLCSIM.

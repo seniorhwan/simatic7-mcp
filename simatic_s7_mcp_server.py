@@ -3967,6 +3967,179 @@ class SimaticComBridge:
             return True, f"Imported symbols from {input_path.name} into project '{res.get('project_name')}' via STEP 7 COM."
         return False, res.get("error", "COM SymbolTable.Import failed.")
 
+    @staticmethod
+    def _normalize_plcsim_run_mode(run_mode: Optional[str]) -> Optional[str]:
+        raw = (run_mode or "RUN_P").strip().upper().replace("-", "_")
+        if raw == "RUNP":
+            raw = "RUN_P"
+        if raw in ("RUN_P", "RUN"):
+            return raw
+        return None
+
+    @staticmethod
+    def _normalize_plcsim_scan_mode(scan_mode: Optional[str]) -> Tuple[bool, Optional[str]]:
+        if scan_mode is None or not str(scan_mode).strip():
+            return True, None
+        raw = str(scan_mode).strip().upper().replace("-", "_")
+        if raw in ("SINGLE", "SINGLE_SCAN", "0"):
+            return True, "SINGLE"
+        if raw in ("CONTINUOUS", "CONTINUOUS_SCAN", "CONT", "1"):
+            return True, "CONTINUOUS"
+        return False, None
+
+    def plcsim_trigger_simulation(
+        self,
+        action: str,
+        *,
+        run_mode: str = "RUN_P",
+        scan_mode: Optional[str] = None,
+        auto_connect: bool = True,
+        disconnect_on_stop: bool = False,
+        launch_if_closed: bool = False,
+        timeout_s: float = 15.0,
+    ) -> Dict[str, Any]:
+        """
+        Triggers S7-PLCSIM simulation start or stop commands over the underlying
+        32-bit COM automation interface (S7wspsmx.S7ProSim.1).
+
+        Handles connection establishment (Connect), optional scan-mode selection
+        (SingleScan / ContinuousScan), CPU state transition (RUN_P / RUN / STOP),
+        post-command state verification (GetState / GetScanMode), and optional
+        clean Disconnect on stop.
+        """
+        t0 = time.perf_counter()
+        act = (action or "").strip().lower()
+        if act not in ("start", "stop"):
+            return {
+                "success": False,
+                "ok": False,
+                "failure_category": FailureCategory.VALIDATION_ERROR.value,
+                "error": f"Invalid simulation action '{action}'. Must be 'start' or 'stop'.",
+                "com_progid": "S7wspsmx.S7ProSim.1",
+                "com_architecture": "32-bit",
+            }
+
+        eff_timeout = max(1.0, min(float(timeout_s), 120.0))
+        norm_run_mode: Optional[str] = None
+        norm_scan_mode: Optional[str] = None
+
+        if act == "start":
+            norm_run_mode = self._normalize_plcsim_run_mode(run_mode)
+            if norm_run_mode is None:
+                return {
+                    "success": False,
+                    "ok": False,
+                    "failure_category": FailureCategory.VALIDATION_ERROR.value,
+                    "error": f"Invalid run_mode '{run_mode}'. Expected 'RUN_P' or 'RUN'.",
+                    "com_progid": "S7wspsmx.S7ProSim.1",
+                    "com_architecture": "32-bit",
+                }
+            scan_ok, norm_scan_mode = self._normalize_plcsim_scan_mode(scan_mode)
+            if not scan_ok:
+                return {
+                    "success": False,
+                    "ok": False,
+                    "failure_category": FailureCategory.VALIDATION_ERROR.value,
+                    "error": f"Invalid scan_mode '{scan_mode}'. Expected 'CONTINUOUS', 'SINGLE', or None.",
+                    "com_progid": "S7wspsmx.S7ProSim.1",
+                    "com_architecture": "32-bit",
+                }
+            cmd = "plcsim_start_simulation"
+            params: Dict[str, Any] = {
+                "run_mode": norm_run_mode,
+                "auto_connect": bool(auto_connect),
+            }
+            if norm_scan_mode is not None:
+                params["scan_mode"] = norm_scan_mode
+        else:
+            cmd = "plcsim_stop_simulation"
+            params = {
+                "auto_connect": bool(auto_connect),
+                "disconnect": bool(disconnect_on_stop),
+            }
+
+        res = self.worker.call(cmd, params, timeout_s=eff_timeout)
+        launched_plcsim = False
+
+        # Optional Windows auto-launch of S7-PLCSIM if closed during a start request
+        if not res.get("ok") and act == "start" and launch_if_closed and sys.platform == "win32":
+            plcsim_exe = find_step7_plcsim_exe()
+            if plcsim_exe is not None and plcsim_exe.is_file():
+                try:
+                    subprocess.Popen([str(plcsim_exe)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    launched_plcsim = True
+                    time.sleep(2.0)
+                    res = self.worker.call(cmd, params, timeout_s=eff_timeout)
+                except OSError:
+                    pass
+
+        latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+        backend = self.worker.backend_name
+
+        if not res.get("ok"):
+            err_msg = str(res.get("error") or f"32-bit S7ProSim COM '{cmd}' failed.")
+            err_lower = err_msg.lower()
+            if res.get("timed_out") or "timed out" in err_lower:
+                category = FailureCategory.COM_TIMEOUT.value
+                hint = "Verify S7-PLCSIM is responsive (no open modal dialogs) and retry with a larger timeout_s."
+            elif "not available on this platform" in err_lower or "com host is not available" in err_lower or backend == "unavailable":
+                category = FailureCategory.COM_UNAVAILABLE.value
+                hint = (
+                    "32-bit Windows COM automation (SysWOW64 PowerShell or native x86 s7_com_bridge.exe) is required "
+                    "for S7-PLCSIM (S7wspsmx.S7ProSim.1). Use s7_virtual_plc_* tools for cross-platform simulation."
+                )
+            else:
+                category = FailureCategory.PLCSIM_UNAVAILABLE.value
+                hint = (
+                    "Ensure Siemens S7-PLCSIM (S7USSAPX.EXE) is installed and running on this Windows host, "
+                    "and that the 32-bit S7wspsmx.S7ProSim.1 COM server is registered."
+                )
+            return {
+                "success": False,
+                "ok": False,
+                "action": act,
+                "failure_category": category,
+                "error": err_msg,
+                "hint": hint,
+                "com_progid": "S7wspsmx.S7ProSim.1",
+                "com_architecture": "32-bit",
+                "transport": "plcsim_s7prosim_com",
+                "worker_backend": backend,
+                "launched_plcsim": launched_plcsim,
+                "latency_ms": latency_ms,
+            }
+
+        target_state = res.get("target_state") or (norm_run_mode if act == "start" else "STOP")
+        cpu_state = str(res.get("cpu_state") or target_state)
+        cpu_upper = cpu_state.strip().upper().replace("-", "_")
+        if "verified" in res:
+            verified = bool(res.get("verified"))
+        elif act == "start":
+            verified = cpu_upper == target_state or (target_state == "RUN_P" and cpu_upper == "RUN")
+        else:
+            verified = cpu_upper == "STOP"
+
+        payload: Dict[str, Any] = {
+            "success": True,
+            "ok": True,
+            "action": act,
+            "com_progid": str(res.get("com_progid") or "S7wspsmx.S7ProSim.1"),
+            "com_architecture": str(res.get("com_architecture") or "32-bit"),
+            "transport": "plcsim_s7prosim_com",
+            "worker_backend": backend,
+            "connected": bool(res.get("connected", not (act == "stop" and disconnect_on_stop))),
+            "previous_state": str(res.get("previous_state") or ""),
+            "target_state": target_state,
+            "cpu_state": cpu_state,
+            "previous_scan_mode": str(res.get("previous_scan_mode") or ""),
+            "scan_mode": str(res.get("scan_mode") or (norm_scan_mode or "")),
+            "verified": verified,
+            "launched_plcsim": launched_plcsim,
+            "latency_ms": float(res.get("latency_ms", latency_ms)),
+        }
+        if act == "stop":
+            payload["disconnected"] = bool(res.get("disconnected", disconnect_on_stop))
+        return payload
 
 
 class S7CommLoopbackServer:
@@ -9585,6 +9758,66 @@ def s7_compare_blocks(
 
 # --- Full S7-PLCSIM & Deterministic Virtual S7 PLC Simulation Tools ---
 
+@mcp.tool(annotations=make_tool_annotations(read_only=False, idempotent=True, title="Start/Stop S7-PLCSIM Simulation"))
+def s7_plcsim_start_stop(
+    action: str,
+    run_mode: str = "RUN_P",
+    scan_mode: Optional[str] = None,
+    auto_connect: bool = True,
+    disconnect_on_stop: bool = False,
+    launch_if_closed: bool = False,
+    timeout_s: float = 15.0,
+) -> str:
+    """
+    Triggers Siemens S7-PLCSIM simulation start or stop commands via the underlying
+    32-bit COM automation interface (S7wspsmx.S7ProSim.1).
+
+    Parameters:
+      - action: 'start' to connect and switch S7-PLCSIM into RUN_P / RUN mode, or
+                'stop' to switch S7-PLCSIM into STOP mode (with optional COM disconnect).
+      - run_mode: Target running mode when action='start': 'RUN_P' (default, programmable run)
+                  or 'RUN'. Ignored when action='stop'.
+      - scan_mode: Optional scan mode to apply before starting: 'CONTINUOUS' or 'SINGLE'.
+      - auto_connect: Ensure S7ProSim.Connect() is established before issuing the state command.
+      - disconnect_on_stop: When action='stop', also invoke S7ProSim.Disconnect() after STOP.
+      - launch_if_closed: On Windows, if S7-PLCSIM is not running during 'start', attempt to
+                          launch S7USSAPX.EXE and retry COM connection.
+      - timeout_s: Maximum seconds to wait for the 32-bit COM worker response (1-120s).
+    """
+    denied = _check_access_mode("s7_plcsim_start_stop", AccessMode.READ_WRITE)
+    if denied:
+        return denied
+
+    result = runtime_client.com_bridge.plcsim_trigger_simulation(
+        action=action,
+        run_mode=run_mode,
+        scan_mode=scan_mode,
+        auto_connect=auto_connect,
+        disconnect_on_stop=disconnect_on_stop,
+        launch_if_closed=launch_if_closed,
+        timeout_s=timeout_s,
+    )
+    AUDIT_LOGGER.record(
+        tool="s7_plcsim_start_stop",
+        action=(action or "").strip().lower() or "unknown",
+        target="S7-PLCSIM (S7wspsmx.S7ProSim.1)",
+        success=bool(result.get("success")),
+        status="SUCCESS" if result.get("success") else "FAILED",
+        failure_category=result.get("failure_category"),
+        latency_ms=result.get("latency_ms"),
+        details={
+            "run_mode": run_mode,
+            "scan_mode": result.get("scan_mode") or scan_mode,
+            "previous_state": result.get("previous_state"),
+            "cpu_state": result.get("cpu_state"),
+            "verified": result.get("verified"),
+            "disconnect_on_stop": bool(disconnect_on_stop),
+            "worker_backend": result.get("worker_backend"),
+        },
+    )
+    return json.dumps(result, indent=2)
+
+
 @mcp.tool(annotations=make_tool_annotations(read_only=False, title="Control S7-PLCSIM Lifecycle"))
 def s7_plcsim_control(
     action: str,
@@ -9593,14 +9826,25 @@ def s7_plcsim_control(
     plc_file_path: Optional[str] = None,
 ) -> str:
     """
-    Controls Siemens S7-PLCSIM via the persistent S7ProSim COM worker:
-    action in {'connect', 'disconnect', 'get_state', 'set_state', 'set_scan_mode', 'save_plc', 'load_plc'}.
+    Controls Siemens S7-PLCSIM via the persistent 32-bit S7ProSim COM worker:
+    action in {'start', 'stop', 'connect', 'disconnect', 'get_state', 'set_state', 'set_scan_mode', 'save_plc', 'load_plc'}.
     """
     act = action.strip().lower()
     if act != "get_state":
         denied = _check_access_mode("s7_plcsim_control", AccessMode.READ_WRITE)
         if denied:
             return denied
+
+    if act in ("start", "stop"):
+        res = runtime_client.com_bridge.plcsim_trigger_simulation(
+            action=act,
+            run_mode=(state or "RUN_P"),
+            scan_mode=scan_mode,
+            auto_connect=True,
+            disconnect_on_stop=False,
+            timeout_s=15.0,
+        )
+        return json.dumps(res, indent=2)
 
     cmd_map = {
         "connect": ("plcsim_connect", {}),
@@ -9616,7 +9860,7 @@ def s7_plcsim_control(
             {
                 "success": False,
                 "failure_category": FailureCategory.VALIDATION_ERROR.value,
-                "error": f"Unknown PLCSIM action '{action}'. Valid: {sorted(cmd_map.keys())}",
+                "error": f"Unknown PLCSIM action '{action}'. Valid: {sorted(list(cmd_map.keys()) + ['start', 'stop'])}",
             },
             indent=2,
         )

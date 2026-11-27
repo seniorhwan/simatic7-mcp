@@ -16,9 +16,10 @@ Supports:
       import_station_cfg, export_station_cfg, export_symbols, import_symbols,
       download_blocks, upload_station, open_block
   - S7wspsmx.S7ProSim.1 (S7-PLCSIM):
-      plcsim_connect, plcsim_disconnect, plcsim_get_state, plcsim_set_state,
-      plcsim_set_scan_mode, plcsim_step_scan, plcsim_read, plcsim_write,
-      plcsim_batch_read, plcsim_batch_write, plcsim_save_plc, plcsim_load_plc
+      plcsim_connect, plcsim_disconnect, plcsim_start_simulation, plcsim_stop_simulation,
+      plcsim_get_state, plcsim_set_state, plcsim_set_scan_mode, plcsim_step_scan,
+      plcsim_read, plcsim_write, plcsim_batch_read, plcsim_batch_write,
+      plcsim_save_plc, plcsim_load_plc
 """
 
 from __future__ import annotations
@@ -807,60 +808,158 @@ function Handle-Command($req) {
   # ================= S7-PLCSIM (S7ProSim COM) =================
   if ($cmd -eq 'plcsim_connect') {
     $psim = Get-PSim
-    $psim.Connect()
+    $null = $psim.Connect()
     $script:PSimConnected = $true
-    return @{ ok = $true; connected = $true; cpu_state = [string]$psim.GetState(); scan_mode = [string]$psim.GetScanMode() }
+    $rawScan = [string]$psim.GetScanMode()
+    $scanLabel = if ($rawScan -eq '0' -or $rawScan.ToUpper() -match 'SINGLE') { 'SINGLE' } elseif ($rawScan -eq '1' -or $rawScan.ToUpper() -match 'CONT') { 'CONTINUOUS' } else { $rawScan }
+    return @{
+      ok = $true
+      connected = $true
+      com_progid = 'S7wspsmx.S7ProSim.1'
+      com_architecture = '32-bit'
+      cpu_state = [string]$psim.GetState()
+      scan_mode = $scanLabel
+    }
   }
 
   if ($cmd -eq 'plcsim_disconnect') {
     $psim = Get-PSim
-    $psim.Disconnect()
+    $null = $psim.Disconnect()
     $script:PSimConnected = $false
-    return @{ ok = $true; connected = $false }
+    return @{ ok = $true; connected = $false; com_progid = 'S7wspsmx.S7ProSim.1'; com_architecture = '32-bit' }
+  }
+
+  if ($cmd -eq 'plcsim_start_simulation') {
+    $psim = Get-PSim
+    $autoConnect = if ($null -ne $req.auto_connect) { [bool]$req.auto_connect } else { $true }
+    if ($autoConnect -or (-not $script:PSimConnected)) {
+      $null = $psim.Connect()
+      $script:PSimConnected = $true
+    }
+    $prevState = ''
+    try { $prevState = [string]$psim.GetState() } catch {}
+    $prevScanRaw = ''
+    try { $prevScanRaw = [string]$psim.GetScanMode() } catch {}
+    $prevScanLabel = if ($prevScanRaw -eq '0' -or $prevScanRaw.ToUpper() -match 'SINGLE') { 'SINGLE' } elseif ($prevScanRaw -eq '1' -or $prevScanRaw.ToUpper() -match 'CONT') { 'CONTINUOUS' } else { $prevScanRaw }
+
+    $reqScan = if ($req.scan_mode) { ([string]$req.scan_mode).Trim().ToUpper() } else { '' }
+    if ($reqScan -ne '') {
+      $modeVal = if ($reqScan -match 'SINGLE') { 0 } else { 1 }
+      $null = $psim.SetScanMode($modeVal)
+    }
+
+    $reqRunMode = if ($req.run_mode) { ([string]$req.run_mode).Trim().ToUpper() } else { 'RUN_P' }
+    if ($reqRunMode -eq 'RUN-P' -or $reqRunMode -eq 'RUNP') { $reqRunMode = 'RUN_P' }
+    if ($reqRunMode -ne 'RUN' -and $reqRunMode -ne 'RUN_P') {
+      return @{ ok = $false; error = "Unsupported run_mode '$reqRunMode'. Expected 'RUN_P' or 'RUN'." }
+    }
+
+    $null = $psim.SetState($reqRunMode)
+    $cpuState = [string]$psim.GetState()
+    $curScanRaw = ''
+    try { $curScanRaw = [string]$psim.GetScanMode() } catch {}
+    $curScanLabel = if ($curScanRaw -eq '0' -or $curScanRaw.ToUpper() -match 'SINGLE') { 'SINGLE' } elseif ($curScanRaw -eq '1' -or $curScanRaw.ToUpper() -match 'CONT') { 'CONTINUOUS' } else { $curScanRaw }
+    $cpuUpper = $cpuState.Trim().ToUpper().Replace('-', '_')
+    $verified = ($cpuUpper -eq $reqRunMode) -or ($reqRunMode -eq 'RUN_P' -and $cpuUpper -eq 'RUN')
+    return @{
+      ok = $true
+      action = 'start'
+      com_progid = 'S7wspsmx.S7ProSim.1'
+      com_architecture = '32-bit'
+      connected = [bool]$script:PSimConnected
+      previous_state = $prevState
+      target_state = $reqRunMode
+      cpu_state = $cpuState
+      previous_scan_mode = $prevScanLabel
+      scan_mode = $curScanLabel
+      verified = [bool]$verified
+    }
+  }
+
+  if ($cmd -eq 'plcsim_stop_simulation') {
+    $psim = Get-PSim
+    $autoConnect = if ($null -ne $req.auto_connect) { [bool]$req.auto_connect } else { $true }
+    $disconnectAfter = if ($null -ne $req.disconnect) { [bool]$req.disconnect } else { $false }
+    if ($autoConnect -or (-not $script:PSimConnected)) {
+      $null = $psim.Connect()
+      $script:PSimConnected = $true
+    }
+    $prevState = ''
+    try { $prevState = [string]$psim.GetState() } catch {}
+    $prevScanRaw = ''
+    try { $prevScanRaw = [string]$psim.GetScanMode() } catch {}
+    $prevScanLabel = if ($prevScanRaw -eq '0' -or $prevScanRaw.ToUpper() -match 'SINGLE') { 'SINGLE' } elseif ($prevScanRaw -eq '1' -or $prevScanRaw.ToUpper() -match 'CONT') { 'CONTINUOUS' } else { $prevScanRaw }
+
+    $null = $psim.SetState('STOP')
+    $cpuState = [string]$psim.GetState()
+    $curScanRaw = ''
+    try { $curScanRaw = [string]$psim.GetScanMode() } catch {}
+    $curScanLabel = if ($curScanRaw -eq '0' -or $curScanRaw.ToUpper() -match 'SINGLE') { 'SINGLE' } elseif ($curScanRaw -eq '1' -or $curScanRaw.ToUpper() -match 'CONT') { 'CONTINUOUS' } else { $curScanRaw }
+    $verified = ($cpuState.Trim().ToUpper() -eq 'STOP')
+
+    if ($disconnectAfter) {
+      $null = $psim.Disconnect()
+      $script:PSimConnected = $false
+    }
+    return @{
+      ok = $true
+      action = 'stop'
+      com_progid = 'S7wspsmx.S7ProSim.1'
+      com_architecture = '32-bit'
+      connected = [bool]$script:PSimConnected
+      disconnected = [bool]$disconnectAfter
+      previous_state = $prevState
+      target_state = 'STOP'
+      cpu_state = $cpuState
+      previous_scan_mode = $prevScanLabel
+      scan_mode = $curScanLabel
+      verified = [bool]$verified
+    }
   }
 
   if ($cmd -eq 'plcsim_get_state') {
     $psim = Get-PSim
-    if (-not $script:PSimConnected) { try { $psim.Connect(); $script:PSimConnected = $true } catch {} }
+    if (-not $script:PSimConnected) { try { $null = $psim.Connect(); $script:PSimConnected = $true } catch {} }
     return @{ ok = $true; cpu_state = [string]$psim.GetState(); scan_mode = [string]$psim.GetScanMode() }
   }
 
   if ($cmd -eq 'plcsim_set_state') {
     $psim = Get-PSim
-    if (-not $script:PSimConnected) { try { $psim.Connect(); $script:PSimConnected = $true } catch {} }
+    if (-not $script:PSimConnected) { try { $null = $psim.Connect(); $script:PSimConnected = $true } catch {} }
     $st = ([string]$req.state).ToUpper()
-    $psim.SetState($st)
+    if ($st -eq 'RUN-P' -or $st -eq 'RUNP') { $st = 'RUN_P' }
+    $null = $psim.SetState($st)
     return @{ ok = $true; cpu_state = [string]$psim.GetState() }
   }
 
   if ($cmd -eq 'plcsim_set_scan_mode') {
     $psim = Get-PSim
-    if (-not $script:PSimConnected) { try { $psim.Connect(); $script:PSimConnected = $true } catch {} }
+    if (-not $script:PSimConnected) { try { $null = $psim.Connect(); $script:PSimConnected = $true } catch {} }
     $rawMode = if ($req.scan_mode) { [string]$req.scan_mode } else { [string]$req.mode }
     $modeVal = if ($rawMode.ToUpper() -match 'SINGLE') { 0 } else { 1 }
-    $psim.SetScanMode($modeVal)
+    $null = $psim.SetScanMode($modeVal)
     return @{ ok = $true; scan_mode = [string]$psim.GetScanMode() }
   }
 
   if ($cmd -eq 'plcsim_step_scan') {
     $psim = Get-PSim
-    if (-not $script:PSimConnected) { try { $psim.Connect(); $script:PSimConnected = $true } catch {} }
+    if (-not $script:PSimConnected) { try { $null = $psim.Connect(); $script:PSimConnected = $true } catch {} }
     $count = [Math]::Max(1, [int]$req.cycles)
     for ($k = 0; $k -lt $count; $k++) {
-      $psim.ExecuteSingleScan()
+      $null = $psim.ExecuteSingleScan()
     }
     return @{ ok = $true; executed_cycles = $count; cpu_state = [string]$psim.GetState() }
   }
 
   if ($cmd -eq 'plcsim_save_plc') {
     $psim = Get-PSim
-    $psim.SavePLC([string]$req.file_path)
+    $null = $psim.SavePLC([string]$req.file_path)
     return @{ ok = $true; file_path = [string]$req.file_path }
   }
 
   if ($cmd -eq 'plcsim_load_plc') {
     $psim = Get-PSim
-    $psim.LoadPLC([string]$req.file_path)
+    $null = $psim.LoadPLC([string]$req.file_path)
     return @{ ok = $true; file_path = [string]$req.file_path; cpu_state = [string]$psim.GetState() }
   }
 
