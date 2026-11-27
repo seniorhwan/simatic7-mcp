@@ -25,6 +25,7 @@ A production-grade **Model Context Protocol (MCP)** stdio server giving AI codin
   - S7-PLCSIM 32-bit COM automation (`s7_plcsim_start_stop` for verified `RUN_P`/`RUN`/`STOP` simulation start/stop with optional scan-mode selection, auto-launch & disconnect, plus `connect`, `disconnect`, `set_state`, `set_scan_mode`, `step_scan`, `save_plc`, `load_plc`), exact IEEE-754 `REAL` float preservation, and `I`-area reads.
   - Deterministic **Virtual S7-300/400 PLC** (`VirtualS7PLC`) executing STL/LAD, SCL, S7-GRAPH, DBs, periodic `OB35`, and authentic Siemens S7-300 standard/system library blocks (`SFB0` CTU, `SFB1` CTD, `SFB2` CTUD, `SFB3` TP, `SFB4` TON, `SFB5` TOF, `FC105` SCALE, `FC106` UNSCALE, `FB41` CONT_C PID, `SFC20` BLKMOV, `SFC21` FILL, `SFC64` TIME_TCK).
   - Deterministic closed-loop physical plant simulator (`s7_run_closed_loop_sim`) for verifying PID tuning, tank levels, thermal systems, and disturbance rejection with quantitative control assertions.
+  - **Full-Stack SIMATIC Verify Studio Web Workbench (`dev_server.mjs` + `simatic_s7_mcp/verification_studio.py`)**: Browser-based Siemens STEP 7 Classic commissioning & verification studio featuring live LAD/STL/S7-GRAPH power-flow debugging, breakpoints, coverage heatmap, SIMATIC VAT & Force Values (`FRCE` LED), 2D closed-loop Plant Twins (`conveyor_motor`, `tank_pid`, `batch_mixer_sfc`), 1-scan trace oscilloscope with CSV export, hardware/OB fault injection (`OB80`/`OB82`/`OB86`/`OB100`) & CPU Diagnostic Buffer, isolated-clone automated FAT suite runner with Markdown/JSON sign-off certificates, static safety audit & cross-reference explorer, and live bridging to S7-PLCSIM and physical S7-300/400 PLCs.
 - **High-Speed Physical PLC Monitoring, Direct Program Deployment & AI Data Historian (`simatic_s7_mcp/runtime_engine.py` + `simatic_s7_mcp/s7_mc7.py`)**
   - **Direct S7comm ISO-on-TCP Program Transfer (port 102, cross-platform)**: Deploy compiled MC7 blocks (`OB`/`FC`/`FB`/`DB`/`SDB`) directly to physical S7-300/S7-400 PLCs (`0x1A` → `0x1B` → `0x1C` → `0x28 _INSE`), upload & back up blocks from physical PLCs (`0x1D` → `0x1E` → `0x1F`), delete blocks (`0x28 _DELE`), and persist RAM to MMC/EPROM (`0x28 _MODU`). Extracts authentic Siemens-compiled MC7 blocks directly from STEP 7 Classic `.s7p` projects (`ombstx/offline/*/SUBBLK.DBF` + `SUBBLK.DBT`) and compiles Global Data Blocks (DBs) directly in pure Python.
   - Persistent RFC1006 / ISO-on-TCP `S7ConnectionPool` with automatic **PG -> OP -> S7_BASIC TSAP fallback** (critical when SIMATIC Manager already occupies the single PG resource on an S7-300), **dynamic negotiated-PDU chunking** (respects classic S7-300 240-byte PDUs), Timer/Counter area access, online block inventory (`s7_runtime_list_online_blocks`), 7-stage pre-upload network & S7comm connectivity diagnostics with automatic rack/slot discovery (`s7_plc_diagnose_connectivity` + built-in `preflight_check` in `s7_plc_deploy_program`), quick pre-flight check (`s7_plc_connection_check`), Watch Table (VAT) snapshots, CPU SZL diagnostics, and a dedicated **AI time-series historian** (`s7_collect_plc_data`) with per-tag analytics, threshold alerting, and CSV/JSONL export.
@@ -104,7 +105,7 @@ S7_WRITES_ENABLED = "false"
 
 ---
 
-## Complete MCP Tool Catalog (78 Tools)
+## Complete MCP Tool Catalog (81 Tools)
 
 ### Environment, Diagnostics & Project Lifecycle (12 Tools)
 - `s7_get_status` — Inspect controller connection, workspace, and active project state.
@@ -169,7 +170,7 @@ S7_WRITES_ENABLED = "false"
 - `s7_write_device_comments` — Update/write device comments into symbol table artifacts.
 - `s7_search_symbols_and_comments` — Search symbols, addresses, and comments by pattern.
 
-### Simulation — Live S7-PLCSIM & Virtual S7-300 PLC (9 Tools)
+### Simulation & Verification — Live S7-PLCSIM, Virtual S7-300 PLC & FAT Studio (12 Tools)
 - `s7_virtual_plc_load` — Load STL/LAD, SCL, S7-GRAPH, or Data Blocks into the in-memory `VirtualS7PLC`.
 - `s7_virtual_plc_step` — Execute deterministic scan cycles (advancing S7 timers, IEC timers/counters, and periodic `OB35`).
 - `s7_virtual_plc_inspect` — Inspect Virtual PLC I/Q/M/PI/PQ/DB memory, timers, counters, and active SFC steps.
@@ -179,6 +180,9 @@ S7_WRITES_ENABLED = "false"
 - `s7_plcsim_snapshot` — Capture a multi-address state snapshot from S7-PLCSIM or Virtual PLC.
 - `s7_plcsim_run_scenario` — Run multi-step input/expectation test scenarios on Virtual PLC or S7-PLCSIM.
 - `s7_run_closed_loop_sim` — Run closed-loop PLC + physical plant simulation with `FB41` PID, `FC105`/`FC106`, `SFB0`-`SFB5`, `SFC20`/`SFC21`/`SFC64`, disturbances, and control assertions.
+- `s7_sim_load_verification_preset` — Load a Siemens S7-300/400 verification preset (`conveyor_motor`, `tank_pid`, `batch_mixer_sfc`) into the verification session with static audit, VAT tables, and plant twin.
+- `s7_sim_run_fat_suite` — Run automated Factory Acceptance Test (FAT) scenarios on isolated simulator clones and return pass/fail verdicts, assertions, and network coverage.
+- `s7_sim_inject_fault` — Inject or clear Siemens hardware/OB faults (`estop_cut`, `analog_wire_break`, `analog_overrange`, `contactor_feedback_jam`, `profinet_io_drop`, `scan_load_spike`) or trigger `brownout_warm_restart` (`OB100`).
 
 ### Live S7comm Runtime, Physical PLC Deployment & AI Data Historian (16 Tools)
 - `s7_plc_diagnose_connectivity` — Comprehensive 7-stage pre-upload diagnostic verifying DNS, multi-probe TCP RTT/jitter/packet loss, COTP PG/OP/S7_BASIC TSAP availability + automatic rack/slot discovery, negotiated PDU chunk budget, CPU SZL identity/mode/diagnostic buffer, block management & target overwrite impact + read-only `0x1D..0x1F` upload channel probe, and write guardrails (`READY` / `DEGRADED` / `BLOCKED` verdict).

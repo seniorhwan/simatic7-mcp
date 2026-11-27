@@ -105,6 +105,12 @@ from .s7_stdlib import (
     resolve_stdlib_block_name,
     run_closed_loop_plant_sim,
 )
+from .verification_studio import (
+    SIEMENS_PRESETS,
+    SiemensVerificationSession,
+    analyze_static_safety_and_xref,
+    parse_block_networks,
+)
 
 __all__ = [
     "AccessMode",
@@ -187,4 +193,8 @@ __all__ = [
     "build_prompt_safe_commissioning",
     "build_prompt_convert_and_verify_lad",
     "build_prompt_plcsim_automated_test",
+    "SIEMENS_PRESETS",
+    "SiemensVerificationSession",
+    "analyze_static_safety_and_xref",
+    "parse_block_networks",
 ]

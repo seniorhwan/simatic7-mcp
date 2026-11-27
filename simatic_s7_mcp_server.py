@@ -9901,6 +9901,132 @@ def s7_plcsim_snapshot(
     return json.dumps(res, indent=2)
 
 
+_VERIFICATION_STUDIO_SESSION: Optional[Any] = None
+
+
+def _get_verification_studio_session() -> Any:
+    global _VERIFICATION_STUDIO_SESSION
+    if _VERIFICATION_STUDIO_SESSION is None:
+        from simatic_s7_mcp.verification_studio import SiemensVerificationSession
+
+        _VERIFICATION_STUDIO_SESSION = SiemensVerificationSession(initial_preset="conveyor_motor")
+    return _VERIFICATION_STUDIO_SESSION
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=False, title="Load Siemens Verification Preset or Program"))
+def s7_sim_load_verification_preset(
+    preset_id: str = "conveyor_motor",
+    custom_source: Optional[str] = None,
+    project_name: Optional[str] = None,
+    symbols_json: Optional[str] = None,
+) -> str:
+    """
+    Loads a production Siemens STEP 7 verification project ('conveyor_motor', 'tank_pid', or
+    'batch_mixer_sfc') or custom AI-generated STEP 7 source into the full-stack Verification Studio
+    engine, running static safety audit and cross-reference extraction immediately.
+    """
+    denied = _check_access_mode("s7_sim_load_verification_preset", AccessMode.READ_WRITE)
+    if denied:
+        return denied
+    sess = _get_verification_studio_session()
+    if custom_source and custom_source.strip():
+        res = sess.load_custom_program(
+            name=project_name or "AI-Generated STEP 7 Program",
+            source_code=custom_source,
+            symbols_text=symbols_json or "",
+        )
+    else:
+        res = sess.load_preset(preset_id)
+    snap = sess.get_state_snapshot() if res.get("ok") else {}
+    out = {
+        "success": bool(res.get("ok")),
+        "project": snap.get("project"),
+        "static_audit": snap.get("static_audit"),
+        "fat_cases": [c["id"] for c in snap.get("fat_suite", [])],
+        "error": res.get("error"),
+    }
+    AUDIT_LOGGER.record(
+        tool="s7_sim_load_verification_preset",
+        action="load",
+        target=project_name or preset_id,
+        success=out["success"],
+        status="SUCCESS" if out["success"] else "FAILED",
+    )
+    return json.dumps(out, indent=2)
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=True, idempotent=True, title="Run Automated Siemens FAT Suite"))
+def s7_sim_run_fat_suite(
+    preset_id: Optional[str] = None,
+    test_id: Optional[str] = None,
+    include_certificate: bool = False,
+) -> str:
+    """
+    Executes the deterministic Factory Acceptance Test (FAT) suite on an isolated Siemens
+    VirtualS7PLC clone, evaluating functional logic, safety interlocks, OB fault resilience,
+    network coverage, and scan-cycle watchdog headroom.
+    """
+    sess = _get_verification_studio_session()
+    if preset_id:
+        lr = sess.load_preset(preset_id)
+        if not lr.get("ok"):
+            return json.dumps({"success": False, "error": lr.get("error")}, indent=2)
+    summary = sess.run_fat_suite(test_id=test_id)
+    out: Dict[str, Any] = {
+        "success": bool(summary.get("ok")),
+        **summary,
+    }
+    if include_certificate and summary.get("ok"):
+        rep = sess.export_fat_report(fmt="markdown")
+        out["certificate_markdown"] = rep.get("content", "")
+    return json.dumps(out, indent=2)
+
+
+@mcp.tool(annotations=make_tool_annotations(read_only=False, title="Inject Hardware/OB Fault into Siemens Simulator"))
+def s7_sim_inject_fault(
+    fault_id: str,
+    active: bool = True,
+    step_cycles: int = 2,
+) -> str:
+    """
+    Injects or clears an industrial hardware/OB fault in the Siemens Verification Studio
+    ('estop_cut', 'analog_wire_break', 'analog_overrange', 'contactor_feedback_jam',
+    'profinet_io_drop', 'scan_load_spike', or 'brownout_warm_restart') and steps the CPU.
+    """
+    denied = _check_access_mode("s7_sim_inject_fault", AccessMode.READ_WRITE)
+    if denied:
+        return denied
+    sess = _get_verification_studio_session()
+    fid = (fault_id or "").strip().lower()
+    if fid == "brownout_warm_restart":
+        res = sess.trigger_brownout_warm_restart()
+    else:
+        res = sess.set_fault(fid, active)
+    if not res.get("ok"):
+        return json.dumps(
+            {
+                "success": False,
+                "failure_category": FailureCategory.VALIDATION_ERROR.value,
+                "error": res.get("error"),
+            },
+            indent=2,
+        )
+    if step_cycles > 0:
+        sess.step(cycles=max(1, min(int(step_cycles), 200)), force_step=True)
+    snap = sess.get_state_snapshot()
+    return json.dumps(
+        {
+            "success": True,
+            "fault_id": fid,
+            "active": active,
+            "cpu_mode": snap["cpu"]["mode"],
+            "leds": snap["cpu"]["leds"],
+            "recent_diagnostics": snap["diagnostic_buffer"][:5],
+        },
+        indent=2,
+    )
+
+
 def _parse_virtual_read_spec(item: Any) -> Tuple[str, str, Optional[str]]:
     """Normalizes a read address specification for VirtualS7PLC tools.
 
